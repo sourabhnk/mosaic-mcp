@@ -1,0 +1,558 @@
+"""
+User management and quota enforcement.
+
+Handles:
+- User CRUD (create from OAuth, lookup by email/provider/API key)
+- Monthly query quota tracking and enforcement
+- Daily unique target limits
+- Tier-based tool access control
+- Tier-based result limit enforcement
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import secrets
+import uuid as _uuid
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+
+from pydantic import BaseModel
+
+from mosaic_mcp.db.connection import get_pool
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tier definitions
+# ---------------------------------------------------------------------------
+
+class Tier(str, Enum):
+    FREE = "free"
+    PRO = "pro"
+    ENTERPRISE = "enterprise"
+    ADMIN = "admin"
+
+
+TIER_HIERARCHY = {Tier.FREE: 0, Tier.PRO: 1, Tier.ENTERPRISE: 2, Tier.ADMIN: 3}
+
+# Monthly query limits (tool calls)
+TIER_QUERY_LIMITS: dict[Tier, int | None] = {
+    Tier.FREE: 50,
+    Tier.PRO: 500,
+    Tier.ENTERPRISE: None,  # unlimited
+    Tier.ADMIN: None,
+}
+
+# Daily unique target limits (prevents KG enumeration)
+TIER_DAILY_TARGET_LIMITS: dict[Tier, int | None] = {
+    Tier.FREE: 5,
+    Tier.PRO: 30,
+    Tier.ENTERPRISE: None,
+    Tier.ADMIN: None,
+}
+
+# Tools accessible per tier (free tier gets 9, rest are Pro+)
+FREE_TOOLS = frozenset({
+    "mosaic_search_targets",
+    "mosaic_get_target_profile",
+    "mosaic_get_target_compounds",
+    "mosaic_get_target_patents",
+    "mosaic_get_target_papers",
+    "mosaic_get_target_structure",
+    "mosaic_kg_stats",
+    "mosaic_list_indications",
+    "mosaic_list_subindications",
+    "mosaic_subindication_breakdown",
+    "mosaic_target_wishlist_add",
+    "mosaic_watchlist_create",
+    "mosaic_watchlist_add_item",
+    "mosaic_watchlist_get",
+    "mosaic_watchlist_list",
+    "mosaic_target_scores",
+})
+
+# Per-tool result limits by tier
+TIER_RESULT_LIMITS: dict[str, dict[Tier, int]] = {
+    "mosaic_get_target_compounds": {Tier.FREE: 10, Tier.PRO: 50, Tier.ENTERPRISE: 200},
+    "mosaic_get_target_patents":   {Tier.FREE: 10, Tier.PRO: 50, Tier.ENTERPRISE: 200},
+    "mosaic_get_target_papers":    {Tier.FREE: 10, Tier.PRO: 50, Tier.ENTERPRISE: 200},
+    "mosaic_compound_analogs":     {Tier.FREE: 5,  Tier.PRO: 20, Tier.ENTERPRISE: 50},
+    "mosaic_relation_search":      {Tier.FREE: 10, Tier.PRO: 50, Tier.ENTERPRISE: 100},
+}
+
+# Max tokens in structured data per agent response
+TIER_RESPONSE_TOKEN_LIMITS: dict[Tier, int] = {
+    Tier.FREE: 5_000,
+    Tier.PRO: 25_000,
+    Tier.ENTERPRISE: 50_000,
+    Tier.ADMIN: 50_000,
+}
+
+
+# ---------------------------------------------------------------------------
+# User model
+# ---------------------------------------------------------------------------
+
+class User(BaseModel):
+    id: str
+    email: str
+    name: str | None = None
+    image: str | None = None
+    provider: str = "email"
+    provider_id: str | None = None
+    tier: Tier = Tier.FREE
+    dodo_customer_id: str | None = None
+    dodo_subscription_id: str | None = None
+    subscription_status: str | None = None
+    on_hold_since: str | None = None
+    trial_ends_at: str | None = None
+    monthly_query_limit: int = 50
+    created_at: str | None = None
+
+    @property
+    def is_pro_or_above(self) -> bool:
+        return TIER_HIERARCHY.get(self.tier, 0) >= TIER_HIERARCHY[Tier.PRO]
+
+    @property
+    def is_trial_active(self) -> bool:
+        if not self.trial_ends_at:
+            return False
+        try:
+            end = datetime.fromisoformat(self.trial_ends_at.replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) < end
+        except Exception:
+            return False
+
+
+class UsageInfo(BaseModel):
+    monthly_used: int
+    monthly_limit: int | None
+    daily_targets_used: int
+    daily_target_limit: int | None
+    remaining: int | None  # None = unlimited
+
+    @property
+    def quota_exhausted(self) -> bool:
+        if self.monthly_limit is None:
+            return False
+        return self.monthly_used >= self.monthly_limit
+
+    @property
+    def percent_used(self) -> float:
+        if self.monthly_limit is None or self.monthly_limit == 0:
+            return 0.0
+        return min(100.0, (self.monthly_used / self.monthly_limit) * 100)
+
+
+# ---------------------------------------------------------------------------
+# Anonymous user (pre-signup)
+# ---------------------------------------------------------------------------
+
+ANONYMOUS_USER = User(
+    id="anonymous",
+    email="anonymous@mosaic.bio",
+    name="Anonymous",
+    tier=Tier.FREE,
+    monthly_query_limit=5,  # 5 queries before signup required
+)
+
+
+# ---------------------------------------------------------------------------
+# Database operations
+# ---------------------------------------------------------------------------
+
+def _db():
+    return get_pool()
+
+
+def create_user(
+    email: str,
+    name: str | None,
+    image: str | None,
+    provider: str,
+    provider_id: str,
+) -> User:
+    """Create or update a user from OAuth login. Returns the user."""
+    rows = _db().execute(
+        """
+        INSERT INTO users (email, name, image, provider, provider_id)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (provider, provider_id) DO UPDATE SET
+            email = EXCLUDED.email,
+            name = EXCLUDED.name,
+            image = EXCLUDED.image,
+            updated_at = NOW()
+        RETURNING id, email, name, image, provider, provider_id, tier,
+                  dodo_customer_id, dodo_subscription_id,
+                  subscription_status, on_hold_since::text,
+                  trial_ends_at::text, monthly_query_limit, created_at::text
+        """,
+        (email, name, image, provider, provider_id),
+    )
+    if rows:
+        return User(**{k: str(v) if k == "id" else v for k, v in rows[0].items()})
+    raise RuntimeError("Failed to create user")
+
+
+def get_user_by_email(email: str) -> User | None:
+    """Look up user by email."""
+    rows = _db().execute(
+        """
+        SELECT id, email, name, image, provider, provider_id, tier,
+               dodo_customer_id, dodo_subscription_id,
+               subscription_status, on_hold_since::text,
+               trial_ends_at::text, monthly_query_limit, created_at::text
+        FROM users WHERE email = %s
+        """,
+        (email,),
+    )
+    if rows:
+        return User(**{k: str(v) if k == "id" else v for k, v in rows[0].items()})
+    return None
+
+
+def get_user_by_id(user_id: str) -> User | None:
+    """Look up user by ID.
+
+    users.id is a UUID column. Non-UUID ids (e.g. the synthetic
+    "anonymous" user) must short-circuit to None — otherwise the
+    `id = %s::uuid` cast raises InvalidTextRepresentation and aborts
+    the whole request transaction.
+    """
+    try:
+        _uuid.UUID(str(user_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    rows = _db().execute(
+        """
+        SELECT id, email, name, image, provider, provider_id, tier,
+               dodo_customer_id, dodo_subscription_id,
+               subscription_status, on_hold_since::text,
+               trial_ends_at::text, monthly_query_limit, created_at::text
+        FROM users WHERE id = %s::uuid
+        """,
+        (user_id,),
+    )
+    if rows:
+        return User(**{k: str(v) if k == "id" else v for k, v in rows[0].items()})
+    return None
+
+
+def get_user_by_api_key(raw_key: str) -> User | None:
+    """Look up user by API key hash."""
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    rows = _db().execute(
+        """
+        SELECT id, email, name, image, provider, provider_id, tier,
+               dodo_customer_id, dodo_subscription_id,
+               subscription_status, on_hold_since::text,
+               trial_ends_at::text, monthly_query_limit, created_at::text
+        FROM users WHERE api_key_hash = %s
+        """,
+        (key_hash,),
+    )
+    if rows:
+        return User(**{k: str(v) if k == "id" else v for k, v in rows[0].items()})
+    return None
+
+
+def generate_user_api_key(user_id: str) -> str:
+    """Generate and store a new API key for a user. Returns the raw key."""
+    raw_key = f"msk_{secrets.token_urlsafe(32)}"
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    _db().execute(
+        "UPDATE users SET api_key_hash = %s, updated_at = NOW() WHERE id = %s::uuid",
+        (key_hash, user_id),
+    )
+    return raw_key
+
+
+def update_user_tier(user_id: str, tier: Tier, **kwargs: Any) -> None:
+    """Update a user's tier + optional billing fields.
+
+    Always recomputes `monthly_query_limit` from the tier table so that
+    plan upgrades/downgrades immediately change the user's usable quota
+    (fixes `subscription.plan_changed` which previously only logged).
+
+    Accepts both `dodo_*` and legacy `stripe_*` kwargs for call-site flexibility.
+    """
+    limit = TIER_QUERY_LIMITS.get(tier)
+    monthly_limit = limit if limit is not None else 999_999
+
+    set_clauses = [
+        "tier = %s",
+        "monthly_query_limit = %s",
+        "updated_at = NOW()",
+    ]
+    params: list[Any] = [tier.value, monthly_limit]
+
+    # Alias legacy keys → new column names
+    aliases = {
+        "stripe_customer_id": "dodo_customer_id",
+        "stripe_subscription_id": "dodo_subscription_id",
+    }
+    allowed = {
+        "dodo_customer_id",
+        "dodo_subscription_id",
+        "subscription_status",
+        "on_hold_since",
+        "trial_ends_at",
+    }
+    for k, v in kwargs.items():
+        col = aliases.get(k, k)
+        if col in allowed:
+            set_clauses.append(f"{col} = %s")
+            params.append(v)
+
+    params.append(user_id)
+    _db().execute(
+        f"UPDATE users SET {', '.join(set_clauses)} WHERE id = %s::uuid",
+        tuple(params),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Usage tracking & quota enforcement
+# ---------------------------------------------------------------------------
+
+def record_usage(
+    user_id: str,
+    tool_name: str,
+    target_symbol: str | None = None,
+) -> None:
+    """Record a tool invocation for usage tracking."""
+    now = datetime.now(timezone.utc)
+    _db().execute(
+        """
+        INSERT INTO usage_tracking (user_id, tool_name, target_symbol, query_month, query_date)
+        VALUES (%s::uuid, %s, %s, %s, %s)
+        """,
+        (user_id, tool_name, target_symbol, now.strftime("%Y-%m"), now.strftime("%Y-%m-%d")),
+    )
+
+
+def get_usage(user_id: str) -> UsageInfo:
+    """Get current usage stats for a user."""
+    now = datetime.now(timezone.utc)
+    month = now.strftime("%Y-%m")
+    date = now.strftime("%Y-%m-%d")
+
+    # Get user tier
+    user = get_user_by_id(user_id)
+    if not user:
+        return UsageInfo(
+            monthly_used=0, monthly_limit=5,
+            daily_targets_used=0, daily_target_limit=5, remaining=5,
+        )
+
+    tier = user.tier
+
+    # Monthly usage
+    rows = _db().execute(
+        "SELECT get_monthly_usage(%s::uuid, %s) AS cnt", (user_id, month)
+    )
+    monthly_used = rows[0]["cnt"] if rows else 0
+
+    # Daily unique targets
+    rows = _db().execute(
+        "SELECT get_daily_unique_targets(%s::uuid, %s) AS cnt", (user_id, date)
+    )
+    daily_targets = rows[0]["cnt"] if rows else 0
+
+    monthly_limit = TIER_QUERY_LIMITS.get(tier)
+    daily_target_limit = TIER_DAILY_TARGET_LIMITS.get(tier)
+    remaining = None if monthly_limit is None else max(0, monthly_limit - monthly_used)
+
+    return UsageInfo(
+        monthly_used=monthly_used,
+        monthly_limit=monthly_limit,
+        daily_targets_used=daily_targets,
+        daily_target_limit=daily_target_limit,
+        remaining=remaining,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Access control helpers
+# ---------------------------------------------------------------------------
+
+def check_tool_access(tool_name: str, tier: Tier) -> bool:
+    """Check if a user's tier allows access to a specific tool."""
+    if TIER_HIERARCHY.get(tier, 0) >= TIER_HIERARCHY[Tier.PRO]:
+        return True  # Pro+ can access everything
+    return tool_name in FREE_TOOLS
+
+
+def enforce_result_limit(tool_name: str, requested_limit: int, tier: Tier) -> int:
+    """Enforce tier-based result limits. Returns the effective limit."""
+    tool_limits = TIER_RESULT_LIMITS.get(tool_name)
+    if not tool_limits:
+        return requested_limit  # No special limit for this tool
+
+    tier_key = tier if tier in tool_limits else Tier.FREE
+    max_allowed = tool_limits.get(tier_key, requested_limit)
+    return min(requested_limit, max_allowed)
+
+
+def check_quota(user: User) -> dict | None:
+    """Check if user has remaining quota. Returns None if OK, error dict if exceeded.
+
+    Team (Lab) members meter against the shared team subscription rather
+    than their individual tier (Task 1.4.R.2).
+    """
+    from mosaic_mcp._compat import check_team_quota, user_active_team
+
+    team_id = user_active_team(user.id)
+    if team_id:
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+        return check_team_quota(team_id, month)
+
+    usage = get_usage(user.id)
+
+    if usage.quota_exhausted:
+        return {
+            "error": "monthly_quota_exceeded",
+            "message": f"You've used all {usage.monthly_limit} queries this month. Upgrade to continue.",
+            "usage": usage.monthly_used,
+            "limit": usage.monthly_limit,
+            "tier": user.tier.value,
+            "upgrade_url": "/pricing",
+            "percent_used": usage.percent_used,
+        }
+
+    return None
+
+
+def check_daily_target_limit(user: User, target_symbol: str | None) -> dict | None:
+    """Check if user has hit daily unique target limit. Returns None if OK."""
+    if target_symbol is None:
+        return None
+
+    limit = TIER_DAILY_TARGET_LIMITS.get(user.tier)
+    if limit is None:
+        return None
+
+    usage = get_usage(user.id)
+    if usage.daily_targets_used >= limit:
+        # Check if this specific target was already queried today (allow re-queries)
+        now = datetime.now(timezone.utc)
+        rows = _db().execute(
+            """
+            SELECT 1 FROM usage_tracking
+            WHERE user_id = %s::uuid AND query_date = %s AND target_symbol = %s
+            LIMIT 1
+            """,
+            (user.id, now.strftime("%Y-%m-%d"), target_symbol),
+        )
+        if rows:
+            return None  # Already queried this target today — allow
+
+        return {
+            "error": "daily_target_limit_exceeded",
+            "message": f"You've queried {limit} different targets today. Upgrade for more.",
+            "daily_targets_used": usage.daily_targets_used,
+            "daily_target_limit": limit,
+            "tier": user.tier.value,
+            "upgrade_url": "/pricing",
+        }
+
+    return None
+
+
+def can_export(tier: Tier) -> bool:
+    """Check if the user's tier allows CSV/JSON export."""
+    return TIER_HIERARCHY.get(tier, 0) >= TIER_HIERARCHY[Tier.PRO]
+
+
+# ---------------------------------------------------------------------------
+# Webhook idempotency
+# ---------------------------------------------------------------------------
+
+def webhook_already_processed(event_id: str) -> bool:
+    """Return True if this Dodo event_id has already been successfully processed.
+
+    Uses the `webhook_events` table for at-least-once → exactly-once delivery.
+    """
+    if not event_id:
+        return False
+    rows = _db().execute(
+        "SELECT status FROM webhook_events WHERE event_id = %s",
+        (event_id,),
+    )
+    return bool(rows and rows[0].get("status") == "processed")
+
+
+def webhook_record_received(event_id: str, event_type: str) -> bool:
+    """Insert a webhook_events row; return True if newly received, False if dupe.
+
+    Race-safe via ON CONFLICT DO NOTHING.
+    """
+    if not event_id:
+        return True  # No ID → can't dedupe, process anyway
+    rows = _db().execute(
+        """
+        INSERT INTO webhook_events (event_id, event_type, status)
+        VALUES (%s, %s, 'received')
+        ON CONFLICT (event_id) DO NOTHING
+        RETURNING event_id
+        """,
+        (event_id, event_type),
+    )
+    return bool(rows)
+
+
+def webhook_mark_processed(event_id: str) -> None:
+    if not event_id:
+        return
+    _db().execute(
+        "UPDATE webhook_events SET status='processed', processed_at=NOW() WHERE event_id=%s",
+        (event_id,),
+    )
+
+
+def webhook_mark_failed(event_id: str, error: str) -> None:
+    if not event_id:
+        return
+    _db().execute(
+        "UPDATE webhook_events SET status='failed', error_message=%s WHERE event_id=%s",
+        (error[:1000], event_id),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Grace-period reaper (call via cron / admin endpoint)
+# ---------------------------------------------------------------------------
+
+GRACE_PERIOD_DAYS = 3
+
+
+def reap_on_hold_subscriptions() -> int:
+    """Downgrade Pro users whose Dodo subscription has been on_hold > grace period.
+
+    Returns the number of users downgraded. Intended to run daily.
+    """
+    rows = _db().execute(
+        f"""
+        SELECT id FROM users
+        WHERE subscription_status = 'on_hold'
+          AND on_hold_since IS NOT NULL
+          AND on_hold_since < NOW() - INTERVAL '{GRACE_PERIOD_DAYS} days'
+          AND tier IN ('pro', 'enterprise')
+        """
+    )
+    count = 0
+    for r in rows or []:
+        uid = str(r["id"])
+        update_user_tier(
+            uid,
+            Tier.FREE,
+            subscription_status="expired",
+            on_hold_since=None,
+        )
+        logger.info("Grace period expired for user %s; downgraded to Free", uid)
+        count += 1
+    return count

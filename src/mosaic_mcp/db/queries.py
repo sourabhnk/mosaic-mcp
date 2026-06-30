@@ -1,0 +1,3710 @@
+"""
+SQL query helpers for pre-clinical intelligence.
+
+Drop-in replacement for src.graph.queries.GraphQueries — same method
+signatures and return shapes, but uses standard SQL JOINs instead of
+Apache AGE Cypher.  Works with any PostgreSQL 14+ including Neon.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+import psycopg
+
+from mosaic_mcp.db.connection import ConnectionManager, get_pool, get_read_pool
+
+logger = logging.getLogger(__name__)
+
+# gap-fix 8: a partner gene surfaced by the graph but NOT in the curated target
+# set has no KG patent/compound coverage at all — so its "0 patents / 0
+# compounds" means "we have no data on this gene", NOT "the field is empty".
+# Such a partner is tagged out_of_coverage so synthesis/UI render its
+# competitive status as "not assessed" rather than as confirmed whitespace.
+# The co-essentiality / PPI coupling signal itself stays (it is KG-derived).
+OUT_OF_COVERAGE_REASON = "gene outside Mosaic curated coverage"
+
+
+class GraphQueries:
+    """Multi-hop query helpers using relational SQL.
+
+    Method names and return shapes are identical to the old Cypher-based
+    GraphQueries so consumers (MCP server, API routers) can swap imports
+    without any logic changes.
+
+    Uses the read pool by default since all queries are read-only.
+    When a Neon read replica is configured (DATABASE_URL_READ), queries
+    are automatically routed there. Otherwise falls back to the pooled
+    primary endpoint.
+    """
+
+    def __init__(self, db: ConnectionManager | None = None) -> None:
+        self.db = db or get_read_pool()
+
+    def _resolve_target(self, symbol: str) -> str:
+        """Resolve a target symbol or name to its canonical ID.
+
+        Resolution order:
+        1. Direct ID match (exact gene symbol)
+        2. Gene name alias (JSONB array containment)
+        3. Fuzzy name match (case-insensitive LIKE on name/function_description)
+        Returns the canonical ID, or the original symbol if no match found.
+        """
+        symbol = symbol.strip().upper()
+        # Direct ID match is the fast path
+        direct = self._execute_safe(
+            "SELECT id FROM targets WHERE id = %(s)s",
+            {"s": symbol},
+        )
+        if direct:
+            return symbol
+        # Check gene_names aliases
+        alias = self._execute_safe(
+            "SELECT id FROM targets WHERE gene_names @> to_jsonb(%(s)s::text) LIMIT 1",
+            {"s": symbol},
+        )
+        if alias:
+            logger.info("Resolved alias %s -> %s", symbol, alias[0]["id"])
+            return alias[0]["id"]
+
+        # Fuzzy name match — allows "epidermal growth factor" -> EGFR
+        name_query = symbol.lower()
+        name_match = self._execute_safe("""
+            SELECT id FROM targets
+            WHERE LOWER(name) LIKE %(q)s
+               OR LOWER(name) = %(exact)s
+            ORDER BY LENGTH(name) ASC
+            LIMIT 1
+        """, {"q": f"%{name_query}%", "exact": name_query})
+        if name_match:
+            logger.info("Resolved name '%s' -> %s", symbol, name_match[0]["id"])
+            return name_match[0]["id"]
+
+        return symbol
+
+    def resolve_compound_by_name(self, name: str) -> str | None:
+        """Resolve a compound by common name (e.g., 'imatinib') to its ID."""
+        name_lower = name.strip().lower()
+        row = self._execute_safe("""
+            SELECT id FROM compounds
+            WHERE LOWER(name) = %(n)s
+            LIMIT 1
+        """, {"n": name_lower})
+        if row:
+            return row[0]["id"]
+        # Partial match
+        row = self._execute_safe("""
+            SELECT id FROM compounds
+            WHERE LOWER(name) LIKE %(q)s
+            ORDER BY LENGTH(name) ASC
+            LIMIT 1
+        """, {"q": f"%{name_lower}%"})
+        if row:
+            return row[0]["id"]
+        return None
+
+    # =====================================================================
+    # Competitive Landscape
+    # =====================================================================
+
+    def get_competitive_landscape(self, target_symbol: str) -> dict[str, Any]:
+        target = self._resolve_target(target_symbol)
+
+        # 1. Compounds targeting this target
+        compounds = self._execute_safe("""
+            SELECT c.id AS compound_id, c.name AS compound_name,
+                   c.chembl_id, c.max_phase,
+                   ct.activity_type, ct.value, ct.unit,
+                   ct.pchembl_value, ct.assay_type
+            FROM compounds c
+            JOIN compound_targets ct ON ct.compound_id = c.id
+            WHERE ct.target_id = %(target)s
+        """, {"target": target})
+
+        # 2. Patents mentioning target + their assignees
+        patents = self._execute_safe("""
+            SELECT p.id AS patent_id, p.title AS patent_title,
+                   p.filing_date, p.publication_date,
+                   o.name AS assignee, o.org_type, o.is_big_pharma
+            FROM patent_mentions_target pmt
+            JOIN patents p ON p.id = pmt.patent_id
+            LEFT JOIN patent_organizations po ON po.patent_id = p.id
+            LEFT JOIN organizations o ON o.id = po.org_id
+            WHERE pmt.target_id = %(target)s
+        """, {"target": target})
+
+        # 3. Organizations via papers
+        paper_orgs = self._execute_safe("""
+            SELECT DISTINCT o.name AS org_name, o.org_type,
+                   COUNT(DISTINCT pmt.paper_id) AS paper_count
+            FROM paper_mentions_target pmt
+            JOIN paper_authors pa ON pa.paper_id = pmt.paper_id
+            JOIN person_organizations po ON po.person_id = pa.person_id
+            JOIN organizations o ON o.id = po.org_id
+            WHERE pmt.target_id = %(target)s
+            GROUP BY o.name, o.org_type
+        """, {"target": target})
+
+        # Aggregate
+        org_map: dict[str, dict] = {}
+        for p in patents:
+            assignee = p.get("assignee")
+            if assignee:
+                if assignee not in org_map:
+                    org_map[assignee] = {
+                        "name": assignee,
+                        "org_type": p.get("org_type"),
+                        "is_big_pharma": p.get("is_big_pharma"),
+                        "patent_count": 0,
+                        "paper_count": 0,
+                        "compound_count": 0,
+                    }
+                org_map[assignee]["patent_count"] += 1
+
+        for po in paper_orgs:
+            org_name = po.get("org_name")
+            if org_name:
+                if org_name not in org_map:
+                    org_map[org_name] = {
+                        "name": org_name,
+                        "org_type": po.get("org_type"),
+                        "patent_count": 0,
+                        "paper_count": 0,
+                        "compound_count": 0,
+                    }
+                org_map[org_name]["paper_count"] = po.get("paper_count") or 0
+
+        return {
+            "target": target,
+            "organizations": sorted(
+                org_map.values(), key=lambda x: x["patent_count"], reverse=True
+            ),
+            "compounds": compounds,
+            "patents": patents,
+            "total_orgs": len(org_map),
+            "total_compounds": len(compounds),
+            "total_patents": len(patents),
+        }
+
+    def get_target_competitors(self, target_symbol: str) -> list[dict[str, Any]]:
+        target = self._resolve_target(target_symbol)
+        return self._execute_safe("""
+            SELECT o.name AS org_name, o.org_type, o.is_big_pharma,
+                   COUNT(DISTINCT po.patent_id) AS patent_count,
+                   MIN(p.filing_date) AS earliest_filing,
+                   MAX(p.filing_date) AS latest_filing
+            FROM patent_mentions_target pmt
+            JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+            JOIN organizations o ON o.id = po.org_id
+            JOIN patents p ON p.id = pmt.patent_id
+            WHERE pmt.target_id = %(target)s
+            GROUP BY o.name, o.org_type, o.is_big_pharma
+            ORDER BY patent_count DESC
+        """, {"target": target})
+
+    # =====================================================================
+    # Selectivity & SAR
+    # =====================================================================
+
+    def get_compound_selectivity_profile(self, compound_id: str) -> dict[str, Any]:
+        cid = compound_id.strip()
+
+        activities = self._execute_safe("""
+            SELECT t.id AS target_symbol, t.name AS target_name,
+                   t.target_class,
+                   ct.activity_type, ct.value, ct.unit,
+                   ct.pchembl_value, ct.assay_type, ct.source_doc_id
+            FROM compound_targets ct
+            JOIN targets t ON t.id = ct.target_id
+            WHERE ct.compound_id = %(cid)s
+        """, {"cid": cid})
+
+        selectivity = self._execute_safe("""
+            SELECT t.id AS target_symbol, t.name AS target_name,
+                   cs.selectivity_ratio, cs.primary_target
+            FROM compound_selectivity cs
+            JOIN targets t ON t.id = cs.target_id
+            WHERE cs.compound_id = %(cid)s
+        """, {"cid": cid})
+
+        compound_info = self._execute_safe("""
+            SELECT name, chembl_id, smiles, max_phase, pchembl_value
+            FROM compounds
+            WHERE id = %(cid)s
+        """, {"cid": cid})
+
+        return {
+            "compound": compound_info[0] if compound_info else {},
+            "activities": activities,
+            "selectivity_data": selectivity,
+            "target_count": len(activities),
+        }
+
+    def get_compound_series(self, compound_id: str) -> list[dict[str, Any]]:
+        cid = compound_id.strip()
+        return self._execute_safe("""
+            SELECT a.compound_b_id AS analog_id, c.name AS analog_name,
+                   c.smiles, c.max_phase,
+                   a.tanimoto_similarity AS similarity,
+                   t.id AS target_symbol,
+                   ct.value AS activity_value,
+                   ct.activity_type, ct.unit
+            FROM compound_analogs a
+            JOIN compounds c ON c.id = a.compound_b_id
+            LEFT JOIN compound_targets ct ON ct.compound_id = c.id
+            LEFT JOIN targets t ON t.id = ct.target_id
+            WHERE a.compound_a_id = %(cid)s
+        """, {"cid": cid})
+
+    # =====================================================================
+    # Pathway & Target Context
+    # =====================================================================
+
+    def get_pathway_context(self, target_symbol: str) -> dict[str, Any]:
+        target = self._resolve_target(target_symbol)
+
+        pathways = self._execute_safe("""
+            SELECT p.id AS pathway_id, p.name AS pathway_name,
+                   p.source, p.category, tp.role
+            FROM target_pathways tp
+            JOIN pathways p ON p.id = tp.pathway_id
+            WHERE tp.target_id = %(target)s
+        """, {"target": target})
+
+        related_targets = self._execute_safe("""
+            SELECT DISTINCT ot.id AS target_symbol, ot.name AS target_name,
+                   ot.target_class, ot.druggability_tier AS druggability,
+                   p.name AS shared_pathway,
+                   COUNT(DISTINCT p.id) AS shared_pathway_count
+            FROM target_pathways tp1
+            JOIN target_pathways tp2 ON tp2.pathway_id = tp1.pathway_id
+                                    AND tp2.target_id != tp1.target_id
+            JOIN targets ot ON ot.id = tp2.target_id
+            JOIN pathways p ON p.id = tp1.pathway_id
+            WHERE tp1.target_id = %(target)s
+            GROUP BY ot.id, ot.name, ot.target_class, ot.druggability_tier, p.name
+        """, {"target": target})
+
+        interactions = self._execute_safe("""
+            SELECT ot.id AS target_symbol, ot.name AS target_name,
+                   ti.interaction_type, ti.confidence_score AS confidence,
+                   ti.source_db
+            FROM target_interactions ti
+            JOIN targets ot ON ot.id = ti.target_b_id
+            WHERE ti.target_a_id = %(target)s
+        """, {"target": target})
+
+        return {
+            "target": target,
+            "pathways": pathways,
+            "related_targets": related_targets,
+            "protein_interactions": interactions,
+            "pathway_count": len(pathways),
+            "related_target_count": len(related_targets),
+        }
+
+    def get_target_validation_evidence(self, target_symbol: str) -> list[dict[str, Any]]:
+        target = self._resolve_target(target_symbol)
+        return self._execute_safe("""
+            SELECT p.id AS paper_id, p.title, p.journal,
+                   p.publication_date, p.citation_count,
+                   pv.validation_type, pv.model_system, pv.outcome
+            FROM paper_validations pv
+            JOIN papers p ON p.id = pv.paper_id
+            WHERE pv.target_id = %(target)s
+            ORDER BY p.publication_date DESC
+        """, {"target": target})
+
+    # =====================================================================
+    # Indication Landscape
+    # =====================================================================
+
+    def get_indication_landscape(self, indication_name: str) -> dict[str, Any]:
+        """Targets + compounds for an indication.
+
+        Indication lookup is tolerant: exact id match, then exact name match,
+        then LIKE match against id/name. Indications in the DB may be keyed
+        by id like "lung cancer" or "lung_cancer" depending on ingestion
+        source, so we look up both id and name columns.
+        """
+        q = indication_name.strip()
+        q_lower = q.lower()
+        q_like = f"%{q_lower}%"
+
+        # First resolve matching indication ids (may be >1 for fuzzy match)
+        ind_rows = self._execute_safe("""
+            SELECT id, name
+            FROM indications
+            WHERE LOWER(id) = %(q)s
+               OR LOWER(name) = %(q)s
+               OR LOWER(id) LIKE %(q_like)s
+               OR LOWER(name) LIKE %(q_like)s
+            ORDER BY
+                CASE WHEN LOWER(id) = %(q)s OR LOWER(name) = %(q)s THEN 0 ELSE 1 END,
+                LENGTH(name) ASC
+            LIMIT 20
+        """, {"q": q_lower, "q_like": q_like})
+
+        if not ind_rows:
+            return {
+                "indication": indication_name,
+                "targets": [],
+                "compounds": [],
+                "target_count": 0,
+                "compound_count": 0,
+                "error": f"No indication matches for '{indication_name}'",
+            }
+
+        ind_ids = [r["id"] for r in ind_rows]
+
+        targets = self._execute_safe("""
+            SELECT t.id AS target_symbol, t.name AS target_name,
+                   t.target_class, t.druggability_tier AS druggability,
+                   t.validation_level,
+                   ti.evidence_type, ti.association_score
+            FROM target_indications ti
+            JOIN targets t ON t.id = ti.target_id
+            WHERE ti.indication_id = ANY(%(ids)s)
+            ORDER BY ti.association_score DESC NULLS LAST
+            LIMIT 100
+        """, {"ids": ind_ids})
+
+        compounds = self._execute_safe("""
+            SELECT c.id AS compound_id, c.name AS compound_name,
+                   c.max_phase, c.compound_type,
+                   ci.clinical_status
+            FROM compound_indications ci
+            JOIN compounds c ON c.id = ci.compound_id
+            WHERE ci.indication_id = ANY(%(ids)s)
+            ORDER BY c.max_phase DESC NULLS LAST
+            LIMIT 100
+        """, {"ids": ind_ids})
+
+        # Fallback: target_indications currently keys on coarse therapy-area
+        # buckets ('oncology', 'neuroscience') rather than specific diseases.
+        # If no specific-disease matches, infer the therapy area from the
+        # indication name and return the bucket-level targets. This is a
+        # documented coarseness — callers get the right KG slice even though
+        # row-level disease→target links are not yet loaded.
+        inferred_area: str | None = None
+        if not targets:
+            q_for_area = q_lower
+            onco_hits = (
+                "cancer", "tumor", "tumour", "carcinoma", "sarcoma",
+                "leukemia", "leukaemia", "lymphoma", "myeloma",
+                "glioma", "melanoma", "neoplas", "metasta",
+            )
+            neuro_hits = (
+                "alzheim", "parkinson", "huntington", "dementia",
+                "epileps", "seizure", "multiple sclerosis", "als ",
+                "amyotrophic", "neuro", "brain", "cognit",
+            )
+            cardio_hits = (
+                "heart", "cardio", "myocard", "atrial", "ventric",
+                "arrhyth", "hypertens", "ischem",
+            )
+            if any(h in q_for_area for h in onco_hits):
+                inferred_area = "oncology"
+            elif any(h in q_for_area for h in neuro_hits):
+                inferred_area = "neuroscience"
+            elif any(h in q_for_area for h in cardio_hits):
+                inferred_area = "cardiovascular"
+
+            if inferred_area:
+                targets = self._execute_safe("""
+                    SELECT t.id AS target_symbol, t.name AS target_name,
+                           t.target_class, t.druggability_tier AS druggability,
+                           t.validation_level,
+                           ti.evidence_type, ti.association_score
+                    FROM target_indications ti
+                    JOIN targets t ON t.id = ti.target_id
+                    WHERE ti.indication_id = %(area)s
+                    ORDER BY ti.association_score DESC NULLS LAST
+                    LIMIT 100
+                """, {"area": inferred_area})
+
+        return {
+            "indication": indication_name,
+            "matched_indications": [r["name"] for r in ind_rows[:10]],
+            "inferred_therapy_area": inferred_area,
+            "targets": targets,
+            "compounds": compounds,
+            "target_count": len(targets),
+            "compound_count": len(compounds),
+        }
+
+    # =====================================================================
+    # Evidence & Document Queries
+    # =====================================================================
+
+    def get_evidence_for_claim(
+        self, compound_id: str, target_symbol: str
+    ) -> list[dict[str, Any]]:
+        cid = compound_id.strip()
+        target = self._resolve_target(target_symbol)
+
+        return self._execute_safe("""
+            SELECT p.id AS doc_id, p.title, p.publication_date,
+                   p.journal, 'Paper' AS doc_type
+            FROM paper_mentions_compound pmc
+            JOIN paper_mentions_target pmt ON pmt.paper_id = pmc.paper_id
+            JOIN papers p ON p.id = pmc.paper_id
+            WHERE pmc.compound_id = %(cid)s AND pmt.target_id = %(target)s
+            UNION ALL
+            SELECT pat.id AS doc_id, pat.title, pat.publication_date,
+                   NULL AS journal, 'Patent' AS doc_type
+            FROM patent_mentions_compound pamc
+            JOIN patent_mentions_target pamt ON pamt.patent_id = pamc.patent_id
+            JOIN patents pat ON pat.id = pamc.patent_id
+            WHERE pamc.compound_id = %(cid)s AND pamt.target_id = %(target)s
+        """, {"cid": cid, "target": target})
+
+    def get_target_document_timeline(self, target_symbol: str) -> list[dict[str, Any]]:
+        target = self._resolve_target(target_symbol)
+        return self._execute_safe("""
+            SELECT p.id AS doc_id, p.title, p.publication_date,
+                   pmt.confidence, 'Paper' AS doc_type
+            FROM paper_mentions_target pmt
+            JOIN papers p ON p.id = pmt.paper_id
+            WHERE pmt.target_id = %(target)s
+            UNION ALL
+            SELECT pat.id AS doc_id, pat.title, pat.publication_date,
+                   pamt.confidence, 'Patent' AS doc_type
+            FROM patent_mentions_target pamt
+            JOIN patents pat ON pat.id = pamt.patent_id
+            WHERE pamt.target_id = %(target)s
+            ORDER BY publication_date DESC
+        """, {"target": target})
+
+    # =====================================================================
+    # Target Neighborhood (for graph viz)
+    # =====================================================================
+
+    def get_target_neighborhood(
+        self, target_symbol: str, max_depth: int = 2
+    ) -> dict[str, Any]:
+        target = self._resolve_target(target_symbol)
+
+        compounds = self._execute_safe("""
+            SELECT c.id, c.name, 'Compound' AS type,
+                   ct.activity_type AS edge_detail,
+                   ct.activity_type, ct.activity_value, ct.activity_unit,
+                   ct.pchembl_value,
+                   c.max_phase, c.chembl_id
+            FROM compound_targets ct
+            JOIN compounds c ON c.id = ct.compound_id
+            WHERE ct.target_id = %(target)s
+        """, {"target": target})
+
+        papers = self._execute_safe("""
+            SELECT p.id, p.title AS name, 'Paper' AS type,
+                   p.journal, p.publication_date, p.citation_count
+            FROM paper_mentions_target pmt
+            JOIN papers p ON p.id = pmt.paper_id
+            WHERE pmt.target_id = %(target)s
+        """, {"target": target})
+
+        patents = self._execute_safe("""
+            SELECT p.id, p.title AS name, 'Patent' AS type,
+                   p.filing_date, p.publication_date, p.country_code
+            FROM patent_mentions_target pmt
+            JOIN patents p ON p.id = pmt.patent_id
+            WHERE pmt.target_id = %(target)s
+        """, {"target": target})
+
+        indications_list = self._execute_safe("""
+            SELECT i.id, i.name, 'Indication' AS type,
+                   i.therapeutic_area, ti.association_score
+            FROM target_indications ti
+            JOIN indications i ON i.id = ti.indication_id
+            WHERE ti.target_id = %(target)s
+        """, {"target": target})
+
+        pathways = self._execute_safe("""
+            SELECT p.id, p.name, 'Pathway' AS type,
+                   p.source AS pathway_source, p.category
+            FROM target_pathways tp
+            JOIN pathways p ON p.id = tp.pathway_id
+            WHERE tp.target_id = %(target)s
+        """, {"target": target})
+
+        interacting = self._execute_safe("""
+            SELECT t.id, t.name, 'Target' AS type,
+                   t.target_class, t.druggability_tier,
+                   ti.confidence AS interaction_confidence
+            FROM target_interactions ti
+            JOIN targets t ON t.id = ti.target_b_id
+            WHERE ti.target_a_id = %(target)s
+        """, {"target": target})
+
+        orgs: list[dict] = []
+        if max_depth >= 2:
+            orgs = self._execute_safe("""
+                SELECT DISTINCT o.name AS id, o.name, 'Organization' AS type,
+                       o.org_type, o.is_big_pharma, o.country,
+                       COUNT(DISTINCT po.patent_id) AS patent_count
+                FROM patent_mentions_target pmt
+                JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+                JOIN organizations o ON o.id = po.org_id
+                WHERE pmt.target_id = %(target)s
+                GROUP BY o.name, o.org_type, o.is_big_pharma, o.country
+            """, {"target": target})
+
+        all_nodes: list[dict] = []
+        edges: list[dict] = []
+
+        for c in compounds:
+            all_nodes.append(c)
+            edges.append({"source": target, "target": c["id"], "type": c.get("edge_detail") or "targets"})
+        for p in papers:
+            all_nodes.append(p)
+            edges.append({"source": target, "target": p["id"], "type": "mentioned_in"})
+        for p in patents:
+            all_nodes.append(p)
+            edges.append({"source": target, "target": p["id"], "type": "mentioned_in"})
+        for i in indications_list:
+            all_nodes.append(i)
+            edges.append({"source": target, "target": i["id"], "type": "implicated_in"})
+        for p in pathways:
+            all_nodes.append(p)
+            edges.append({"source": target, "target": p["id"], "type": "member_of"})
+        for t in interacting:
+            all_nodes.append(t)
+            edges.append({"source": target, "target": t["id"], "type": "interacts_with"})
+        for o in orgs:
+            all_nodes.append(o)
+            edges.append({"source": target, "target": o["id"], "type": "researched_by"})
+
+        # Limit papers/patents to top 50 to keep graph readable
+        limited_nodes = []
+        limited_edges = []
+        type_counts = {}
+        for node, edge in zip(all_nodes, edges):
+            ntype = node.get("type", "")
+            type_counts[ntype] = type_counts.get(ntype, 0) + 1
+            if ntype in ("Paper", "Patent") and type_counts[ntype] > 50:
+                continue
+            limited_nodes.append(node)
+            limited_edges.append(edge)
+
+        return {
+            "center": target,
+            "nodes": limited_nodes,
+            "edges": limited_edges,
+            "node_count": len(limited_nodes),
+            "by_type": {
+                "compounds": len(compounds),
+                "papers": min(len(papers), 50),
+                "patents": min(len(patents), 50),
+                "indications": len(indications_list),
+                "pathways": len(pathways),
+                "interacting_targets": len(interacting),
+                "organizations": len(orgs),
+            },
+            "total_by_type": {
+                "compounds": len(compounds),
+                "papers": len(papers),
+                "patents": len(patents),
+                "indications": len(indications_list),
+                "pathways": len(pathways),
+                "interacting_targets": len(interacting),
+                "organizations": len(orgs),
+            },
+        }
+
+    # =====================================================================
+    # MCP-specific queries (previously inline Cypher in server.py)
+    # =====================================================================
+
+    def search_targets(
+        self, query: str, indication: str | None = None
+    ) -> list[dict[str, Any]]:
+        q = query.strip().upper()
+        # Two LIKE variants:
+        #   q_like:   %<lowered>%                  — matches contiguous substring
+        #   q_tokens: %tok1%tok2%...               — matches all tokens in order,
+        #             punctuation-insensitive. Needed because target names like
+        #             "Poly [ADP-ribose] polymerase 1" break a "poly adp" substring
+        #             match due to the bracket.
+        lowered = query.strip().lower()
+        tokens = [t for t in re.split(r"[^a-z0-9]+", lowered) if t]
+        q_tokens = "%" + "%".join(tokens) + "%" if tokens else f"%{lowered}%"
+        params: dict[str, Any] = {
+            "q": q,
+            "q_like": f"%{lowered}%",
+            "q_tokens": q_tokens,
+        }
+
+        if indication:
+            ind = indication.strip().lower()
+            params["ind"] = ind
+            return self._execute_safe("""
+                SELECT t.id AS gene_symbol, t.name AS target_name,
+                       t.target_class, t.druggability_tier,
+                       LEFT(t.function_description, 200) AS function_description,
+                       ts.target_attractiveness, ts.scientific_validation,
+                       ts.momentum, ts.momentum_direction,
+                       (SELECT COUNT(*) FROM compound_targets WHERE target_id = t.id) AS compound_count,
+                       (SELECT COUNT(*) FROM patent_mentions_target WHERE target_id = t.id) AS patent_count,
+                       (SELECT COUNT(*) FROM paper_mentions_target WHERE target_id = t.id) AS paper_count
+                FROM targets t
+                JOIN target_indications ti ON ti.target_id = t.id
+                LEFT JOIN target_scores ts ON ts.target_id = t.id
+                WHERE ti.indication_id = %(ind)s
+                  AND (t.id = %(q)s
+                       OR UPPER(t.symbol) = %(q)s
+                       OR LOWER(t.name) LIKE %(q_like)s
+                       OR LOWER(t.name) LIKE %(q_tokens)s
+                       OR LOWER(t.target_class) LIKE %(q_like)s
+                       OR LOWER(COALESCE(t.protein_family, '')) LIKE %(q_like)s
+                       OR LOWER(COALESCE(t.function_description, '')) LIKE %(q_like)s
+                       OR LOWER(COALESCE(t.function_description, '')) LIKE %(q_tokens)s
+                       OR LOWER(COALESCE(t.gene_names::text, '')) LIKE %(q_like)s)
+                ORDER BY ts.target_attractiveness DESC NULLS LAST
+                LIMIT 50
+            """, params)
+        else:
+            return self._execute_safe("""
+                SELECT t.id AS gene_symbol, t.name AS target_name,
+                       t.target_class, t.druggability_tier,
+                       LEFT(t.function_description, 200) AS function_description,
+                       ts.target_attractiveness, ts.scientific_validation,
+                       ts.momentum, ts.momentum_direction,
+                       (SELECT COUNT(*) FROM compound_targets WHERE target_id = t.id) AS compound_count,
+                       (SELECT COUNT(*) FROM patent_mentions_target WHERE target_id = t.id) AS patent_count,
+                       (SELECT COUNT(*) FROM paper_mentions_target WHERE target_id = t.id) AS paper_count
+                FROM targets t
+                LEFT JOIN target_scores ts ON ts.target_id = t.id
+                WHERE t.id = %(q)s
+                      OR UPPER(t.symbol) = %(q)s
+                      OR LOWER(t.name) LIKE %(q_like)s
+                      OR LOWER(t.name) LIKE %(q_tokens)s
+                      OR LOWER(t.target_class) LIKE %(q_like)s
+                      OR LOWER(COALESCE(t.protein_family, '')) LIKE %(q_like)s
+                      OR LOWER(COALESCE(t.function_description, '')) LIKE %(q_like)s
+                      OR LOWER(COALESCE(t.function_description, '')) LIKE %(q_tokens)s
+                      OR LOWER(COALESCE(t.gene_names::text, '')) LIKE %(q_like)s
+                ORDER BY ts.target_attractiveness DESC NULLS LAST
+                LIMIT 50
+            """, params)
+
+    def get_target_profile(self, target_symbol: str) -> dict[str, Any] | None:
+        target = self._resolve_target(target_symbol)
+
+        info = self._execute_safe("""
+            SELECT id AS gene_symbol, name AS target_name,
+                   target_class, uniprot_id, chembl_id, druggability_tier
+            FROM targets
+            WHERE id = %(target)s
+        """, {"target": target})
+
+        if not info:
+            return None
+
+        profile = dict(info[0])
+
+        counts = self._execute_safe("""
+            SELECT
+                (SELECT COUNT(*) FROM compound_targets WHERE target_id = %(t)s) AS compound_count,
+                (SELECT COUNT(*) FROM patent_mentions_target WHERE target_id = %(t)s) AS patent_count,
+                (SELECT COUNT(*) FROM paper_mentions_target WHERE target_id = %(t)s) AS paper_count,
+                (SELECT COUNT(DISTINCT o.id)
+                 FROM patent_mentions_target pmt
+                 JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+                 JOIN organizations o ON o.id = po.org_id
+                 WHERE pmt.target_id = %(t)s) AS organization_count
+        """, {"t": target})
+
+        if counts:
+            profile.update(counts[0])
+
+        top_compounds = self._execute_safe("""
+            SELECT c.id AS compound_id, c.name AS compound_name,
+                   c.chembl_id, ct.value AS activity_value,
+                   ct.activity_type, c.max_phase
+            FROM compound_targets ct
+            JOIN compounds c ON c.id = ct.compound_id
+            WHERE ct.target_id = %(target)s
+            ORDER BY ct.value ASC NULLS LAST
+            LIMIT 5
+        """, {"target": target})
+
+        profile["top_compounds"] = top_compounds
+
+        # Genetic-evidence quick-look: DepMap essentiality + AlphaMissense.
+        # Surfaced inline so target_profile alone (without target_validation)
+        # is enough to see whether a target is genetically supported.
+        ess = self._execute_safe(
+            "SELECT to_regclass('target_essentiality') AS t"
+        )
+        if ess and ess[0].get("t"):
+            row = self._execute_safe(
+                """SELECT mean_gene_effect, dependency_fraction, n_models
+                   FROM target_essentiality WHERE target_id = %(t)s""",
+                {"t": target},
+            )
+            if row:
+                profile["depmap"] = {
+                    "mean_gene_effect": float(row[0]["mean_gene_effect"] or 0),
+                    "dependency_fraction": float(row[0]["dependency_fraction"] or 0),
+                    "n_models": int(row[0]["n_models"] or 0),
+                }
+        am = self._execute_safe(
+            "SELECT to_regclass('target_variant_pathogenicity') AS t"
+        )
+        if am and am[0].get("t"):
+            row = self._execute_safe(
+                """SELECT n_variants, pct_pathogenic, hotspot_residues
+                   FROM target_variant_pathogenicity WHERE target_id = %(t)s""",
+                {"t": target},
+            )
+            if row:
+                profile["alphamissense"] = {
+                    "n_missense_variants": int(row[0]["n_variants"] or 0),
+                    "pct_pathogenic": float(row[0]["pct_pathogenic"] or 0),
+                    "hotspot_residues": row[0]["hotspot_residues"] or [],
+                }
+        return profile
+
+    # =====================================================================
+    # Deep Profile (comprehensive target dossier)
+    # =====================================================================
+
+    def get_target_deep_profile(self, target_symbol: str) -> dict[str, Any] | None:
+        """Assemble a comprehensive intelligence dossier for a target.
+
+        Pulls from all entity and enrichment tables: targets (UniProt),
+        target_scores, compound_targets, paper_validations, target_indications,
+        target_pathways, target_interactions, compound_indications, and
+        patent/paper/org aggregations.
+        """
+        target = self._resolve_target(target_symbol)
+
+        # 1. Core metadata (all columns including UniProt enrichment)
+        info = self._execute_safe("""
+            SELECT id AS gene_symbol, name AS target_name,
+                   target_class, uniprot_id, chembl_id, entrez_id,
+                   protein_family, selectivity_group, druggability_tier,
+                   validation_level, disease_association_count,
+                   homology_human_pct,
+                   function_description, subcellular_location,
+                   go_terms, disease_associations AS uniprot_diseases,
+                   gene_names, protein_length
+            FROM targets
+            WHERE id = %(target)s
+        """, {"target": target})
+
+        if not info:
+            return None
+
+        profile = dict(info[0])
+
+        # 2. Entity counts (extended)
+        counts = self._execute_safe("""
+            SELECT
+                (SELECT COUNT(*) FROM compound_targets WHERE target_id = %(t)s) AS compound_count,
+                (SELECT COUNT(*) FROM patent_mentions_target WHERE target_id = %(t)s) AS patent_count,
+                (SELECT COUNT(*) FROM paper_mentions_target WHERE target_id = %(t)s) AS paper_count,
+                (SELECT COUNT(DISTINCT o.id)
+                 FROM patent_mentions_target pmt
+                 JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+                 JOIN organizations o ON o.id = po.org_id
+                 WHERE pmt.target_id = %(t)s) AS organization_count,
+                (SELECT COUNT(*) FROM target_pathways WHERE target_id = %(t)s) AS pathway_count,
+                (SELECT COUNT(*) FROM target_interactions WHERE target_a_id = %(t)s) AS ppi_count,
+                (SELECT COUNT(*) FROM target_indications WHERE target_id = %(t)s) AS indication_count,
+                (SELECT COUNT(*) FROM paper_validations WHERE target_id = %(t)s) AS validation_count
+        """, {"t": target})
+
+        if counts:
+            profile["counts"] = dict(counts[0])
+
+        # 3. Target scores
+        scores = self._execute_safe("""
+            SELECT target_attractiveness, scientific_validation,
+                   druggability, competitive_intensity,
+                   momentum, momentum_direction, computed_at
+            FROM target_scores
+            WHERE target_id = %(t)s
+        """, {"t": target})
+        profile["scores"] = dict(scores[0]) if scores else None
+
+        # 4. Top 10 compounds by potency
+        top_compounds = self._execute_safe("""
+            SELECT c.id AS compound_id, c.name AS compound_name,
+                   c.chembl_id, c.smiles, c.max_phase,
+                   c.molecular_weight, c.pchembl_value AS compound_pchembl,
+                   ct.value AS activity_value, ct.activity_type,
+                   ct.unit, ct.pchembl_value AS activity_pchembl,
+                   ct.assay_type
+            FROM compound_targets ct
+            JOIN compounds c ON c.id = ct.compound_id
+            WHERE ct.target_id = %(target)s
+            ORDER BY ct.value ASC NULLS LAST
+            LIMIT 10
+        """, {"target": target})
+        profile["top_compounds"] = top_compounds
+
+        # 5. SAR summary
+        sar = self._execute_safe("""
+            SELECT COUNT(*) AS total_compounds,
+                   MIN(ct.value) AS best_ic50_nm,
+                   AVG(ct.value) AS mean_ic50_nm,
+                   MAX(c.max_phase) AS highest_phase,
+                   COUNT(DISTINCT ct.activity_type) AS assay_type_count
+            FROM compound_targets ct
+            JOIN compounds c ON c.id = ct.compound_id
+            WHERE ct.target_id = %(t)s
+        """, {"t": target})
+        profile["sar_summary"] = dict(sar[0]) if sar else {}
+
+        # 6. Disease associations (top 15)
+        diseases = self._execute_safe("""
+            SELECT i.id AS indication_id, i.name AS indication_name,
+                   i.therapeutic_area,
+                   ti.evidence_type, ti.association_score
+            FROM target_indications ti
+            JOIN indications i ON i.id = ti.indication_id
+            WHERE ti.target_id = %(t)s
+            ORDER BY ti.association_score DESC NULLS LAST
+            LIMIT 15
+        """, {"t": target})
+        profile["disease_associations"] = diseases
+
+        # 7. Validation evidence
+        val_by_type = self._execute_safe("""
+            SELECT validation_type, COUNT(*) AS evidence_count
+            FROM paper_validations
+            WHERE target_id = %(t)s
+            GROUP BY validation_type
+        """, {"t": target})
+        val_top_papers = self._execute_safe("""
+            SELECT p.title, p.journal, p.publication_date,
+                   p.citation_count, p.pmid,
+                   pv.validation_type, pv.model_system, pv.outcome
+            FROM paper_validations pv
+            JOIN papers p ON p.id = pv.paper_id
+            WHERE pv.target_id = %(t)s
+            ORDER BY p.citation_count DESC NULLS LAST
+            LIMIT 5
+        """, {"t": target})
+        profile["validation_evidence"] = {
+            "by_type": {r["validation_type"]: r["evidence_count"] for r in val_by_type},
+            "top_papers": val_top_papers,
+        }
+
+        # 8. Top pathways (10)
+        pathways = self._execute_safe("""
+            SELECT p.name AS pathway_name, p.source, p.category, tp.role
+            FROM target_pathways tp
+            JOIN pathways p ON p.id = tp.pathway_id
+            WHERE tp.target_id = %(t)s
+            LIMIT 10
+        """, {"t": target})
+        profile["pathways"] = pathways
+
+        # 9. Protein interactions (top 10)
+        ppis = self._execute_safe("""
+            SELECT ot.id AS partner_symbol, ot.name AS partner_name,
+                   ot.target_class AS partner_class,
+                   ti.interaction_type, ti.confidence_score, ti.source_db
+            FROM target_interactions ti
+            JOIN targets ot ON ot.id = ti.target_b_id
+            WHERE ti.target_a_id = %(t)s
+            ORDER BY ti.confidence_score DESC NULLS LAST
+            LIMIT 10
+        """, {"t": target})
+        profile["protein_interactions"] = ppis
+
+        # 10. Top organizations (10)
+        orgs = self._execute_safe("""
+            SELECT o.name AS org_name, o.org_type, o.is_big_pharma,
+                   COUNT(DISTINCT po.patent_id) AS patent_count
+            FROM patent_mentions_target pmt
+            JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+            JOIN organizations o ON o.id = po.org_id
+            WHERE pmt.target_id = %(t)s
+            GROUP BY o.name, o.org_type, o.is_big_pharma
+            ORDER BY patent_count DESC
+            LIMIT 10
+        """, {"t": target})
+        profile["top_organizations"] = orgs
+
+        # 11. Clinical pipeline (15) — compound_indications first, fallback to target_indications
+        pipeline = self._execute_safe("""
+            SELECT c.name AS compound_name, c.chembl_id,
+                   i.name AS indication_name,
+                   ci.max_phase, ci.clinical_status
+            FROM compound_targets ct
+            JOIN compound_indications ci ON ci.compound_id = ct.compound_id
+            JOIN compounds c ON c.id = ct.compound_id
+            JOIN indications i ON i.id = ci.indication_id
+            WHERE ct.target_id = %(t)s
+            ORDER BY ci.max_phase DESC NULLS LAST
+            LIMIT 15
+        """, {"t": target})
+
+        if len(pipeline) < 3:
+            fallback = self._execute_safe("""
+                SELECT c.name AS compound_name, c.chembl_id,
+                       i.name AS indication_name,
+                       c.max_phase,
+                       CASE WHEN c.max_phase >= 1 THEN 'clinical' ELSE 'preclinical' END AS clinical_status,
+                       ti.association_score
+                FROM compound_targets ct
+                JOIN compounds c ON c.id = ct.compound_id
+                JOIN target_indications ti ON ti.target_id = ct.target_id
+                JOIN indications i ON i.id = ti.indication_id
+                WHERE ct.target_id = %(t)s
+                  AND ti.association_score >= 0.3
+                ORDER BY c.max_phase DESC, ct.value ASC NULLS LAST, ti.association_score DESC
+                LIMIT 15
+            """, {"t": target})
+            seen = {(r["compound_name"], r["indication_name"]) for r in pipeline}
+            for row in fallback:
+                if (row["compound_name"], row["indication_name"]) not in seen:
+                    pipeline.append(dict(row))
+                    seen.add((row["compound_name"], row["indication_name"]))
+
+        profile["clinical_pipeline"] = pipeline
+
+        # 12. Publication trend (last 5 years)
+        trend = self._execute_safe("""
+            SELECT EXTRACT(YEAR FROM p.publication_date::date)::int AS year,
+                   COUNT(*) AS paper_count
+            FROM paper_mentions_target pmt
+            JOIN papers p ON p.id = pmt.paper_id
+            WHERE pmt.target_id = %(t)s
+              AND p.publication_date IS NOT NULL
+            GROUP BY year
+            ORDER BY year DESC
+            LIMIT 5
+        """, {"t": target})
+        profile["publication_trend"] = trend
+
+        # 13. Structural intelligence (AlphaFold + druggability)
+        structure = self._execute_safe("""
+            SELECT uniprot_id, afdb_url, pdb_url, cif_url, pae_url, afdb_version,
+                   seq_length, mean_plddt, median_plddt,
+                   plddt_high_frac, plddt_confident_frac, plddt_low_frac,
+                   disorder_frac,
+                   pocket_count, top_pocket_volume, top_pocket_score,
+                   pockets, structural_tier,
+                   fetched_at, computed_at
+            FROM target_structure
+            WHERE target_id = %(t)s
+        """, {"t": target})
+        profile["structure"] = dict(structure[0]) if structure else None
+
+        return profile
+
+    # =====================================================================
+    # Structural intelligence (AlphaFold + druggability)
+    # =====================================================================
+
+    def get_target_structure(self, target_symbol: str) -> dict[str, Any] | None:
+        """Return AlphaFold structure summary + druggability for a target.
+
+        None if the target isn't in the KG or has no AlphaFold model loaded.
+        """
+        target = self._resolve_target(target_symbol)
+        rows = self._execute_safe("""
+            SELECT ts.target_id, t.name AS target_name,
+                   ts.uniprot_id, ts.afdb_url, ts.pdb_url, ts.cif_url, ts.pae_url,
+                   ts.afdb_version,
+                   ts.seq_length, ts.mean_plddt, ts.median_plddt,
+                   ts.plddt_high_frac, ts.plddt_confident_frac,
+                   ts.plddt_low_frac, ts.disorder_frac,
+                   ts.pocket_count, ts.top_pocket_volume, ts.top_pocket_score,
+                   ts.pockets, ts.structural_tier,
+                   ts.fetched_at, ts.computed_at
+            FROM target_structure ts
+            JOIN targets t ON t.id = ts.target_id
+            WHERE ts.target_id = %(t)s
+        """, {"t": target})
+        return dict(rows[0]) if rows else None
+
+    def find_undruggable_targets(
+        self,
+        therapy_area: str | None = None,
+        max_pocket_score: float = 0.4,
+        min_disorder_frac: float = 0.0,
+        require_validation: bool = True,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Find structurally challenging targets with unmet pipeline activity.
+
+        A target is "undruggable" by *structural* signals if:
+            - structural_tier IN ('challenging', 'undruggable'), OR
+            - top_pocket_score < max_pocket_score, OR
+            - disorder_frac >= min_disorder_frac (when caller raises the bar)
+
+        We additionally surface validation evidence so callers can focus on
+        targets that *matter* clinically — high validation + structural
+        intractability is the white-space for new modalities (PROTAC, glue,
+        biologic, RNAi). Sorted by an opportunity score that rewards
+        validated, well-evidenced, low-competition targets.
+        """
+        params: dict[str, Any] = {
+            "max_pocket_score": max_pocket_score,
+            "min_disorder_frac": min_disorder_frac,
+            "limit": limit,
+        }
+
+        area_filter = ""
+        if therapy_area:
+            area_filter = """
+                AND t.id IN (
+                    SELECT ti2.target_id FROM target_indications ti2
+                    JOIN indications i2 ON i2.id = ti2.indication_id
+                    WHERE LOWER(i2.therapeutic_area) LIKE %(area)s
+                       OR LOWER(i2.name) LIKE %(area)s
+                )
+            """
+            params["area"] = f"%{therapy_area.lower()}%"
+
+        validation_filter = ""
+        if require_validation:
+            validation_filter = """
+                AND (
+                    EXISTS (SELECT 1 FROM paper_validations pv WHERE pv.target_id = t.id)
+                    OR (ts_score.scientific_validation IS NOT NULL
+                        AND ts_score.scientific_validation >= 0.3)
+                )
+            """
+
+        return self._execute_safe(f"""
+            SELECT
+                t.id AS gene_symbol,
+                t.name AS target_name,
+                t.target_class,
+                t.protein_family,
+                ts.structural_tier,
+                ts.mean_plddt,
+                ts.disorder_frac,
+                ts.pocket_count,
+                ts.top_pocket_score,
+                ts.top_pocket_volume,
+                ts.uniprot_id,
+                ts.afdb_url,
+                ts_score.scientific_validation,
+                ts_score.competitive_intensity,
+                (SELECT COUNT(*) FROM compound_targets WHERE target_id = t.id)
+                    AS compound_count,
+                (SELECT COUNT(*) FROM compound_targets ct
+                 JOIN compounds c ON c.id = ct.compound_id
+                 WHERE ct.target_id = t.id AND c.max_phase >= 4) AS approved_drug_count,
+                (SELECT COUNT(*) FROM paper_validations WHERE target_id = t.id)
+                    AS validation_count,
+                -- Opportunity score: validation × structural intractability ×
+                -- (1 - competition).
+                (
+                    COALESCE(ts_score.scientific_validation, 0.3)
+                    * (1.0 - COALESCE(ts.top_pocket_score, 0.0))
+                    * (1.0 - COALESCE(ts_score.competitive_intensity, 0.0))
+                ) AS opportunity_score
+            FROM targets t
+            JOIN target_structure ts ON ts.target_id = t.id
+            LEFT JOIN target_scores ts_score ON ts_score.target_id = t.id
+            WHERE (
+                    ts.structural_tier IN ('challenging', 'undruggable')
+                    OR (ts.top_pocket_score IS NOT NULL
+                        AND ts.top_pocket_score < %(max_pocket_score)s)
+                    OR (ts.disorder_frac IS NOT NULL
+                        AND ts.disorder_frac >= %(min_disorder_frac)s
+                        AND %(min_disorder_frac)s > 0)
+                  )
+                  {area_filter}
+                  {validation_filter}
+            ORDER BY opportunity_score DESC NULLS LAST
+            LIMIT %(limit)s
+        """, params)
+
+    # =====================================================================
+    # Standalone enrichment queries
+    # =====================================================================
+
+    def get_target_scores(self, target_symbol: str) -> dict[str, Any] | None:
+        """Get computed attractiveness scores for a target."""
+        target = self._resolve_target(target_symbol)
+        rows = self._execute_safe("""
+            SELECT ts.target_id, t.name AS target_name,
+                   ts.target_attractiveness, ts.scientific_validation,
+                   ts.druggability, ts.competitive_intensity,
+                   ts.momentum, ts.momentum_direction, ts.computed_at
+            FROM target_scores ts
+            JOIN targets t ON t.id = ts.target_id
+            WHERE ts.target_id = %(t)s
+        """, {"t": target})
+        return dict(rows[0]) if rows else None
+
+    def get_target_validation_summary(self, target_symbol: str) -> dict[str, Any]:
+        """Get validation evidence summary grouped by type."""
+        target = self._resolve_target(target_symbol)
+
+        by_type = self._execute_safe("""
+            SELECT validation_type, COUNT(*) AS count,
+                   COUNT(DISTINCT CASE WHEN outcome = 'positive' THEN paper_id END) AS positive,
+                   COUNT(DISTINCT CASE WHEN outcome = 'negative' THEN paper_id END) AS negative,
+                   COUNT(DISTINCT CASE WHEN outcome = 'mixed' THEN paper_id END) AS mixed
+            FROM paper_validations
+            WHERE target_id = %(t)s
+            GROUP BY validation_type
+        """, {"t": target})
+
+        top_papers = self._execute_safe("""
+            SELECT p.title, p.journal, p.publication_date, p.pmid,
+                   p.citation_count,
+                   pv.validation_type, pv.model_system, pv.outcome
+            FROM paper_validations pv
+            JOIN papers p ON p.id = pv.paper_id
+            WHERE pv.target_id = %(t)s
+            ORDER BY p.citation_count DESC NULLS LAST
+            LIMIT 10
+        """, {"t": target})
+
+        # Genetic / functional evidence layers — additive over the
+        # paper-validation summary.
+        genetic_evidence: dict[str, Any] = {}
+
+        # DepMap CRISPR essentiality (per-target rollup).
+        ess = self._execute_safe(
+            "SELECT to_regclass('target_essentiality') AS t"
+        )
+        if ess and ess[0].get("t"):
+            row = self._execute_safe(
+                """SELECT mean_gene_effect, dependency_fraction, n_models
+                   FROM target_essentiality WHERE target_id = %(t)s""",
+                {"t": target},
+            )
+            if row:
+                r = row[0]
+                genetic_evidence["depmap_essentiality"] = {
+                    "mean_gene_effect": float(r["mean_gene_effect"] or 0),
+                    "dependency_fraction": float(r["dependency_fraction"] or 0),
+                    "n_models": int(r["n_models"] or 0),
+                    "source": "DepMap CRISPR (Chronos)",
+                    "interpretation": (
+                        "Lower gene_effect = stronger essentiality. "
+                        "dependency_fraction is the share of cell models where "
+                        "this gene scored below the essentiality threshold."
+                    ),
+                }
+
+        # AlphaMissense variant pathogenicity (per-target rollup).
+        am = self._execute_safe(
+            "SELECT to_regclass('target_variant_pathogenicity') AS t"
+        )
+        if am and am[0].get("t"):
+            row = self._execute_safe(
+                """SELECT uniprot_id, n_variants, mean_score, pct_pathogenic,
+                          hotspot_residues, license
+                   FROM target_variant_pathogenicity WHERE target_id = %(t)s""",
+                {"t": target},
+            )
+            if row:
+                r = row[0]
+                genetic_evidence["alphamissense"] = {
+                    "uniprot_id": r["uniprot_id"],
+                    "n_missense_variants": int(r["n_variants"] or 0),
+                    "mean_pathogenicity": float(r["mean_score"] or 0),
+                    "pct_pathogenic": float(r["pct_pathogenic"] or 0),
+                    "hotspot_residues": r["hotspot_residues"] or [],
+                    "license": r["license"],
+                    "source": "AlphaMissense (DeepMind, 2023)",
+                }
+
+        return {
+            "target": target,
+            "validation_types": by_type,
+            "top_papers": top_papers,
+            "total_evidence": sum(r["count"] for r in by_type),
+            "genetic_evidence": genetic_evidence,
+        }
+
+    def get_clinical_pipeline(self, target_symbol: str) -> dict[str, Any]:
+        """Get clinical trial pipeline for compounds targeting a gene.
+
+        Preferred: real ClinicalTrials.gov data via trials/trial_targets/trial_compounds
+        tables (populated by scripts/fetch_clinical_trials.py). Each entry carries
+        nct_id, brief_title, phase, status, sponsor, start/completion dates.
+
+        Fallback: when trials table is empty for this target, fall back to the legacy
+        synthesized pipeline built from compound_indications.max_phase. Fallback rows
+        have nct_id = NULL so callers can distinguish real trial data from synthesized.
+        """
+        target = self._resolve_target(target_symbol)
+
+        # Primary: real trial roster from trials table
+        trials = self._execute_safe("""
+            SELECT tr.nct_id, tr.brief_title, tr.phase, tr.overall_status,
+                   tr.lead_sponsor, tr.sponsor_class, tr.start_date, tr.completion_date,
+                   tr.enrollment, tr.has_results, tr.why_stopped,
+                   tr.study_type, tr.conditions, tr.interventions,
+                   COALESCE(c.pref_name, c.name, c.chembl_id) AS compound_name,
+                   c.chembl_id, c.max_phase AS compound_max_phase
+            FROM trials tr
+            JOIN trial_targets tt ON tt.nct_id = tr.nct_id
+            LEFT JOIN trial_compounds tc ON tc.nct_id = tr.nct_id
+            LEFT JOIN compounds c ON c.id = tc.compound_id
+            WHERE tt.target_id = %(t)s
+            ORDER BY
+                CASE tr.phase
+                    WHEN 'Phase 4' THEN 4
+                    WHEN 'Phase 3' THEN 3
+                    WHEN 'Phase 2' THEN 2
+                    WHEN 'Phase 1' THEN 1
+                    ELSE 0
+                END DESC,
+                tr.start_date DESC NULLS LAST
+            LIMIT 50
+        """, {"t": target})
+
+        # Secondary: compound_indications-derived pipeline (pre-CT.gov-ingest data)
+        synthesized = self._execute_safe("""
+            SELECT NULL::text AS nct_id,
+                   NULL::text AS brief_title,
+                   COALESCE(c.pref_name, c.name, c.chembl_id, c.id) AS compound_name,
+                   c.chembl_id,
+                   c.max_phase AS compound_max_phase,
+                   i.name AS indication_name, i.therapeutic_area,
+                   CASE ci.max_phase
+                       WHEN 4 THEN 'Phase 4'
+                       WHEN 3 THEN 'Phase 3'
+                       WHEN 2 THEN 'Phase 2'
+                       WHEN 1 THEN 'Phase 1'
+                       WHEN 0 THEN 'Preclinical'
+                       ELSE NULL
+                   END AS phase,
+                   ci.clinical_status AS overall_status,
+                   NULL::text AS lead_sponsor
+            FROM compound_targets ct
+            JOIN compound_indications ci ON ci.compound_id = ct.compound_id
+            JOIN compounds c ON c.id = ct.compound_id
+            JOIN indications i ON i.id = ci.indication_id
+            WHERE ct.target_id = %(t)s
+            ORDER BY ci.max_phase DESC NULLS LAST, c.name
+            LIMIT 30
+        """, {"t": target})
+
+        # If the trials roster is weak, supplement with synthesized rows
+        # (deduped on compound+phase so we don't show the same compound twice).
+        combined: list[dict[str, Any]] = [dict(r) for r in trials]
+        if len(combined) < 5:
+            seen = {(r.get("compound_name"), r.get("phase")) for r in combined}
+            for row in synthesized:
+                key = (row.get("compound_name"), row.get("phase"))
+                if key not in seen:
+                    combined.append(dict(row))
+                    seen.add(key)
+
+        # Last-resort fallback: trial_targets + compound_indications both empty
+        # for this target. Fall back to compound_targets + compounds.max_phase so
+        # callers at least see the drug roster with phase annotation.
+        if not combined:
+            basic = self._execute_safe("""
+                SELECT NULL::text AS nct_id,
+                       NULL::text AS brief_title,
+                       COALESCE(c.pref_name, c.name, c.chembl_id, c.id) AS compound_name,
+                       c.chembl_id,
+                       c.max_phase AS compound_max_phase,
+                       NULL::text AS indication_name,
+                       NULL::text AS therapeutic_area,
+                       CASE c.max_phase
+                           WHEN 4 THEN 'Phase 4'
+                           WHEN 3 THEN 'Phase 3'
+                           WHEN 2 THEN 'Phase 2'
+                           WHEN 1 THEN 'Phase 1'
+                           WHEN 0 THEN 'Preclinical'
+                           ELSE 'Unknown'
+                       END AS phase,
+                       NULL::text AS overall_status,
+                       NULL::text AS lead_sponsor,
+                       ct.activity_type, ct.value AS activity_nm
+                FROM compound_targets ct
+                JOIN compounds c ON c.id = ct.compound_id
+                WHERE ct.target_id = %(t)s
+                ORDER BY c.max_phase DESC NULLS LAST, ct.value ASC NULLS LAST
+                LIMIT 30
+            """, {"t": target})
+            combined = [dict(r) for r in basic]
+
+        # Count how many are real trial entries vs synthesized
+        real_count = sum(1 for r in combined if r.get("nct_id"))
+        return {
+            "target": target,
+            "pipeline": combined,
+            "total_entries": len(combined),
+            "real_trials_count": real_count,
+            "synthesized_count": len(combined) - real_count,
+            "data_sources": (
+                ["clinicaltrials.gov", "chembl"] if real_count
+                else ["chembl"]
+            ),
+        }
+
+    def compare_targets(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """Side-by-side comparison of multiple targets."""
+        targets = [s.strip().upper() for s in symbols[:5]]
+
+        return self._execute_safe("""
+            SELECT
+                t.id AS gene_symbol, t.name AS target_name,
+                t.target_class, t.druggability_tier,
+                t.function_description,
+                (SELECT COUNT(*) FROM compound_targets WHERE target_id = t.id) AS compound_count,
+                (SELECT COUNT(*) FROM patent_mentions_target WHERE target_id = t.id) AS patent_count,
+                (SELECT COUNT(*) FROM paper_mentions_target WHERE target_id = t.id) AS paper_count,
+                (SELECT MIN(ct2.value) FROM compound_targets ct2 WHERE ct2.target_id = t.id) AS best_ic50_nm,
+                (SELECT MAX(c2.max_phase) FROM compound_targets ct3
+                 JOIN compounds c2 ON c2.id = ct3.compound_id
+                 WHERE ct3.target_id = t.id) AS highest_phase,
+                ts.target_attractiveness, ts.scientific_validation,
+                ts.druggability, ts.competitive_intensity,
+                ts.momentum, ts.momentum_direction
+            FROM targets t
+            LEFT JOIN target_scores ts ON ts.target_id = t.id
+            WHERE t.id = ANY(%(targets)s)
+        """, {"targets": targets})
+
+    def get_target_compounds(
+        self, target_symbol: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        target = self._resolve_target(target_symbol)
+        return self._execute_safe("""
+            SELECT c.id AS compound_id, c.name AS compound_name,
+                   c.chembl_id, c.smiles, c.max_phase,
+                   ct.activity_type, ct.value AS activity_value,
+                   ct.unit, ct.pchembl_value
+            FROM compound_targets ct
+            JOIN compounds c ON c.id = ct.compound_id
+            WHERE ct.target_id = %(target)s
+            ORDER BY ct.value ASC NULLS LAST
+            LIMIT %(limit)s
+        """, {"target": target, "limit": limit})
+
+    def get_target_patents(
+        self, target_symbol: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        target = self._resolve_target(target_symbol)
+        return self._execute_safe("""
+            SELECT p.id AS patent_id, p.title,
+                   p.filing_date, p.publication_date,
+                   p.country_code AS jurisdiction,
+                   ARRAY_AGG(DISTINCT o.name) FILTER (WHERE o.name IS NOT NULL) AS assignees
+            FROM patent_mentions_target pmt
+            JOIN patents p ON p.id = pmt.patent_id
+            LEFT JOIN patent_organizations po ON po.patent_id = p.id
+            LEFT JOIN organizations o ON o.id = po.org_id
+            WHERE pmt.target_id = %(target)s
+            GROUP BY p.id, p.title, p.filing_date, p.publication_date, p.country_code
+            ORDER BY COALESCE(p.filing_date, p.publication_date, '') DESC
+            LIMIT %(limit)s
+        """, {"target": target, "limit": limit})
+
+    def get_target_papers(
+        self, target_symbol: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        target = self._resolve_target(target_symbol)
+        return self._execute_safe("""
+            SELECT p.id AS paper_id, p.title,
+                   p.publication_date, p.journal, p.pmid, p.doi
+            FROM paper_mentions_target pmt
+            JOIN papers p ON p.id = pmt.paper_id
+            WHERE pmt.target_id = %(target)s
+            ORDER BY COALESCE(p.publication_date, '') DESC
+            LIMIT %(limit)s
+        """, {"target": target, "limit": limit})
+
+    def list_indications(self) -> list[dict[str, Any]]:
+        """List indications with their linked target count.
+
+        Sources both target_indications (KG-derived) and trial_indications
+        (CT.gov-derived) so that CT.gov conditions appear even before
+        explicit target->indication edges are mined.
+        """
+        return self._execute_safe("""
+            SELECT i.id AS indication_id,
+                   i.name AS indication_name,
+                   i.mesh_id,
+                   i.therapeutic_area,
+                   COALESCE(ti_counts.target_count, 0) AS target_count,
+                   COALESCE(tr_counts.trial_count, 0) AS trial_count
+            FROM indications i
+            LEFT JOIN (
+                SELECT indication_id, COUNT(DISTINCT target_id) AS target_count
+                FROM target_indications
+                GROUP BY indication_id
+            ) ti_counts ON ti_counts.indication_id = i.id
+            LEFT JOIN (
+                SELECT indication_id, COUNT(DISTINCT nct_id) AS trial_count
+                FROM trial_indications
+                GROUP BY indication_id
+            ) tr_counts ON tr_counts.indication_id = i.id
+            WHERE COALESCE(ti_counts.target_count, 0) + COALESCE(tr_counts.trial_count, 0) > 0
+            ORDER BY trial_count DESC, target_count DESC
+            LIMIT 200
+        """)
+
+    def list_subindications(
+        self, parent_indication: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List oncology sub-indications with target counts.
+
+        A sub-indication is any indication flagged is_oncology_subtype or
+        having a parent. Optionally filter to direct children of
+        `parent_indication` (matched by id, exact name, or a synonym).
+        """
+        where = ["(c.is_oncology_subtype IS TRUE OR c.parent_id IS NOT NULL)"]
+        params: dict[str, Any] = {}
+        if parent_indication:
+            params["parent"] = parent_indication.strip()
+            params["parent_lower"] = parent_indication.strip().lower()
+            where.append(
+                """c.parent_id IN (
+                    SELECT p.id FROM indications p
+                    WHERE p.id = %(parent)s
+                       OR lower(p.name) = %(parent_lower)s
+                       OR %(parent_lower)s = ANY(
+                            SELECT lower(s) FROM unnest(
+                                COALESCE(p.synonyms, '{}'::text[])) AS s)
+                )"""
+            )
+        return self._execute_safe(
+            f"""
+            SELECT c.id AS indication_id,
+                   c.name AS indication_name,
+                   c.parent_id,
+                   p.name AS parent_name,
+                   c.is_oncology_subtype,
+                   COALESCE(c.synonyms, '{{}}') AS synonyms,
+                   COALESCE(tc.target_count, 0) AS target_count
+            FROM indications c
+            LEFT JOIN indications p ON p.id = c.parent_id
+            LEFT JOIN (
+                SELECT indication_id, COUNT(DISTINCT target_id) AS target_count
+                FROM target_indications GROUP BY indication_id
+            ) tc ON tc.indication_id = c.id
+            WHERE {' AND '.join(where)}
+            ORDER BY target_count DESC, c.name ASC
+            LIMIT 500
+            """,
+            params or None,
+        )
+
+    def get_subindication_breakdown(
+        self, gene_symbol: str, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Top oncology sub-indications linked to a target, by edge evidence."""
+        return self._execute_safe(
+            """
+            SELECT i.id AS indication_id,
+                   i.name AS indication_name,
+                   i.parent_id,
+                   ti.evidence_type,
+                   MAX(ti.association_score) AS association_score
+            FROM targets t
+            JOIN target_indications ti ON ti.target_id = t.id
+            JOIN indications i ON i.id = ti.indication_id
+            WHERE (upper(t.symbol) = upper(%(sym)s)
+                   OR upper(t.id) = upper(%(sym)s))
+              AND i.is_oncology_subtype IS TRUE
+            GROUP BY i.id, i.name, i.parent_id, ti.evidence_type
+            ORDER BY association_score DESC NULLS LAST, i.name ASC
+            LIMIT %(lim)s
+            """,
+            {"sym": gene_symbol.strip(), "lim": limit},
+        )
+
+    # =====================================================================
+    # Graph-fallback queries for real_data_provider
+    # =====================================================================
+
+    def fetch_targets_summary(
+        self, indication_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        indication_literal = indication_id or "all"
+        params: dict[str, Any] = {"ind_literal": indication_literal}
+
+        # Subquery computes best activity per target (lowest value) AND captures
+        # its activity_type + compound details, avoiding the "IC50 vs Ki" mislabeling
+        # of the old `best_ic50_nm` column. best_ic50_nm kept as deprecated alias
+        # until all callers migrated.
+        if indication_id:
+            params["ind"] = indication_id
+            return self._execute_safe("""
+                WITH best_act AS (
+                    SELECT DISTINCT ON (ct.target_id)
+                        ct.target_id,
+                        ct.value AS best_activity_value,
+                        COALESCE(ct.activity_type, 'IC50') AS best_activity_type,
+                        ct.unit AS best_activity_unit,
+                        ct.compound_id AS best_compound_id,
+                        COALESCE(c.pref_name, c.name, c.chembl_id, ct.compound_id) AS best_compound_name,
+                        c.max_phase AS best_compound_max_phase
+                    FROM compound_targets ct
+                    LEFT JOIN compounds c ON c.id = ct.compound_id
+                    WHERE ct.value IS NOT NULL
+                    ORDER BY ct.target_id, ct.value ASC NULLS LAST
+                )
+                SELECT
+                    COALESCE(t.uniprot_id, t.id) AS target_id,
+                    t.id AS gene_symbol,
+                    COALESCE(t.name, t.id) AS target_name,
+                    COALESCE(t.target_class, 'unknown') AS target_class,
+                    %(ind_literal)s AS indication_id,
+                    COUNT(DISTINCT pamt.patent_id) AS patent_count,
+                    COUNT(DISTINCT pmt.paper_id) AS paper_count,
+                    COUNT(DISTINCT ct.compound_id) AS compound_count,
+                    MIN(ba.best_activity_value) AS best_activity_value,
+                    (ARRAY_AGG(ba.best_activity_type))[1] AS best_activity_type,
+                    (ARRAY_AGG(ba.best_activity_unit))[1] AS best_activity_unit,
+                    MIN(ba.best_activity_value) AS best_ic50_nm,  -- deprecated alias
+                    (ARRAY_AGG(ba.best_compound_id))[1] AS best_compound_id,
+                    (ARRAY_AGG(ba.best_compound_name))[1] AS best_compound_name,
+                    (ARRAY_AGG(ba.best_compound_max_phase))[1] AS best_compound_max_phase,
+                    COUNT(DISTINCT o.id) AS active_org_count,
+                    0.0 AS target_attractiveness_score,
+                    0.0 AS scientific_validation_score,
+                    0.0 AS competitive_intensity_score,
+                    0.0 AS momentum_score,
+                    0.0 AS druggability_score,
+                    'stable' AS momentum_direction
+                FROM targets t
+                JOIN target_indications ti ON ti.target_id = t.id AND ti.indication_id = %(ind)s
+                LEFT JOIN patent_mentions_target pamt ON pamt.target_id = t.id
+                LEFT JOIN paper_mentions_target pmt ON pmt.target_id = t.id
+                LEFT JOIN compound_targets ct ON ct.target_id = t.id
+                LEFT JOIN best_act ba ON ba.target_id = t.id
+                LEFT JOIN patent_organizations po ON po.patent_id = pamt.patent_id
+                LEFT JOIN organizations o ON o.id = po.org_id
+                GROUP BY t.id, t.uniprot_id, t.name, t.target_class
+            """, params)
+        else:
+            return self._execute_safe("""
+                WITH best_act AS (
+                    SELECT DISTINCT ON (ct.target_id)
+                        ct.target_id,
+                        ct.value AS best_activity_value,
+                        COALESCE(ct.activity_type, 'IC50') AS best_activity_type,
+                        ct.unit AS best_activity_unit,
+                        ct.compound_id AS best_compound_id,
+                        COALESCE(c.pref_name, c.name, c.chembl_id, ct.compound_id) AS best_compound_name,
+                        c.max_phase AS best_compound_max_phase
+                    FROM compound_targets ct
+                    LEFT JOIN compounds c ON c.id = ct.compound_id
+                    WHERE ct.value IS NOT NULL
+                    ORDER BY ct.target_id, ct.value ASC NULLS LAST
+                )
+                SELECT
+                    COALESCE(t.uniprot_id, t.id) AS target_id,
+                    t.id AS gene_symbol,
+                    COALESCE(t.name, t.id) AS target_name,
+                    COALESCE(t.target_class, 'unknown') AS target_class,
+                    %(ind_literal)s AS indication_id,
+                    COUNT(DISTINCT pamt.patent_id) AS patent_count,
+                    COUNT(DISTINCT pmt.paper_id) AS paper_count,
+                    COUNT(DISTINCT ct.compound_id) AS compound_count,
+                    MIN(ba.best_activity_value) AS best_activity_value,
+                    (ARRAY_AGG(ba.best_activity_type))[1] AS best_activity_type,
+                    (ARRAY_AGG(ba.best_activity_unit))[1] AS best_activity_unit,
+                    MIN(ba.best_activity_value) AS best_ic50_nm,  -- deprecated alias
+                    (ARRAY_AGG(ba.best_compound_id))[1] AS best_compound_id,
+                    (ARRAY_AGG(ba.best_compound_name))[1] AS best_compound_name,
+                    (ARRAY_AGG(ba.best_compound_max_phase))[1] AS best_compound_max_phase,
+                    COUNT(DISTINCT o.id) AS active_org_count,
+                    0.0 AS target_attractiveness_score,
+                    0.0 AS scientific_validation_score,
+                    0.0 AS competitive_intensity_score,
+                    0.0 AS momentum_score,
+                    0.0 AS druggability_score,
+                    'stable' AS momentum_direction
+                FROM targets t
+                LEFT JOIN patent_mentions_target pamt ON pamt.target_id = t.id
+                LEFT JOIN paper_mentions_target pmt ON pmt.target_id = t.id
+                LEFT JOIN compound_targets ct ON ct.target_id = t.id
+                LEFT JOIN best_act ba ON ba.target_id = t.id
+                LEFT JOIN patent_organizations po ON po.patent_id = pamt.patent_id
+                LEFT JOIN organizations o ON o.id = po.org_id
+                GROUP BY t.id, t.uniprot_id, t.name, t.target_class
+            """, params)
+
+    def fetch_orgs_summary(
+        self, indication_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        if indication_id:
+            return self._execute_safe("""
+                SELECT
+                    o.id AS org_id, o.name AS org_name,
+                    COALESCE(o.org_type, 'unknown') AS org_type,
+                    %(ind)s AS indication_id,
+                    COUNT(DISTINCT pamt.target_id) AS targets_active,
+                    COUNT(DISTINCT po.patent_id) AS total_patents,
+                    0 AS total_papers,
+                    0.0 AS portfolio_breadth_score,
+                    0.0 AS activity_intensity_score
+                FROM organizations o
+                JOIN patent_organizations po ON po.org_id = o.id
+                JOIN patent_mentions_target pamt ON pamt.patent_id = po.patent_id
+                JOIN target_indications ti ON ti.target_id = pamt.target_id
+                    AND ti.indication_id = %(ind)s
+                GROUP BY o.id, o.name, o.org_type
+            """, {"ind": indication_id})
+        else:
+            return self._execute_safe("""
+                SELECT
+                    o.id AS org_id, o.name AS org_name,
+                    COALESCE(o.org_type, 'unknown') AS org_type,
+                    'all' AS indication_id,
+                    COUNT(DISTINCT pamt.target_id) AS targets_active,
+                    COUNT(DISTINCT po.patent_id) AS total_patents,
+                    0 AS total_papers,
+                    0.0 AS portfolio_breadth_score,
+                    0.0 AS activity_intensity_score
+                FROM organizations o
+                JOIN patent_organizations po ON po.org_id = o.id
+                JOIN patent_mentions_target pamt ON pamt.patent_id = po.patent_id
+                GROUP BY o.id, o.name, o.org_type
+            """)
+
+    def fetch_compounds_summary(
+        self, target_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        if target_id:
+            return self._execute_safe("""
+                SELECT
+                    COALESCE(c.chembl_id, c.id) AS compound_id,
+                    COALESCE(c.name, c.chembl_id, c.id) AS compound_name,
+                    c.inchikey, c.smiles,
+                    t.id AS target_id,
+                    MIN(ct.value) AS best_ic50_nm,
+                    (ARRAY_AGG(COALESCE(ct.activity_type, 'IC50')))[1] AS activity_type,
+                    0.0 AS novelty_score,
+                    0 AS patent_count
+                FROM compounds c
+                JOIN compound_targets ct ON ct.compound_id = c.id
+                JOIN targets t ON t.id = ct.target_id
+                WHERE LOWER(COALESCE(t.uniprot_id, t.id)) = LOWER(%(tid)s)
+                GROUP BY c.id, c.chembl_id, c.name, c.inchikey, c.smiles, t.id
+            """, {"tid": target_id})
+        else:
+            return self._execute_safe("""
+                SELECT
+                    COALESCE(c.chembl_id, c.id) AS compound_id,
+                    COALESCE(c.name, c.chembl_id, c.id) AS compound_name,
+                    c.inchikey, c.smiles,
+                    t.id AS target_id,
+                    MIN(ct.value) AS best_ic50_nm,
+                    (ARRAY_AGG(COALESCE(ct.activity_type, 'IC50')))[1] AS activity_type,
+                    0.0 AS novelty_score,
+                    0 AS patent_count
+                FROM compounds c
+                JOIN compound_targets ct ON ct.compound_id = c.id
+                JOIN targets t ON t.id = ct.target_id
+                GROUP BY c.id, c.chembl_id, c.name, c.inchikey, c.smiles, t.id
+            """)
+
+    # =====================================================================
+    # Helpers
+    # =====================================================================
+
+    # =====================================================================
+    # New high-value queries (P2 — differentiation tools)
+    # =====================================================================
+
+    def find_whitespace_opportunities(
+        self, therapy_area: str | None = None, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Find underexplored high-score targets — white-space opportunities.
+
+        Targets with high scientific validation but low competitive intensity
+        and few compounds represent the best opportunities for novel programs.
+        """
+        params: dict[str, Any] = {"limit": limit}
+
+        area_filter = ""
+        if therapy_area:
+            area_filter = """
+                AND t.id IN (
+                    SELECT ti2.target_id FROM target_indications ti2
+                    JOIN indications i2 ON i2.id = ti2.indication_id
+                    WHERE LOWER(i2.therapeutic_area) LIKE %(area)s
+                       OR LOWER(i2.name) LIKE %(area)s
+                )
+            """
+            params["area"] = f"%{therapy_area.lower()}%"
+
+        return self._execute_safe(f"""
+            SELECT
+                t.id AS gene_symbol,
+                t.name AS target_name,
+                t.target_class,
+                t.druggability_tier,
+                t.function_description,
+                ts.target_attractiveness,
+                ts.scientific_validation,
+                ts.competitive_intensity,
+                ts.momentum,
+                ts.momentum_direction,
+                (SELECT COUNT(*) FROM compound_targets WHERE target_id = t.id) AS compound_count,
+                (SELECT COUNT(*) FROM patent_mentions_target WHERE target_id = t.id) AS patent_count,
+                (SELECT COUNT(*) FROM paper_mentions_target WHERE target_id = t.id) AS paper_count,
+                (SELECT COUNT(DISTINCT o.id)
+                 FROM patent_mentions_target pmt
+                 JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+                 JOIN organizations o ON o.id = po.org_id
+                 WHERE pmt.target_id = t.id AND o.is_big_pharma = TRUE
+                ) AS big_pharma_count,
+                -- Opportunity score: high validation × low competition × has compounds
+                CASE
+                    WHEN ts.scientific_validation > 0 AND ts.competitive_intensity >= 0 THEN
+                        ts.scientific_validation * (1.0 - COALESCE(ts.competitive_intensity, 0))
+                        * CASE WHEN ts.momentum_direction = 'rising' THEN 1.2 ELSE 1.0 END
+                    ELSE 0
+                END AS opportunity_score
+            FROM targets t
+            JOIN target_scores ts ON ts.target_id = t.id
+            WHERE ts.scientific_validation >= 0.3
+              AND ts.competitive_intensity < 0.5
+              {area_filter}
+            ORDER BY opportunity_score DESC
+            LIMIT %(limit)s
+        """, params)
+
+    def get_org_portfolio(self, org_name: str) -> dict[str, Any]:
+        """Get full portfolio for an organization: targets, patents, compounds.
+
+        Organizations are not fully de-duplicated in the raw data (e.g. Roche
+        appears as "F HOFFMANN LA ROCHE AG", "F HOFFMANN LA ROCHE [CH]", ...),
+        so we resolve the query to a SET of matching org_ids and aggregate
+        across all variants, not just a single picked row.
+        """
+        org_clean = org_name.strip()
+        org_lower = org_clean.lower()
+
+        # Resolve to a list of org rows whose name word-boundary matches the query.
+        # We prefer Big Pharma-tagged rows, then longer-name rows, capped to 50.
+        org_rows = self._execute_safe(r"""
+            SELECT id, name, org_type, is_big_pharma, country
+            FROM organizations
+            WHERE LOWER(name) = %(org_exact)s
+               OR name ~* ('\m' || %(org_word)s || '\M')
+               OR LOWER(name) LIKE %(org_like)s
+            ORDER BY
+                CASE WHEN is_big_pharma THEN 0 ELSE 1 END,
+                LENGTH(name) ASC
+            LIMIT 50
+        """, {
+            "org_exact": org_lower,
+            "org_word": org_clean,
+            "org_like": f"%{org_lower}%",
+        })
+
+        if not org_rows:
+            return {"error": f"Organization matching '{org_name}' not found"}
+
+        # Primary row drives the display metadata; all IDs drive aggregation.
+        primary = dict(org_rows[0])
+        org_ids = [r["id"] for r in org_rows]
+
+        # Patents filed by ANY matching org variant
+        patents = self._execute_safe("""
+            SELECT p.id AS patent_id, p.title, p.filing_date,
+                   p.publication_date, p.country_code
+            FROM patent_organizations po
+            JOIN patents p ON p.id = po.patent_id
+            WHERE po.org_id = ANY(%(oids)s)
+            ORDER BY COALESCE(p.filing_date, p.publication_date, '') DESC
+            LIMIT 20
+        """, {"oids": org_ids})
+
+        # Targets this org is active on (via patents) — aggregated across variants
+        targets = self._execute_safe("""
+            SELECT t.id AS gene_symbol, t.name AS target_name,
+                   t.target_class, t.druggability_tier,
+                   COUNT(DISTINCT po.patent_id) AS patent_count
+            FROM patent_organizations po
+            JOIN patent_mentions_target pmt ON pmt.patent_id = po.patent_id
+            JOIN targets t ON t.id = pmt.target_id
+            WHERE po.org_id = ANY(%(oids)s)
+            GROUP BY t.id, t.name, t.target_class, t.druggability_tier
+            ORDER BY patent_count DESC
+            LIMIT 50
+        """, {"oids": org_ids})
+
+        # Therapy areas
+        areas = self._execute_safe("""
+            SELECT DISTINCT COALESCE(i.therapeutic_area, i.name) AS area,
+                   COUNT(DISTINCT t.id) AS target_count
+            FROM patent_organizations po
+            JOIN patent_mentions_target pmt ON pmt.patent_id = po.patent_id
+            JOIN targets t ON t.id = pmt.target_id
+            JOIN target_indications ti ON ti.target_id = t.id
+            JOIN indications i ON i.id = ti.indication_id
+            WHERE po.org_id = ANY(%(oids)s)
+            GROUP BY COALESCE(i.therapeutic_area, i.name)
+            ORDER BY target_count DESC
+            LIMIT 10
+        """, {"oids": org_ids})
+
+        # Count of total patents across all variants (for summary)
+        total_patents_row = self._execute_safe("""
+            SELECT COUNT(DISTINCT po.patent_id) AS n
+            FROM patent_organizations po
+            WHERE po.org_id = ANY(%(oids)s)
+        """, {"oids": org_ids})
+        total_patents = total_patents_row[0]["n"] if total_patents_row else len(patents)
+
+        return {
+            "organization": primary,
+            "matched_variants": len(org_ids),
+            "matched_names": [r["name"] for r in org_rows[:10]],
+            "targets": targets,
+            "recent_patents": patents,
+            "therapy_areas": areas,
+            "summary": {
+                "total_patents": total_patents,
+                "total_targets": len(targets),
+                "therapy_area_count": len(areas),
+            },
+        }
+
+    def get_target_network(self, target_symbol: str) -> dict[str, Any]:
+        """Full knowledge graph traversal for a target — all connected entities.
+
+        Returns a network map with nodes and edges suitable for graph
+        visualization or comprehensive analysis.
+        """
+        target = self._resolve_target(target_symbol)
+
+        # Core target info
+        info = self._execute_safe("""
+            SELECT id, name, target_class, druggability_tier,
+                   function_description
+            FROM targets WHERE id = %(t)s
+        """, {"t": target})
+
+        if not info:
+            return {"error": f"Target '{target}' not found"}
+
+        nodes = [{"id": target, "type": "Target", "label": info[0].get("name", target),
+                  "properties": dict(info[0])}]
+        edges = []
+
+        # Compounds
+        compounds = self._execute_safe("""
+            SELECT c.id, c.name, c.max_phase,
+                   ct.activity_type, ct.value AS activity_nm
+            FROM compound_targets ct
+            JOIN compounds c ON c.id = ct.compound_id
+            WHERE ct.target_id = %(t)s
+            ORDER BY ct.value ASC NULLS LAST
+            LIMIT 15
+        """, {"t": target})
+
+        for c in compounds:
+            nodes.append({"id": c["id"], "type": "Compound", "label": c["name"]})
+            edges.append({"source": c["id"], "target": target,
+                         "type": "TARGETS", "activity_nm": c.get("activity_nm")})
+
+        # PPIs — prefer the richer extended table (Mosaic-vs-all-genes) when
+        # populated; fall back to legacy within-Mosaic edges.
+        has_ppi_ext = self._execute_safe(
+            "SELECT to_regclass('target_interactions_ext') AS t"
+        )
+        if has_ppi_ext and has_ppi_ext[0].get("t"):
+            ppis = self._execute_safe("""
+                SELECT
+                  ti.partner_symbol AS id,
+                  COALESCE(ot.name, ti.partner_symbol) AS name,
+                  ti.confidence_score,
+                  ti.partner_in_mosaic
+                FROM target_interactions_ext ti
+                LEFT JOIN targets ot ON ot.id = ti.partner_symbol
+                WHERE ti.target_id = %(t)s
+                ORDER BY ti.confidence_score DESC NULLS LAST
+                LIMIT 15
+            """, {"t": target})
+        else:
+            ppis = self._execute_safe("""
+                SELECT ot.id, ot.name, ti.confidence_score,
+                       TRUE AS partner_in_mosaic
+                FROM target_interactions ti
+                JOIN targets ot ON ot.id = ti.target_b_id
+                WHERE ti.target_a_id = %(t)s
+                ORDER BY ti.confidence_score DESC NULLS LAST
+                LIMIT 10
+            """, {"t": target})
+
+        for p in ppis:
+            nodes.append({"id": p["id"], "type": "Target",
+                          "label": p["name"],
+                          "in_mosaic_kg": bool(p.get("partner_in_mosaic"))})
+            edges.append({"source": target, "target": p["id"],
+                         "type": "INTERACTS_WITH",
+                         "confidence": p.get("confidence_score")})
+
+        # Co-essential partners (DepMap CRISPR), if extended table is present.
+        has_coess_ext = self._execute_safe(
+            "SELECT to_regclass('target_coessentiality_ext') AS t"
+        )
+        if has_coess_ext and has_coess_ext[0].get("t"):
+            coess = self._execute_safe("""
+                SELECT ce.partner_symbol AS id,
+                       COALESCE(t2.name, ce.partner_symbol) AS name,
+                       ce.correlation, ce.partner_in_mosaic
+                FROM target_coessentiality_ext ce
+                LEFT JOIN targets t2 ON t2.id = ce.partner_symbol
+                WHERE ce.target_id = %(t)s
+                ORDER BY ABS(ce.correlation) DESC
+                LIMIT 10
+            """, {"t": target})
+            for c in coess:
+                # de-dupe by id; if the gene already appears as a PPI node
+                # just augment the edge.
+                if not any(n["id"] == c["id"] for n in nodes):
+                    nodes.append({
+                        "id": c["id"], "type": "Target",
+                        "label": c["name"],
+                        "in_mosaic_kg": bool(c.get("partner_in_mosaic")),
+                    })
+                edges.append({"source": target, "target": c["id"],
+                              "type": "CO_ESSENTIAL_WITH",
+                              "correlation": float(c["correlation"] or 0)})
+
+        # Pathways
+        pathways = self._execute_safe("""
+            SELECT p.id, p.name FROM target_pathways tp
+            JOIN pathways p ON p.id = tp.pathway_id
+            WHERE tp.target_id = %(t)s LIMIT 8
+        """, {"t": target})
+
+        for pw in pathways:
+            nodes.append({"id": pw["id"], "type": "Pathway", "label": pw["name"]})
+            edges.append({"source": target, "target": pw["id"], "type": "PARTICIPATES_IN"})
+
+        # Diseases
+        diseases = self._execute_safe("""
+            SELECT i.id, i.name, ti.association_score
+            FROM target_indications ti
+            JOIN indications i ON i.id = ti.indication_id
+            WHERE ti.target_id = %(t)s
+            ORDER BY ti.association_score DESC NULLS LAST
+            LIMIT 10
+        """, {"t": target})
+
+        for d in diseases:
+            nodes.append({"id": d["id"], "type": "Disease", "label": d["name"]})
+            edges.append({"source": target, "target": d["id"],
+                         "type": "IMPLICATED_IN", "score": d.get("association_score")})
+
+        # Organizations (via patents)
+        orgs = self._execute_safe("""
+            SELECT o.id, o.name, o.is_big_pharma,
+                   COUNT(DISTINCT po.patent_id) AS patent_count
+            FROM patent_mentions_target pmt
+            JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+            JOIN organizations o ON o.id = po.org_id
+            WHERE pmt.target_id = %(t)s
+            GROUP BY o.id, o.name, o.is_big_pharma
+            ORDER BY patent_count DESC
+            LIMIT 10
+        """, {"t": target})
+
+        for o in orgs:
+            nodes.append({"id": o["id"], "type": "Organization", "label": o["name"],
+                         "is_big_pharma": o.get("is_big_pharma")})
+            edges.append({"source": o["id"], "target": target,
+                         "type": "PATENTS_ON", "count": o.get("patent_count")})
+
+        return {
+            "center": target,
+            "nodes": nodes,
+            "edges": edges,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "node_types": {
+                ntype: sum(1 for n in nodes if n["type"] == ntype)
+                for ntype in set(n["type"] for n in nodes)
+            },
+        }
+
+    def find_synthetic_lethal_whitespace(
+        self,
+        approved_target: str | None = None,
+        lineage: str | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Synthetic-lethal *whitespace* candidates (KG-native, Move 2).
+
+        NOTE: this is a PPI + shared-pathway **proxy** for co-essentiality,
+        not DepMap co-essentiality (DepMap ingestion is Sprint 2.3.R.1 and
+        not yet loaded). The `co_functionality` field is explicitly a
+        proxy; `lineage` is reserved until DepMap lands (no-op for now).
+
+        For each anchor target A (a developed target with chemical
+        matter), find partners B that are functionally coupled to A
+        (STRING PPI and/or shared Reactome pathways) but are development
+        *whitespace* (< 5 patents, no clinical compound). Ranked by
+        whitespace_score = co_functionality x 1/(1+patents_B)
+        x (1 + ln(1+validation_evidence_B)).
+        """
+        if approved_target:
+            anchors = [self._resolve_target(approved_target)]
+        else:
+            rows = self._execute_safe("""
+                SELECT ct.target_id AS id, COUNT(*) AS n
+                FROM compound_targets ct
+                GROUP BY ct.target_id ORDER BY n DESC LIMIT 8
+            """)
+            anchors = [r["id"] for r in rows]
+        if not anchors:
+            return {"anchors": [], "candidates": [], "total": 0}
+
+        # Probe optional/new tables once; SQL is built only with the
+        # CTEs whose source data actually exists.
+        def _table_exists(tname: str) -> bool:
+            chk = self._execute_safe(
+                "SELECT to_regclass(%(t)s) AS t", {"t": tname}
+            )
+            return bool(chk and chk[0].get("t"))
+
+        has_coess = _table_exists("target_coessentiality")
+        has_coess_ext = _table_exists("target_coessentiality_ext")
+        has_ppi_ext = _table_exists("target_interactions_ext")
+
+        # ---- PPI source: prefer richer extended table when present.
+        # Extended table partners can be non-Mosaic genes (free strings);
+        # both are fine here — non-Mosaic partners surface as whitespace.
+        ppi_cte_legacy = """
+        ppi AS (
+            SELECT an.a, ti.target_b_id AS b, MAX(ti.confidence_score) AS conf
+            FROM anchors an
+            JOIN target_interactions ti ON ti.target_a_id = an.a
+            GROUP BY 1, 2
+        )
+        """
+        ppi_cte_ext = """
+        ppi AS (
+            SELECT an.a, ti.partner_symbol AS b,
+                   MAX(ti.confidence_score) AS conf
+            FROM anchors an
+            JOIN target_interactions_ext ti ON ti.target_id = an.a
+            GROUP BY 1, 2
+            UNION
+            SELECT an.a, ti.target_b_id AS b, MAX(ti.confidence_score) AS conf
+            FROM anchors an
+            JOIN target_interactions ti ON ti.target_a_id = an.a
+            GROUP BY 1, 2
+        )
+        """
+        ppi_cte = ppi_cte_ext if has_ppi_ext else ppi_cte_legacy
+
+        # ---- Co-essentiality source: prefer Mosaic-vs-all-genes when present.
+        if has_coess_ext:
+            coess_cte = """,
+        coess AS (
+            SELECT ce.target_id AS a, ce.partner_symbol AS b,
+                   ABS(ce.correlation) AS r
+            FROM target_coessentiality_ext ce
+            JOIN anchors an ON an.a = ce.target_id
+        )"""
+        elif has_coess:
+            coess_cte = """,
+        coess AS (
+            SELECT ce.target_a_id AS a, ce.target_b_id AS b,
+                   ABS(ce.correlation) AS r
+            FROM target_coessentiality ce
+            JOIN anchors an ON an.a = ce.target_a_id
+        )"""
+        else:
+            coess_cte = ""
+
+        has_any_coess = has_coess or has_coess_ext
+        coess_pairs = (
+            "FULL JOIN coess ce ON COALESCE(p.a, s.a) = ce.a "
+            "AND COALESCE(p.b, s.b) = ce.b"
+            if has_any_coess else ""
+        )
+        coess_sel_pairs = ", COALESCE(ce.r, 0) AS coess_r" if has_any_coess else \
+            ", 0::float AS coess_r"
+        coess_a = "COALESCE(p.a, s.a, ce.a)" if has_any_coess else "COALESCE(p.a, s.a)"
+        coess_b = "COALESCE(p.b, s.b, ce.b)" if has_any_coess else "COALESCE(p.b, s.b)"
+
+        sql = f"""
+        WITH anchors AS (SELECT unnest(%(anchors)s::text[]) AS a),
+        {ppi_cte},
+        shared_pw AS (
+            SELECT an.a, tp2.target_id AS b, COUNT(DISTINCT tp1.pathway_id) AS sp
+            FROM anchors an
+            JOIN target_pathways tp1 ON tp1.target_id = an.a
+            JOIN target_pathways tp2 ON tp2.pathway_id = tp1.pathway_id
+                                    AND tp2.target_id <> an.a
+            GROUP BY 1, 2
+        ){coess_cte},
+        pairs AS (
+            SELECT {coess_a} AS a, {coess_b} AS b,
+                   COALESCE(p.conf, 0) AS conf, COALESCE(s.sp, 0) AS sp
+                   {coess_sel_pairs}
+            FROM ppi p
+            FULL JOIN shared_pw s ON p.a = s.a AND p.b = s.b
+            {coess_pairs}
+        ),
+        scored AS (
+            SELECT pr.a, pr.b, pr.conf, pr.sp, pr.coess_r,
+                   (SELECT COUNT(DISTINCT patent_id) FROM patent_mentions_target
+                     WHERE target_id = pr.b) AS patents_b,
+                   (SELECT COUNT(*) FROM compound_targets WHERE target_id = pr.b)
+                     AS compounds_b,
+                   (SELECT COALESCE(MAX(c.max_phase), 0) FROM compound_targets ct
+                     JOIN compounds c ON c.id = ct.compound_id
+                     WHERE ct.target_id = pr.b) AS max_phase_b,
+                   (SELECT COUNT(*) FROM paper_validations WHERE target_id = pr.b)
+                     AS validation_b,
+                   (EXISTS (SELECT 1 FROM targets WHERE id = pr.b)) AS b_in_mosaic
+            FROM pairs pr
+            WHERE pr.b <> pr.a
+        )
+        -- LEFT JOIN on targets so partners that aren't in our curated set
+        -- still surface (these are pure whitespace candidates from the
+        -- richer DepMap / STRING extended tables).
+        SELECT s.a, s.b, s.conf, s.sp, s.coess_r, s.patents_b, s.compounds_b,
+               s.max_phase_b, s.validation_b, s.b_in_mosaic,
+               ta.name AS a_name, ta.target_class AS a_class,
+               ta.druggability_tier AS a_tier,
+               tb.name AS b_name, tb.target_class AS b_class,
+               tb.druggability_tier AS b_tier
+        FROM scored s
+        JOIN targets ta ON ta.id = s.a
+        LEFT JOIN targets tb ON tb.id = s.b
+        WHERE s.patents_b < 5 AND s.max_phase_b < 1
+        """
+        rows = self._execute_safe(sql, {"anchors": anchors})
+
+        import math
+
+        cands: list[dict[str, Any]] = []
+        for r in rows:
+            conf = float(r["conf"] or 0)
+            conf_norm = conf / 1000.0 if conf > 1 else conf
+            co_func = round(
+                0.6 * min(conf_norm, 1.0) + 0.4 * min((r["sp"] or 0) / 5.0, 1.0),
+                4,
+            )
+            coess_r = round(float(r.get("coess_r") or 0.0), 4)
+            # Real DepMap co-essentiality, when present, drives the score
+            # (dominant signal); else fall back to the PPI/pathway proxy.
+            if coess_r > 0:
+                driver = coess_r
+                basis = "depmap_coessentiality"
+            else:
+                driver = co_func
+                basis = "ppi_pathway_proxy"
+            if driver <= 0:
+                continue
+            patents_b = int(r["patents_b"] or 0)
+            val_b = int(r["validation_b"] or 0)
+            score = round(
+                driver * (1.0 / (1 + patents_b)) * (1 + math.log1p(val_b)), 4
+            )
+            cands.append({
+                "anchor": {"symbol": r["a"], "name": r["a_name"],
+                           "target_class": r["a_class"],
+                           "druggability_tier": r["a_tier"]},
+                "whitespace_partner": {
+                    "symbol": r["b"],
+                    # When partner is not a Mosaic target tb columns are NULL —
+                    # surface that distinction so the UI/agent can flag it.
+                    "name": r["b_name"],
+                    "target_class": r["b_class"],
+                    "druggability_tier": r["b_tier"],
+                    "in_mosaic_kg": bool(r.get("b_in_mosaic")),
+                    # gap-fix 8: out-of-set partner counts are not whitespace —
+                    # Mosaic doesn't cover the gene. Render "not assessed".
+                    "out_of_coverage": bool(not r.get("b_in_mosaic")),
+                    "not_assessed_reason": (
+                        None if r.get("b_in_mosaic") else OUT_OF_COVERAGE_REASON),
+                    "patent_count": patents_b,
+                    "compound_count": int(r["compounds_b"] or 0),
+                    "validation_evidence": val_b,
+                },
+                "co_functionality_proxy": co_func,
+                "co_essentiality_r": coess_r if coess_r > 0 else None,
+                "co_functionality_basis": basis,
+                "shared_pathways": int(r["sp"] or 0),
+                "ppi_confidence": round(conf_norm, 4),
+                "whitespace_score": score,
+                # Archetype-aware (gap-fix 7): never propose inhibiting a
+                # tumor suppressor — for a loss-of-function anchor, frame the
+                # partner as a synthetic-lethal vulnerability of <gene>-loss.
+                "suggested_approach": (
+                    (f"{r['b']} as a candidate synthetic-lethal partner of "
+                     f"{r['a']}-loss (tumor suppressor — restore/bypass "
+                     f"{r['a']}, do not inhibit it)"
+                     f"{' in ' + lineage if lineage else ''}; or co-target "
+                     f"{r['b']} in {r['a']}-deficient tumors.")
+                    if "suppressor" in (r.get("a_class") or "").lower() else
+                    (f"Combination: a {r['a']} inhibitor + {r['b']} modulation"
+                     f"{' in ' + lineage if lineage else ''}; or {r['b']} as a "
+                     f"synthetic-lethal monotherapy in {r['a']}-altered tumors.")
+                ),
+            })
+        cands.sort(key=lambda c: c["whitespace_score"], reverse=True)
+        n_real = sum(1 for c in cands[:limit]
+                     if c["co_functionality_basis"] == "depmap_coessentiality")
+        n_non_mosaic = sum(1 for c in cands[:limit]
+                           if not c["whitespace_partner"]["in_mosaic_kg"])
+        if has_coess_ext:
+            method = ("DepMap Mosaic-vs-all-genes coessentiality where "
+                      "available, else PPI + shared-pathway proxy")
+        elif has_coess:
+            method = ("DepMap within-Mosaic coessentiality where available, "
+                      "else PPI + shared-pathway proxy")
+        else:
+            method = ("PPI + shared-pathway proxy for co-essentiality "
+                      "(DepMap not yet ingested — run scripts/enrich_depmap.py)")
+        return {
+            "anchors": anchors,
+            "lineage_filter": lineage,
+            "candidates": cands[:limit],
+            "total": len(cands),
+            "method": method,
+            "depmap_loaded": has_any_coess,
+            "depmap_extended_loaded": has_coess_ext,
+            "string_extended_loaded": has_ppi_ext,
+            "candidates_using_real_coessentiality": n_real,
+            "candidates_outside_mosaic_kg": n_non_mosaic,
+        }
+
+    KNOWN_MODALITIES = (
+        "small_molecule", "covalent", "degrader", "macrocycle", "peptide_like",
+    )
+
+    def find_modality_gaps(self, target_or_family: str) -> dict[str, Any]:
+        """Which compound modalities are explored vs absent for a target
+        (Move 2 Task 2.4.R.3).
+
+        Target-level only: `targets.protein_family` is unpopulated, so
+        family-level rollups are not available (documented, not silently
+        wrong). Modality is the heuristic SMILES classification on the
+        top-N compounds — coverage is partial by design; unclassified
+        compounds are reported separately.
+        """
+        t = self._resolve_target(target_or_family)
+        exists = self._execute_safe(
+            "SELECT 1 FROM targets WHERE id = %(t)s", {"t": t}
+        )
+        if not exists:
+            return {
+                "query": target_or_family,
+                "resolved_target": None,
+                "explored": {}, "absent_modalities": list(self.KNOWN_MODALITIES),
+                "note": (
+                    "Target not in the KG. Family-level modality rollups "
+                    "are unavailable (protein_family not populated)."
+                ),
+            }
+        rows = self._execute_safe(
+            """
+            SELECT COALESCE(c.modality, 'unclassified') AS modality,
+                   COUNT(DISTINCT c.id) AS n
+            FROM compound_targets ct
+            JOIN compounds c ON c.id = ct.compound_id
+            WHERE ct.target_id = %(t)s
+            GROUP BY COALESCE(c.modality, 'unclassified')
+            """,
+            {"t": t},
+        )
+        explored = {r["modality"]: int(r["n"]) for r in rows}
+        present = {m for m in explored if m in self.KNOWN_MODALITIES}
+        absent = [m for m in self.KNOWN_MODALITIES if m not in present]
+        return {
+            "query": target_or_family,
+            "resolved_target": t,
+            "explored": explored,
+            "absent_modalities": absent,
+            "unclassified_compounds": explored.get("unclassified", 0),
+            "note": (
+                "Heuristic SMILES modality on top-ranked compounds; "
+                "target-level only (no protein_family data for family rollups)."
+            ),
+        }
+
+    def find_resistance_bypass_map(
+        self,
+        target: str,
+        indication: str | None = None,
+    ) -> dict[str, Any]:
+        """Candidate resistance-bypass targets for a target (Move 2 Task
+        2.4.R.2), from the keyword-mined `resistance_relations` table
+        (GLiREL has no resistance edge type — see ADR / commit).
+
+        Ranks co-mentioned bypass targets by a drugability-gap score:
+        high resistance-context evidence, low development activity
+        (few patents, no clinical compound). `indication` is accepted
+        but reserved (paper-indication links not modelled) — documented,
+        not silently ignored.
+        """
+        t = self._resolve_target(target)
+        # Bypass candidates from (a) curated resistance-relation co-mentions,
+        # LEFT-joined so non-Mosaic bypass genes surface too.
+        rows = self._execute_safe(
+            """
+            WITH byp AS (
+                SELECT bypass_target_id AS b,
+                       COUNT(*) AS edges,
+                       COUNT(DISTINCT source_doc_id) AS papers,
+                       AVG(confidence) AS conf,
+                       array_agg(DISTINCT resistance_kind) AS kinds,
+                       MIN(evidence_text) AS sample
+                FROM resistance_relations
+                WHERE resistant_target_id = %(t)s
+                GROUP BY bypass_target_id
+            )
+            SELECT byp.*, tb.name AS b_name, tb.target_class AS b_class,
+                   tb.druggability_tier AS b_tier,
+                   (EXISTS (SELECT 1 FROM targets WHERE id = byp.b)) AS b_in_mosaic,
+                   (SELECT COUNT(DISTINCT patent_id) FROM patent_mentions_target
+                     WHERE target_id = byp.b) AS patents_b,
+                   (SELECT COUNT(*) FROM compound_targets WHERE target_id = byp.b)
+                     AS compounds_b,
+                   (SELECT COALESCE(MAX(c.max_phase),0) FROM compound_targets ct
+                     JOIN compounds c ON c.id = ct.compound_id
+                     WHERE ct.target_id = byp.b) AS max_phase_b
+            FROM byp
+            LEFT JOIN targets tb ON tb.id = byp.b
+            """,
+            {"t": t},
+        )
+        out = []
+        for r in rows:
+            patents_b = int(r["patents_b"] or 0)
+            papers = int(r["papers"] or 0)
+            conf = float(r["conf"] or 0.3)
+            gap_score = round(papers * conf * (1.0 / (1 + patents_b)), 4)
+            out.append({
+                "bypass_target": {
+                    "symbol": r["b"], "name": r["b_name"],
+                    "target_class": r["b_class"],
+                    "druggability_tier": r["b_tier"],
+                    "in_mosaic_kg": bool(r.get("b_in_mosaic")),
+                    "out_of_coverage": bool(not r.get("b_in_mosaic")),  # gap-fix 8
+                    "not_assessed_reason": (
+                        None if r.get("b_in_mosaic") else OUT_OF_COVERAGE_REASON),
+                    "patent_count": patents_b,
+                    "compound_count": int(r["compounds_b"] or 0),
+                    "max_clinical_phase": int(r["max_phase_b"] or 0),
+                },
+                "evidence_source": "resistance_relations",
+                "resistance_evidence_papers": papers,
+                "resistance_kinds": [k for k in (r["kinds"] or []) if k],
+                "avg_confidence": round(conf, 3),
+                "drugability_gap_score": gap_score,
+                "evidence_snippet": (r["sample"] or "")[:240],
+            })
+
+        # Augment with PPI-derived bypass candidates (high-confidence STRING
+        # neighbours that haven't shown up in the literature signal yet).
+        # Only runs when target_interactions_ext is populated.
+        has_ppi_ext = self._execute_safe(
+            "SELECT to_regclass('target_interactions_ext') AS t"
+        )
+        if has_ppi_ext and has_ppi_ext[0].get("t"):
+            seen_bs = {row["bypass_target"]["symbol"] for row in out}
+            ppi_rows = self._execute_safe(
+                """
+                SELECT ti.partner_symbol AS b,
+                       ti.confidence_score AS conf,
+                       ti.partner_in_mosaic,
+                       tb.name AS b_name,
+                       tb.target_class AS b_class,
+                       tb.druggability_tier AS b_tier,
+                       (SELECT COUNT(DISTINCT patent_id) FROM patent_mentions_target
+                         WHERE target_id = ti.partner_symbol) AS patents_b,
+                       (SELECT COUNT(*) FROM compound_targets
+                         WHERE target_id = ti.partner_symbol) AS compounds_b
+                FROM target_interactions_ext ti
+                LEFT JOIN targets tb ON tb.id = ti.partner_symbol
+                WHERE ti.target_id = %(t)s
+                  AND ti.confidence_score >= 700
+                ORDER BY ti.confidence_score DESC
+                LIMIT 25
+                """,
+                {"t": t},
+            )
+            for r in ppi_rows:
+                if r["b"] in seen_bs:
+                    continue
+                patents_b = int(r["patents_b"] or 0)
+                conf_norm = float(r["conf"] or 0) / 1000.0
+                # PPI-only gap_score is conservatively lower than literature
+                # evidence; downweight by 0.4 so curated comes first.
+                gap = round(0.4 * conf_norm * (1.0 / (1 + patents_b)), 4)
+                out.append({
+                    "bypass_target": {
+                        "symbol": r["b"], "name": r["b_name"],
+                        "target_class": r["b_class"],
+                        "druggability_tier": r["b_tier"],
+                        "in_mosaic_kg": bool(r.get("partner_in_mosaic")),
+                        "out_of_coverage": bool(not r.get("partner_in_mosaic")),  # gap-fix 8
+                        "not_assessed_reason": (
+                            None if r.get("partner_in_mosaic") else OUT_OF_COVERAGE_REASON),
+                        "patent_count": patents_b,
+                        "compound_count": int(r["compounds_b"] or 0),
+                    },
+                    "evidence_source": "string_ppi",
+                    "resistance_evidence_papers": 0,
+                    "resistance_kinds": [],
+                    "avg_confidence": round(conf_norm, 3),
+                    "drugability_gap_score": gap,
+                    "evidence_snippet": (
+                        f"High-confidence STRING PPI partner "
+                        f"(score={int(r['conf'])}/1000)"
+                    ),
+                })
+
+        out.sort(key=lambda x: x["drugability_gap_score"], reverse=True)
+        return {
+            "target": t,
+            "indication_filter": indication,
+            "bypass_candidates": out,
+            "total": len(out),
+            "method": (
+                "Resistance co-mentions (curated literature)"
+                + (" + STRING PPI extended partners"
+                   if has_ppi_ext and has_ppi_ext[0].get("t") else "")
+            ),
+        }
+
+    def find_talent_migration(
+        self,
+        target: str,
+        lookback_years: int = 5,
+    ) -> dict[str, Any]:
+        """Researchers active on a target, recency-weighted, plus the
+        *other* targets they work on — a talent-flow signal (Move 2
+        Task 2.4.R.4).
+
+        Author identity uses the pre-resolved `persons` table (ORCID +
+        name); ~80% recall is accepted per the corrections doc — full
+        disambiguation is out of scope. Now reads both paper authorship
+        AND patent inventorship (patent_inventors backfilled 2026-05-26).
+        """
+        t = self._resolve_target(target)
+        import datetime
+        cur_year = datetime.date.today().year
+        min_year = cur_year - max(1, lookback_years)
+
+        people = self._execute_safe(
+            """
+            WITH tp AS (
+                SELECT pmt.paper_id,
+                       substring(p.publication_date, 1, 4)::int AS yr
+                FROM paper_mentions_target pmt
+                JOIN papers p ON p.id = pmt.paper_id
+                WHERE pmt.target_id = %(t)s
+                  AND p.publication_date ~ '^[0-9]{4}'
+                  AND substring(p.publication_date, 1, 4)::int >= %(minyr)s
+            ),
+            paper_signal AS (
+                SELECT pa.person_id,
+                       COUNT(DISTINCT tp.paper_id) AS n_papers,
+                       MAX(tp.yr) AS last_paper_yr,
+                       MIN(tp.yr) AS first_paper_yr,
+                       SUM(tp.yr - %(minyr)s + 1) AS paper_weight
+                FROM tp
+                JOIN paper_authors pa ON pa.paper_id = tp.paper_id
+                GROUP BY pa.person_id
+            ),
+            tpat AS (
+                -- Patents where this target is mentioned, with a year.
+                SELECT pmt.patent_id,
+                       substring(pt.filing_date, 1, 4)::int AS yr
+                FROM patent_mentions_target pmt
+                JOIN patents pt ON pt.id = pmt.patent_id
+                WHERE pmt.target_id = %(t)s
+                  AND pt.filing_date ~ '^[0-9]{4}'
+                  AND substring(pt.filing_date, 1, 4)::int >= %(minyr)s
+            ),
+            patent_signal AS (
+                SELECT pinv.person_id,
+                       COUNT(DISTINCT tpat.patent_id) AS n_patents,
+                       MAX(tpat.yr) AS last_patent_yr,
+                       MIN(tpat.yr) AS first_patent_yr,
+                       SUM(tpat.yr - %(minyr)s + 1) AS patent_weight
+                FROM tpat
+                JOIN patent_inventors pinv ON pinv.patent_id = tpat.patent_id
+                GROUP BY pinv.person_id
+            )
+            SELECT
+              COALESCE(ps.person_id, pat.person_id) AS person_id,
+              COALESCE(ps.n_papers, 0)              AS n_papers,
+              COALESCE(pat.n_patents, 0)            AS n_patents,
+              -- Combined first/last year across both signals.
+              LEAST(ps.first_paper_yr, pat.first_patent_yr) AS first_year,
+              GREATEST(ps.last_paper_yr, pat.last_patent_yr) AS last_year,
+              -- Recency weight: equal weight to papers + patents so a person
+              -- active in both surfaces above someone in only one.
+              COALESCE(ps.paper_weight, 0)
+                + COALESCE(pat.patent_weight, 0)    AS recency_weight
+            FROM paper_signal ps
+            FULL OUTER JOIN patent_signal pat ON pat.person_id = ps.person_id
+            ORDER BY recency_weight DESC, n_papers + n_patents DESC
+            LIMIT 25
+            """,
+            {"t": t, "minyr": min_year},
+        )
+        if not people:
+            return {"target": t, "lookback_years": lookback_years,
+                    "researchers": [], "total": 0}
+
+        ids = [p["person_id"] for p in people]
+        meta = {
+            r["id"]: r for r in self._execute_safe(
+                "SELECT id, name, orcid, affiliation FROM persons "
+                "WHERE id = ANY(%(ids)s)",
+                {"ids": ids},
+            )
+        }
+        # Each person's OTHER targets over time (the migration signal).
+        # Now combines paper-authorship signal AND patent-inventor signal,
+        # taking the most recent year across both.
+        others: dict[Any, list] = {}
+        for r in self._execute_safe(
+            """
+            WITH paper_others AS (
+                SELECT pa.person_id, pmt.target_id,
+                       MAX(substring(p.publication_date, 1, 4)::int) AS last_year,
+                       COUNT(DISTINCT pmt.paper_id) AS n_papers,
+                       0 AS n_patents
+                FROM paper_authors pa
+                JOIN paper_mentions_target pmt ON pmt.paper_id = pa.paper_id
+                JOIN papers p ON p.id = pmt.paper_id
+                WHERE pa.person_id = ANY(%(ids)s)
+                  AND pmt.target_id <> %(t)s
+                  AND p.publication_date ~ '^[0-9]{4}'
+                GROUP BY pa.person_id, pmt.target_id
+            ),
+            patent_others AS (
+                SELECT pinv.person_id, pmt.target_id,
+                       MAX(substring(pt.filing_date, 1, 4)::int) AS last_year,
+                       0 AS n_papers,
+                       COUNT(DISTINCT pmt.patent_id) AS n_patents
+                FROM patent_inventors pinv
+                JOIN patent_mentions_target pmt ON pmt.patent_id = pinv.patent_id
+                JOIN patents pt ON pt.id = pmt.patent_id
+                WHERE pinv.person_id = ANY(%(ids)s)
+                  AND pmt.target_id <> %(t)s
+                  AND pt.filing_date ~ '^[0-9]{4}'
+                GROUP BY pinv.person_id, pmt.target_id
+            ),
+            merged AS (
+                SELECT * FROM paper_others
+                UNION ALL
+                SELECT * FROM patent_others
+            )
+            SELECT person_id, target_id,
+                   MAX(last_year) AS last_year,
+                   SUM(n_papers)  AS n_papers,
+                   SUM(n_patents) AS n_patents
+            FROM merged
+            GROUP BY person_id, target_id
+            ORDER BY MAX(last_year) DESC
+            """,
+            {"ids": ids, "t": t},
+        ):
+            others.setdefault(r["person_id"], [])
+            if len(others[r["person_id"]]) < 8:
+                others[r["person_id"]].append({
+                    "target": r["target_id"],
+                    "last_year": r["last_year"],
+                    "papers": int(r.get("n_papers") or 0),
+                    "patents": int(r.get("n_patents") or 0),
+                })
+
+        researchers = []
+        for p in people:
+            m = meta.get(p["person_id"], {})
+            researchers.append({
+                "name": m.get("name"),
+                "orcid": m.get("orcid"),
+                "affiliation": m.get("affiliation"),
+                "papers_on_target": int(p["n_papers"] or 0),
+                "patents_on_target": int(p["n_patents"] or 0),
+                "first_year": p["first_year"],
+                "last_year": p["last_year"],
+                "recency_weight": p["recency_weight"],
+                "also_works_on": others.get(p["person_id"], []),
+            })
+        return {
+            "target": t,
+            "lookback_years": lookback_years,
+            "researchers": researchers,
+            "total": len(researchers),
+        }
+
+    def find_emerging_signals(
+        self,
+        window_months: int = 6,
+        signal_type: str = "paper_surge",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Targets whose recent activity significantly exceeds their own
+        prior baseline (z-score > 2). Simple statistics, no ML (Move 2
+        Task 2.4.R.5 / corrections scope).
+
+        signal_type: 'paper_surge' (papers.publication_date) or
+        'patent_surge' (patents.filing_date).
+        """
+        window_months = max(1, min(window_months, 24))
+        if signal_type == "patent_surge":
+            edge, doc, datecol = (
+                "patent_mentions_target", "patents", "filing_date")
+        else:
+            signal_type = "paper_surge"
+            edge, doc, datecol = (
+                "paper_mentions_target", "papers", "publication_date")
+
+        rows = self._execute_safe(
+            f"""
+            SELECT e.target_id,
+                   substring(d.{datecol}, 1, 7) AS ym,
+                   COUNT(DISTINCT e.{doc[:-1]}_id) AS n
+            FROM {edge} e
+            JOIN {doc} d ON d.id = e.{doc[:-1]}_id
+            WHERE d.{datecol} ~ '^[0-9]{{4}}-[0-9]{{2}}'
+            GROUP BY e.target_id, ym
+            """,
+        )
+        # Bucket monthly counts per target.
+        from collections import defaultdict
+        series: dict[str, dict[str, int]] = defaultdict(dict)
+        for r in rows:
+            series[r["target_id"]][r["ym"]] = int(r["n"])
+
+        import statistics
+        signals = []
+        for target_id, months in series.items():
+            ordered = sorted(months)
+            if len(ordered) < window_months * 2 + 1:
+                continue
+            recent = ordered[-window_months:]
+            baseline_months = ordered[:-window_months]
+            recent_total = sum(months[m] for m in recent)
+            # Baseline: rolling window_months sums over the prior period.
+            base_sums = [
+                sum(months.get(baseline_months[i + k], 0)
+                    for k in range(window_months))
+                for i in range(len(baseline_months) - window_months + 1)
+            ]
+            if len(base_sums) < 2:
+                continue
+            mu = statistics.mean(base_sums)
+            sd = statistics.pstdev(base_sums)
+            if sd == 0:
+                continue
+            z = (recent_total - mu) / sd
+            if z > 2:
+                signals.append({
+                    "target": target_id,
+                    "z_score": round(z, 2),
+                    "recent_window_count": recent_total,
+                    "baseline_mean": round(mu, 2),
+                    "window_months": window_months,
+                    "sparkline": [months[m] for m in ordered[-(window_months * 3):]],
+                })
+        signals.sort(key=lambda s: s["z_score"], reverse=True)
+        return {
+            "signal_type": signal_type,
+            "window_months": window_months,
+            "signals": signals[:limit],
+            "total": len(signals),
+        }
+
+    def find_similar_targets(
+        self,
+        target: str,
+        k: int = 10,
+    ) -> dict[str, Any]:
+        """Structurally similar targets to `target`, ranked by Foldseek
+        TM-score (Move 3 Task M3.1).
+
+        Source: `target_structure_neighbors` populated by
+        `scripts/build_foldseek_index.py` from the AlphaFold PDB corpus.
+        Returns at most `k` neighbours. Empty + a populate-hint when the
+        table doesn't exist or has no rows for this target — never
+        raises, always shapes the response."""
+        t = self._resolve_target(target)
+        has_table = self._execute_safe(
+            "SELECT to_regclass('target_structure_neighbors') AS t"
+        )
+        loaded = bool(has_table and has_table[0].get("t"))
+
+        if not loaded:
+            return {
+                "target": t,
+                "neighbors": [],
+                "total": 0,
+                "k": k,
+                "index_loaded": False,
+                "method": (
+                    "Foldseek 3Di+AA all-vs-all over AlphaFold PDBs. "
+                    "Index not yet built — run "
+                    "`python -m scripts.build_foldseek_index`."
+                ),
+            }
+
+        rows = self._execute_safe(
+            """
+            SELECT tsn.neighbor_id        AS symbol,
+                   tsn.tm_score,
+                   tsn.alntmscore,
+                   tsn.evalue,
+                   tsn.lddt,
+                   tsn.rmsd,
+                   tb.name                AS name,
+                   tb.target_class        AS target_class,
+                   tb.druggability_tier   AS druggability_tier
+            FROM target_structure_neighbors tsn
+            JOIN targets tb ON tb.id = tsn.neighbor_id
+            WHERE tsn.target_id = %(t)s
+            ORDER BY tsn.tm_score DESC NULLS LAST
+            LIMIT %(k)s
+            """,
+            {"t": t, "k": max(1, min(int(k), 50))},
+        )
+        neighbors = [
+            {
+                "neighbor": {
+                    "symbol": r["symbol"],
+                    "name": r["name"],
+                    "target_class": r["target_class"],
+                    "druggability_tier": r["druggability_tier"],
+                },
+                "tm_score": (float(r["tm_score"])
+                             if r["tm_score"] is not None else None),
+                "alntmscore": (float(r["alntmscore"])
+                               if r["alntmscore"] is not None else None),
+                "evalue": (float(r["evalue"])
+                           if r["evalue"] is not None else None),
+                "lddt": (float(r["lddt"])
+                         if r["lddt"] is not None else None),
+                "rmsd": (float(r["rmsd"])
+                         if r["rmsd"] is not None else None),
+            }
+            for r in rows
+        ]
+        return {
+            "target": t,
+            "neighbors": neighbors,
+            "total": len(neighbors),
+            "k": k,
+            "index_loaded": True,
+            "method": (
+                "Foldseek 3Di+AA all-vs-all over AlphaFold PDBs; "
+                "tm_score normalised over query length"
+            ),
+        }
+
+    def _execute_safe(
+        self,
+        sql: str,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            return self.db.execute(sql, params)
+        except psycopg.OperationalError:
+            raise  # connection errors bubble up
+        except Exception as e:
+            logger.error("Query failed: %s", e)
+            return []
+
+    # =====================================================================
+    # Semantic Relations (GLiREL-extracted)
+    # =====================================================================
+
+    def get_semantic_relations(
+        self, entity_id: str, entity_type: str = "target"
+    ) -> list[dict[str, Any]]:
+        """Get all semantic relations involving an entity.
+
+        Returns a `source_label` field resolved from papers/patents so agents
+        don't have to surface raw `source_doc_id` strings. The raw ID is kept
+        for downstream joins but should not be displayed to end users.
+        """
+        return self._execute_safe("""
+            SELECT sr.relation_type, sr.confidence,
+                   sr.subject_id, sr.subject_type,
+                   sr.object_id, sr.object_type,
+                   sr.evidence_text, sr.model_name,
+                   sr.source_doc_id, sr.source_doc_type,
+                   CASE
+                     WHEN sr.source_doc_type = 'paper'  THEN COALESCE(p.title, sr.source_doc_id)
+                     WHEN sr.source_doc_type = 'patent' THEN COALESCE(pat.title, sr.source_doc_id)
+                     ELSE sr.source_doc_id
+                   END AS source_label,
+                   CASE
+                     WHEN sr.source_doc_type = 'paper'  THEN p.doi
+                     ELSE NULL
+                   END AS source_doi
+            FROM semantic_relations sr
+            LEFT JOIN papers  p   ON sr.source_doc_type = 'paper'  AND p.id  = sr.source_doc_id
+            LEFT JOIN patents pat ON sr.source_doc_type = 'patent' AND pat.id = sr.source_doc_id
+            WHERE (sr.subject_id = %(eid)s AND sr.subject_type = %(etype)s)
+               OR (sr.object_id = %(eid)s AND sr.object_type = %(etype)s)
+            ORDER BY sr.confidence DESC
+            LIMIT 100
+        """, {"eid": entity_id, "etype": entity_type})
+
+    def get_target_moa_profile(self, target_symbol: str) -> dict[str, Any]:
+        """Get mechanism-of-action breakdown for a target from semantic relations."""
+        target = self._resolve_target(target_symbol)
+        # Resolve target display name once so the return payload has a human label,
+        # not just the gene symbol used internally.
+        _target_row = self._execute_safe(
+            "SELECT id, symbol, name, target_class FROM targets WHERE id = %(t)s LIMIT 1",
+            {"t": target},
+        )
+        target_name = (_target_row[0].get("name") if _target_row else None) or target
+        target_class = (_target_row[0].get("target_class") if _target_row else None)
+
+        # MOA relations from semantic_relations
+        # Prefer pref_name over name so research compounds don't leak ChEMBL IDs.
+        moa_rels = self._execute_safe("""
+            SELECT sr.subject_id AS compound_id, sr.relation_type,
+                   sr.confidence, sr.evidence_text,
+                   COALESCE(c.pref_name, c.name, c.chembl_id, sr.subject_id) AS compound_name,
+                   c.chembl_id, c.max_phase, c.first_approval, c.molecule_type
+            FROM semantic_relations sr
+            LEFT JOIN compounds c ON c.id = sr.subject_id
+            WHERE sr.object_id = %(target)s
+            AND sr.object_type = 'target'
+            AND sr.subject_type = 'compound'
+            AND sr.relation_type IN (
+                'inhibits', 'inhibits_covalent', 'inhibits_allosteric',
+                'inhibits_competitive', 'agonizes', 'antagonizes',
+                'degrades_protac', 'modulates_allosteric', 'partial_agonist'
+            )
+            ORDER BY sr.confidence DESC
+        """, {"target": target})
+
+        # Tier 1 relations (paper/patent → target)
+        semantic_edges = self._execute_safe("""
+            SELECT sr.relation_type, COUNT(*) AS cnt,
+                   ROUND(AVG(sr.confidence)::numeric, 3) AS avg_confidence
+            FROM semantic_relations sr
+            WHERE sr.object_id = %(target)s
+            AND sr.object_type = 'target'
+            AND sr.relation_type NOT IN (
+                'inhibits', 'inhibits_covalent', 'inhibits_allosteric',
+                'inhibits_competitive', 'agonizes', 'antagonizes',
+                'degrades_protac', 'modulates_allosteric', 'partial_agonist'
+            )
+            GROUP BY sr.relation_type
+            ORDER BY cnt DESC
+        """, {"target": target})
+
+        # MOA summary
+        moa_summary = {}
+        for r in moa_rels:
+            moa = r["relation_type"]
+            if moa not in moa_summary:
+                moa_summary[moa] = {"count": 0, "compounds": []}
+            moa_summary[moa]["count"] += 1
+            if len(moa_summary[moa]["compounds"]) < 5:
+                moa_summary[moa]["compounds"].append({
+                    "compound_name": r.get("compound_name"),
+                    "chembl_id": r.get("chembl_id"),
+                    "max_phase": r.get("max_phase"),
+                    "confidence": r.get("confidence"),
+                })
+
+        return {
+            "target": target,
+            "target_name": target_name,
+            "target_class": target_class,
+            "moa_compounds": moa_rels[:20],
+            "moa_summary": moa_summary,
+            "semantic_edge_counts": {
+                r["relation_type"]: r["cnt"] for r in semantic_edges
+            },
+            "total_semantic_relations": sum(r["cnt"] for r in semantic_edges) + len(moa_rels),
+        }
+
+    def get_evidence_map(self, target_symbol: str) -> dict[str, Any]:
+        """Get evidence landscape for a target: which relation types, from which sources."""
+        target = self._resolve_target(target_symbol)
+
+        # Evidence by relation type and source
+        evidence = self._execute_safe("""
+            SELECT sr.relation_type, sr.source_doc_type,
+                   COUNT(*) AS cnt,
+                   ROUND(AVG(sr.confidence)::numeric, 3) AS avg_conf,
+                   MAX(sr.confidence) AS max_conf
+            FROM semantic_relations sr
+            WHERE (sr.subject_id = %(t)s OR sr.object_id = %(t)s)
+            AND (sr.subject_type = 'target' OR sr.object_type = 'target')
+            GROUP BY sr.relation_type, sr.source_doc_type
+            ORDER BY cnt DESC
+        """, {"t": target})
+
+        # Top evidence snippets per relation type.
+        # Resolves display names so agents don't output bare "CHEMBL1234 inhibits P00533".
+        top_evidence = self._execute_safe("""
+            SELECT DISTINCT ON (sr.relation_type)
+                   sr.relation_type, sr.confidence,
+                   sr.subject_id, sr.object_id,
+                   sr.subject_type, sr.object_type,
+                   LEFT(sr.evidence_text, 300) AS evidence_snippet,
+                   sr.source_doc_type,
+                   CASE sr.subject_type
+                       WHEN 'compound'  THEN COALESCE(c1.pref_name, c1.name, c1.chembl_id, sr.subject_id)
+                       WHEN 'target'    THEN COALESCE(t1.name, t1.symbol, sr.subject_id)
+                       WHEN 'indication' THEN COALESCE(i1.name, sr.subject_id)
+                       ELSE sr.subject_id
+                   END AS subject_name,
+                   CASE sr.object_type
+                       WHEN 'compound'  THEN COALESCE(c2.pref_name, c2.name, c2.chembl_id, sr.object_id)
+                       WHEN 'target'    THEN COALESCE(t2.name, t2.symbol, sr.object_id)
+                       WHEN 'indication' THEN COALESCE(i2.name, sr.object_id)
+                       ELSE sr.object_id
+                   END AS object_name
+            FROM semantic_relations sr
+            LEFT JOIN compounds c1 ON c1.id = sr.subject_id AND sr.subject_type = 'compound'
+            LEFT JOIN compounds c2 ON c2.id = sr.object_id  AND sr.object_type  = 'compound'
+            LEFT JOIN targets   t1 ON t1.id = sr.subject_id AND sr.subject_type = 'target'
+            LEFT JOIN targets   t2 ON t2.id = sr.object_id  AND sr.object_type  = 'target'
+            LEFT JOIN indications i1 ON i1.id = sr.subject_id AND sr.subject_type = 'indication'
+            LEFT JOIN indications i2 ON i2.id = sr.object_id  AND sr.object_type  = 'indication'
+            WHERE (sr.subject_id = %(t)s OR sr.object_id = %(t)s)
+            AND (sr.subject_type = 'target' OR sr.object_type = 'target')
+            ORDER BY sr.relation_type, sr.confidence DESC
+        """, {"t": target})
+
+        # Count unique interacting entities
+        partners = self._execute_safe("""
+            SELECT
+                COUNT(DISTINCT CASE WHEN sr.subject_type = 'compound' THEN sr.subject_id
+                                    WHEN sr.object_type = 'compound' THEN sr.object_id END) AS compound_partners,
+                COUNT(DISTINCT CASE WHEN sr.subject_type = 'target' AND sr.subject_id != %(t)s THEN sr.subject_id
+                                    WHEN sr.object_type = 'target' AND sr.object_id != %(t)s THEN sr.object_id END) AS target_partners,
+                COUNT(DISTINCT sr.source_doc_id) AS source_docs
+            FROM semantic_relations sr
+            WHERE (sr.subject_id = %(t)s OR sr.object_id = %(t)s)
+            AND (sr.subject_type = 'target' OR sr.object_type = 'target')
+        """, {"t": target})
+
+        p = partners[0] if partners else {}
+        return {
+            "target": target,
+            "evidence_by_type": evidence,
+            "top_evidence_per_type": top_evidence,
+            "compound_partners": p.get("compound_partners", 0),
+            "target_partners": p.get("target_partners", 0),
+            "source_documents": p.get("source_docs", 0),
+        }
+
+    def get_relation_search(
+        self, relation_type: str, min_confidence: float = 0.1, limit: int = 50
+    ) -> dict[str, Any]:
+        """Search for entity pairs by relation type across the entire KG.
+
+        Resolves human-readable labels for every entity type (compound pref_name,
+        target name, indication name, paper title, patent title) so agents and UIs
+        never see bare CHEMBL/UniProt IDs in the output.
+        """
+        rows = self._execute_safe("""
+            SELECT sr.subject_id, sr.subject_type,
+                   sr.object_id, sr.object_type,
+                   sr.relation_type, sr.confidence,
+                   LEFT(sr.evidence_text, 200) AS evidence_snippet,
+                   sr.source_doc_type,
+                   CASE sr.subject_type
+                       WHEN 'compound'  THEN COALESCE(c1.pref_name, c1.name, c1.chembl_id, sr.subject_id)
+                       WHEN 'target'    THEN COALESCE(t1.name, t1.symbol, sr.subject_id)
+                       WHEN 'indication' THEN COALESCE(i1.name, sr.subject_id)
+                       WHEN 'paper'     THEN COALESCE(p1.title, sr.subject_id)
+                       WHEN 'patent'    THEN COALESCE(pat1.title, pat1.publication_number, sr.subject_id)
+                       ELSE sr.subject_id
+                   END AS subject_name,
+                   CASE sr.object_type
+                       WHEN 'compound'  THEN COALESCE(c2.pref_name, c2.name, c2.chembl_id, sr.object_id)
+                       WHEN 'target'    THEN COALESCE(t2.name, t2.symbol, sr.object_id)
+                       WHEN 'indication' THEN COALESCE(i2.name, sr.object_id)
+                       WHEN 'paper'     THEN COALESCE(p2.title, sr.object_id)
+                       WHEN 'patent'    THEN COALESCE(pat2.title, pat2.publication_number, sr.object_id)
+                       ELSE sr.object_id
+                   END AS object_name
+            FROM semantic_relations sr
+            LEFT JOIN compounds c1 ON c1.id = sr.subject_id AND sr.subject_type = 'compound'
+            LEFT JOIN compounds c2 ON c2.id = sr.object_id  AND sr.object_type  = 'compound'
+            LEFT JOIN targets   t1 ON t1.id = sr.subject_id AND sr.subject_type = 'target'
+            LEFT JOIN targets   t2 ON t2.id = sr.object_id  AND sr.object_type  = 'target'
+            LEFT JOIN indications i1 ON i1.id = sr.subject_id AND sr.subject_type = 'indication'
+            LEFT JOIN indications i2 ON i2.id = sr.object_id  AND sr.object_type  = 'indication'
+            LEFT JOIN papers    p1 ON p1.id = sr.subject_id AND sr.subject_type = 'paper'
+            LEFT JOIN papers    p2 ON p2.id = sr.object_id  AND sr.object_type  = 'paper'
+            LEFT JOIN patents   pat1 ON pat1.id = sr.subject_id AND sr.subject_type = 'patent'
+            LEFT JOIN patents   pat2 ON pat2.id = sr.object_id  AND sr.object_type  = 'patent'
+            WHERE sr.relation_type = %(rtype)s
+            AND sr.confidence >= %(min_conf)s
+            ORDER BY sr.confidence DESC
+            LIMIT %(lim)s
+        """, {"rtype": relation_type, "min_conf": min_confidence, "lim": limit})
+
+        # Stats
+        stats = self._execute_safe("""
+            SELECT COUNT(*) AS total,
+                   ROUND(AVG(confidence)::numeric, 3) AS avg_conf,
+                   MAX(confidence) AS max_conf,
+                   COUNT(DISTINCT subject_id) AS unique_subjects,
+                   COUNT(DISTINCT object_id) AS unique_objects
+            FROM semantic_relations
+            WHERE relation_type = %(rtype)s
+        """, {"rtype": relation_type})
+
+        s = stats[0] if stats else {}
+        return {
+            "relation_type": relation_type,
+            "results": rows,
+            "total_in_kg": s.get("total", 0),
+            "avg_confidence": s.get("avg_conf"),
+            "max_confidence": s.get("max_conf"),
+            "unique_subjects": s.get("unique_subjects", 0),
+            "unique_objects": s.get("unique_objects", 0),
+        }
+
+    def get_polypharmacology(self, compound_name: str) -> dict[str, Any]:
+        """Get all targets a compound interacts with and the nature of each interaction.
+
+        Looks up the compound by pref_name, name, trade_names or chembl_id so users
+        can pass any common identifier. Returns target_name + target_class for each
+        interacting target so agent responses don't contain bare gene symbols.
+        """
+        name_lower = compound_name.strip().lower()
+
+        # Find compound ID — match pref_name, name, or chembl_id, or any synonym.
+        compound = self._execute_safe("""
+            SELECT id, COALESCE(pref_name, name, chembl_id, id) AS display_name,
+                   name, pref_name, chembl_id, max_phase, first_approval, molecule_type
+            FROM compounds
+            WHERE LOWER(pref_name) = %(name)s
+               OR LOWER(name) = %(name)s
+               OR LOWER(chembl_id) = %(name)s
+               OR EXISTS (
+                   SELECT 1 FROM jsonb_array_elements_text(COALESCE(synonyms, '[]'::jsonb)) s
+                   WHERE LOWER(s) = %(name)s
+               )
+            LIMIT 1
+        """, {"name": name_lower})
+
+        if not compound:
+            return {"compound": compound_name, "found": False, "targets": []}
+
+        cid = compound[0]["id"]
+        cinfo = compound[0]
+
+        # Get all semantic relations where this compound is subject, JOINed to targets
+        # so the output carries target_name and target_class, not just gene symbols.
+        rels = self._execute_safe("""
+            SELECT sr.object_id AS target_id,
+                   COALESCE(t.name, t.symbol, sr.object_id) AS target_name,
+                   t.target_class,
+                   sr.relation_type,
+                   MAX(sr.confidence) AS max_conf,
+                   COUNT(*) AS evidence_count,
+                   array_agg(DISTINCT sr.source_doc_type) AS source_types
+            FROM semantic_relations sr
+            LEFT JOIN targets t ON t.id = sr.object_id
+            WHERE sr.subject_id = %(cid)s
+            AND sr.subject_type = 'compound'
+            AND sr.object_type = 'target'
+            GROUP BY sr.object_id, t.name, t.symbol, t.target_class, sr.relation_type
+            ORDER BY max_conf DESC
+        """, {"cid": cid})
+
+        # Group by target
+        target_profiles: dict[str, dict] = {}
+        for r in rels:
+            t = r["target_id"]
+            if t not in target_profiles:
+                target_profiles[t] = {
+                    "target_id": t,
+                    "target_name": r.get("target_name") or t,
+                    "target_class": r.get("target_class"),
+                    "moa_types": [],
+                    "max_confidence": 0,
+                    "evidence_count": 0,
+                }
+            target_profiles[t]["moa_types"].append(r["relation_type"])
+            target_profiles[t]["max_confidence"] = max(
+                target_profiles[t]["max_confidence"], r["max_conf"]
+            )
+            target_profiles[t]["evidence_count"] += r["evidence_count"]
+
+        targets_sorted = sorted(
+            target_profiles.values(), key=lambda x: -x["max_confidence"]
+        )
+
+        # Clinical indications this compound is documented against
+        # (compound_indications backfilled 2026-05-26 via ChEMBL).
+        indications: list[dict[str, Any]] = []
+        ind_rows = self._execute_safe(
+            """SELECT ci.indication_id, i.name AS indication_name,
+                      ci.max_phase, ci.clinical_status
+               FROM compound_indications ci
+               LEFT JOIN indications i ON i.id = ci.indication_id
+               WHERE ci.compound_id = %(cid)s
+               ORDER BY ci.max_phase DESC NULLS LAST""",
+            {"cid": cid},
+        )
+        for r in ind_rows:
+            indications.append({
+                "indication_id": r["indication_id"],
+                "name": r.get("indication_name") or r["indication_id"],
+                "max_phase": int(r["max_phase"] or 0),
+                "clinical_status": r["clinical_status"],
+            })
+
+        # Top-K Tanimoto analogs (compound_analogs backfilled 2026-05-26).
+        analogs = self._execute_safe(
+            """SELECT a.compound_b_id AS analog_id, c.name AS analog_name,
+                      c.pref_name, c.max_phase,
+                      a.tanimoto_similarity AS similarity
+               FROM compound_analogs a
+               LEFT JOIN compounds c ON c.id = a.compound_b_id
+               WHERE a.compound_a_id = %(cid)s
+               ORDER BY a.tanimoto_similarity DESC
+               LIMIT 10""",
+            {"cid": cid},
+        )
+
+        return {
+            "compound": cinfo.get("display_name") or cinfo.get("pref_name") or cinfo.get("name"),
+            "compound_id": cinfo.get("id"),
+            "chembl_id": cinfo.get("chembl_id"),
+            "max_phase": cinfo.get("max_phase"),
+            "first_approval": cinfo.get("first_approval"),
+            "molecule_type": cinfo.get("molecule_type"),
+            "found": True,
+            "target_count": len(target_profiles),
+            "targets": targets_sorted[:30],
+            "indications": indications,
+            "top_analogs": [
+                {"compound_id": a["analog_id"],
+                 "name": a.get("pref_name") or a.get("analog_name"),
+                 "max_phase": a.get("max_phase"),
+                 "tanimoto": round(float(a["similarity"]), 3)}
+                for a in analogs
+            ],
+        }
+
+    def get_kg_stats(self) -> dict[str, Any]:
+        """Get overall KG statistics — entity counts, relation counts, coverage."""
+        stats = {}
+
+        for table, label in [("targets", "targets"), ("compounds", "compounds"),
+                             ("papers", "papers"), ("patents", "patents")]:
+            rows = self._execute_safe(f"SELECT COUNT(*) AS cnt FROM {table}")
+            stats[label] = rows[0]["cnt"] if rows else 0
+
+        rows = self._execute_safe("SELECT COUNT(*) AS cnt FROM semantic_relations")
+        stats["semantic_relations"] = rows[0]["cnt"] if rows else 0
+
+        rows = self._execute_safe("SELECT COUNT(DISTINCT source_doc_id) AS cnt FROM semantic_relations")
+        stats["docs_with_relations"] = rows[0]["cnt"] if rows else 0
+
+        rows = self._execute_safe("""
+            SELECT relation_type, COUNT(*) AS cnt
+            FROM semantic_relations
+            GROUP BY relation_type ORDER BY cnt DESC
+        """)
+        stats["relation_breakdown"] = {r["relation_type"]: r["cnt"] for r in rows}
+
+        rows = self._execute_safe("""
+            SELECT COUNT(DISTINCT object_id) AS cnt
+            FROM semantic_relations WHERE object_type = 'target'
+        """)
+        stats["targets_with_relations"] = rows[0]["cnt"] if rows else 0
+
+        rows = self._execute_safe("SELECT COUNT(*) AS cnt FROM compound_targets")
+        stats["chembl_activities"] = rows[0]["cnt"] if rows else 0
+
+        # Newer / optional layers (2026-05-26 backfill) — emit when populated.
+        for table, label in [
+            ("compound_selectivity",        "compound_selectivity"),
+            ("compound_indications",        "compound_indications"),
+            ("compound_analogs",            "compound_analogs"),
+            ("paper_mentions_compound",     "paper_compound_mentions"),
+            ("patent_mentions_compound",    "patent_compound_mentions"),
+            ("patent_inventors",            "patent_inventors"),
+            ("target_interactions_ext",     "ppi_extended"),
+            ("target_essentiality",         "depmap_essentiality"),
+            ("target_coessentiality",       "depmap_coess_within_mosaic"),
+            ("target_coessentiality_ext",   "depmap_coess_extended"),
+            ("target_variant_pathogenicity","alphamissense_targets"),
+        ]:
+            chk = self._execute_safe(
+                "SELECT to_regclass(%(t)s) AS t", {"t": table}
+            )
+            if chk and chk[0].get("t"):
+                rows = self._execute_safe(f"SELECT COUNT(*) AS cnt FROM {table}")
+                stats[label] = rows[0]["cnt"] if rows else 0
+
+        return stats
+
+    def get_kg_metadata(self) -> dict[str, Any] | None:
+        """Read the cached kg_metadata singleton, or None if not refreshed.
+
+        Cheap single-row read used by the scope banner / /kg/metadata
+        endpoint / mosaic_kg_stats instead of COUNT(*) per call.
+        """
+        rows = self._execute_safe(
+            "SELECT * FROM kg_metadata WHERE id = 1"
+        )
+        return rows[0] if rows else None
+
+    def target_exists(self, gene_symbol: str) -> bool:
+        """True if the gene is in the covered target set."""
+        rows = self._execute_safe(
+            """SELECT 1 FROM targets
+               WHERE upper(symbol) = upper(%(s)s)
+                  OR upper(id) = upper(%(s)s) LIMIT 1""",
+            {"s": gene_symbol.strip()},
+        )
+        return bool(rows)
+
+    def add_target_wishlist(
+        self,
+        gene_symbol: str,
+        user_email: str = "anonymous",
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """Idempotently record an out-of-scope target request.
+
+        Re-requesting the same (gene, email) bumps request_count and
+        last_requested_at rather than inserting a duplicate.
+        """
+        rows = self._execute_safe(
+            """
+            INSERT INTO target_wishlist
+                (gene_symbol, user_email, notes)
+            VALUES (upper(%(g)s), %(e)s, %(n)s)
+            ON CONFLICT (gene_symbol, user_email) DO UPDATE SET
+                request_count     = target_wishlist.request_count + 1,
+                last_requested_at = NOW(),
+                notes             = COALESCE(EXCLUDED.notes,
+                                             target_wishlist.notes)
+            RETURNING gene_symbol, user_email, request_count
+            """,
+            {
+                "g": gene_symbol.strip(),
+                "e": (user_email or "anonymous").strip(),
+                "n": notes,
+            },
+        )
+        return rows[0] if rows else {}
+
+    def find_closest_targets(
+        self, gene_symbol: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Covered targets nearest a gene by protein family / class.
+
+        Used to give a helpful answer when a requested target is out of
+        scope. Pure heuristic — shares protein_family or target_class
+        with any covered target whose symbol prefix is similar.
+        """
+        return self._execute_safe(
+            """
+            SELECT symbol AS gene_symbol, name, target_class,
+                   protein_family
+            FROM targets
+            ORDER BY
+              CASE WHEN left(upper(symbol), 3) = left(upper(%(s)s), 3)
+                   THEN 0
+                   WHEN left(upper(symbol), 2) = left(upper(%(s)s), 2)
+                   THEN 1 ELSE 2 END,
+              symbol
+            LIMIT %(lim)s
+            """,
+            {"s": gene_symbol.strip(), "lim": limit},
+        )
+
+    # ---- Watchlists (Move 1, Sprint 1.3) -------------------------------
+
+    def create_watchlist(
+        self, owner_key: str, name: str = "My watchlist"
+    ) -> dict[str, Any]:
+        rows = self._execute_safe(
+            """INSERT INTO watchlists (owner_key, name)
+               VALUES (%(o)s, %(n)s)
+               RETURNING id, owner_key, name, created_at""",
+            {"o": owner_key.strip(), "n": (name or "My watchlist").strip()},
+        )
+        return rows[0] if rows else {}
+
+    def list_watchlists(self, owner_key: str) -> list[dict[str, Any]]:
+        return self._execute_safe(
+            """
+            SELECT w.id, w.name, w.created_at,
+                   COALESCE(i.n, 0) AS item_count,
+                   COALESCE(e.n, 0) AS recent_event_count
+            FROM watchlists w
+            LEFT JOIN (SELECT watchlist_id, COUNT(*) n
+                       FROM watchlist_items GROUP BY watchlist_id) i
+                   ON i.watchlist_id = w.id
+            LEFT JOIN (SELECT watchlist_id, COUNT(*) n
+                       FROM watchlist_events
+                       WHERE detected_at > NOW() - INTERVAL '30 days'
+                       GROUP BY watchlist_id) e
+                   ON e.watchlist_id = w.id
+            WHERE w.owner_key = %(o)s
+            ORDER BY w.created_at DESC
+            """,
+            {"o": owner_key.strip()},
+        )
+
+    def add_watchlist_item(
+        self, watchlist_id: str, item_type: str, item_value: str
+    ) -> bool:
+        """Idempotent add. Returns False if the watchlist doesn't exist."""
+        exists = self._execute_safe(
+            "SELECT 1 FROM watchlists WHERE id = %(w)s",
+            {"w": watchlist_id},
+        )
+        if not exists:
+            return False
+        self._execute_safe(
+            """INSERT INTO watchlist_items
+                   (watchlist_id, item_type, item_value)
+               VALUES (%(w)s, %(t)s, %(v)s)
+               ON CONFLICT (watchlist_id, item_type, item_value)
+               DO NOTHING""",
+            {
+                "w": watchlist_id,
+                "t": item_type.strip().lower(),
+                "v": item_value.strip(),
+            },
+        )
+        return True
+
+    def get_watchlist(self, watchlist_id: str) -> dict[str, Any] | None:
+        head = self._execute_safe(
+            "SELECT id, owner_key, name, created_at FROM watchlists WHERE id = %(w)s",
+            {"w": watchlist_id},
+        )
+        if not head:
+            return None
+        wl = head[0]
+        wl["items"] = self._execute_safe(
+            """SELECT item_type, item_value, added_at
+               FROM watchlist_items WHERE watchlist_id = %(w)s
+               ORDER BY added_at DESC""",
+            {"w": watchlist_id},
+        )
+        wl["recent_events"] = self._execute_safe(
+            """SELECT item_type, item_value, event_type, event_payload,
+                      detected_at
+               FROM watchlist_events WHERE watchlist_id = %(w)s
+               ORDER BY detected_at DESC LIMIT 20""",
+            {"w": watchlist_id},
+        )
+        return wl
+
+    # =====================================================================
+    # Trial results (requires fetch_clinical_trials to have been run)
+    # =====================================================================
+
+    def get_trial_results(
+        self,
+        target_symbol: str | None = None,
+        compound_name: str | None = None,
+        indication_name: str | None = None,
+        has_results_only: bool = False,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return real ClinicalTrials.gov rows matching a target/compound/indication.
+
+        Unlike `get_clinical_pipeline` (which can synthesize from max_phase),
+        this tool only returns records from the `trials` table, so every row
+        has a real NCT ID, brief title, phase, status, sponsor, and — when
+        available — primary outcome measures and a `has_results` flag.
+        """
+        filters: list[str] = []
+        params: dict[str, Any] = {"lim": limit}
+
+        if target_symbol:
+            tid = self._resolve_target(target_symbol)
+            filters.append("t.nct_id IN (SELECT nct_id FROM trial_targets WHERE target_id = %(tid)s)")
+            params["tid"] = tid
+
+        if compound_name:
+            filters.append("""
+                t.nct_id IN (
+                    SELECT tc.nct_id FROM trial_compounds tc
+                    JOIN compounds c ON c.id = tc.compound_id
+                    WHERE c.pref_name ILIKE %(cname)s
+                       OR c.name ILIKE %(cname)s
+                       OR c.chembl_id = %(cname_exact)s
+                )
+            """)
+            params["cname"] = f"%{compound_name}%"
+            params["cname_exact"] = compound_name
+
+        if indication_name:
+            filters.append("""
+                t.nct_id IN (
+                    SELECT ti.nct_id FROM trial_indications ti
+                    JOIN indications i ON i.id = ti.indication_id
+                    WHERE i.name ILIKE %(iname)s
+                )
+            """)
+            params["iname"] = f"%{indication_name}%"
+
+        if has_results_only:
+            filters.append("t.has_results = TRUE")
+
+        where = (" WHERE " + " AND ".join(filters)) if filters else ""
+        sql = f"""
+            SELECT t.nct_id, t.brief_title, t.phase, t.overall_status,
+                   t.lead_sponsor, t.sponsor_class, t.start_date, t.completion_date,
+                   t.enrollment, t.conditions, t.interventions, t.primary_outcomes,
+                   t.has_results, t.why_stopped, t.last_update_posted
+            FROM trials t
+            {where}
+            ORDER BY
+                CASE WHEN t.has_results THEN 0 ELSE 1 END,
+                t.start_date DESC NULLS LAST
+            LIMIT %(lim)s
+        """
+        rows = self._execute_safe(sql, params)
+        return {
+            "filters": {
+                "target": target_symbol,
+                "compound": compound_name,
+                "indication": indication_name,
+                "has_results_only": has_results_only,
+            },
+            "trials": rows,
+            "total_shown": len(rows),
+        }
+
+    # =====================================================================
+    # Compare two drugs (head-to-head)
+    # =====================================================================
+
+    def compare_drugs(self, drug_a: str, drug_b: str) -> dict[str, Any]:
+        """Head-to-head comparison of two compounds."""
+        def _lookup(name: str) -> dict | None:
+            rows = self._execute_safe("""
+                SELECT id, chembl_id, pref_name, name, max_phase, first_approval,
+                       molecule_type, indication_class, trade_names
+                FROM compounds
+                WHERE pref_name ILIKE %(n)s OR name ILIKE %(n)s OR chembl_id = %(e)s
+                ORDER BY max_phase DESC NULLS LAST LIMIT 1
+            """, {"n": name, "e": name})
+            return rows[0] if rows else None
+
+        a = _lookup(drug_a)
+        b = _lookup(drug_b)
+        if not a or not b:
+            return {
+                "error": "one_or_both_not_found",
+                "drug_a_found": bool(a),
+                "drug_b_found": bool(b),
+            }
+
+        def _targets(cid: str) -> list[dict]:
+            return self._execute_safe("""
+                SELECT ct.target_id, t.symbol, t.name AS target_name,
+                       ct.activity_type, ct.value AS standard_value_nm, ct.pchembl_value
+                FROM compound_targets ct
+                LEFT JOIN targets t ON t.id = ct.target_id
+                WHERE ct.compound_id = %(c)s
+                ORDER BY ct.pchembl_value DESC NULLS LAST
+                LIMIT 50
+            """, {"c": cid})
+
+        a_targets = _targets(a["id"])
+        b_targets = _targets(b["id"])
+        a_syms = {r["symbol"] for r in a_targets if r.get("symbol")}
+        b_syms = {r["symbol"] for r in b_targets if r.get("symbol")}
+        shared = sorted(a_syms & b_syms)
+
+        def _summary(c, targets):
+            return {
+                "name": c.get("pref_name") or c.get("name") or c.get("chembl_id"),
+                "chembl_id": c.get("chembl_id"),
+                "max_phase": c.get("max_phase"),
+                "first_approval": c.get("first_approval"),
+                "molecule_type": c.get("molecule_type"),
+                "indication_class": c.get("indication_class"),
+                "target_count": len(targets),
+                "targets": targets[:20],
+            }
+
+        return {
+            "drug_a": _summary(a, a_targets),
+            "drug_b": _summary(b, b_targets),
+            "shared_targets": shared,
+            "shared_target_count": len(shared),
+            "only_drug_a_targets": sorted(a_syms - b_syms),
+            "only_drug_b_targets": sorted(b_syms - a_syms),
+        }
+
+    # =====================================================================
+    # Drug repurposing — find indications not yet indicated for a drug
+    # =====================================================================
+
+    def find_repurposing_candidates(
+        self, compound_name: str, limit: int = 20
+    ) -> dict[str, Any]:
+        """Rank indications where a compound's primary targets are implicated
+        but where the compound itself has no documented clinical activity.
+        """
+        crows = self._execute_safe("""
+            SELECT id, chembl_id, pref_name, name, max_phase
+            FROM compounds
+            WHERE pref_name ILIKE %(n)s OR name ILIKE %(n)s OR chembl_id = %(e)s
+            ORDER BY max_phase DESC NULLS LAST LIMIT 1
+        """, {"n": compound_name, "e": compound_name})
+        if not crows:
+            return {"error": "compound_not_found", "query": compound_name}
+        compound = crows[0]
+        cid = compound["id"]
+
+        target_rows = self._execute_safe("""
+            SELECT DISTINCT ct.target_id
+            FROM compound_targets ct
+            WHERE ct.compound_id = %(c)s
+        """, {"c": cid})
+        target_ids = [r["target_id"] for r in target_rows if r.get("target_id")]
+        if not target_ids:
+            return {"error": "no_targets_for_compound", "compound": compound}
+
+        existing = self._execute_safe("""
+            SELECT DISTINCT indication_id FROM compound_indications WHERE compound_id = %(c)s
+        """, {"c": cid})
+        existing_ids = {r["indication_id"] for r in existing}
+
+        candidates = self._execute_safe("""
+            SELECT ti.indication_id,
+                   i.name AS indication_name,
+                   i.therapeutic_area,
+                   COUNT(DISTINCT ti.target_id) AS target_support,
+                   AVG(COALESCE(ti.association_score, 0.5)) AS avg_evidence
+            FROM target_indications ti
+            JOIN indications i ON i.id = ti.indication_id
+            WHERE ti.target_id = ANY(%(tids)s)
+            GROUP BY ti.indication_id, i.name, i.therapeutic_area
+            ORDER BY target_support DESC, avg_evidence DESC
+            LIMIT 100
+        """, {"tids": target_ids})
+
+        filtered = [r for r in candidates if r["indication_id"] not in existing_ids]
+        for r in filtered:
+            r["repurposing_score"] = round(
+                float(r.get("target_support") or 0) * float(r.get("avg_evidence") or 0.5), 3
+            )
+        filtered.sort(key=lambda r: r["repurposing_score"], reverse=True)
+
+        return {
+            "compound": {
+                "name": compound.get("pref_name") or compound.get("name") or compound.get("chembl_id"),
+                "chembl_id": compound.get("chembl_id"),
+                "max_phase": compound.get("max_phase"),
+                "target_count": len(target_ids),
+            },
+            "existing_indication_count": len(existing_ids),
+            "candidates": filtered[:limit],
+            "total_candidates": len(filtered),
+        }
+
+    # =====================================================================
+    # KOL (Key Opinion Leader) finder
+    # =====================================================================
+
+    def find_kols(
+        self, target_symbol: str | None = None,
+        indication_name: str | None = None, limit: int = 20,
+    ) -> dict[str, Any]:
+        """Rank authors by paper volume + recency in a target/indication area."""
+        if not target_symbol and not indication_name:
+            return {"error": "require target_symbol or indication_name"}
+
+        params: dict[str, Any] = {"lim": limit}
+        if target_symbol:
+            tid = self._resolve_target(target_symbol)
+            params["tid"] = tid
+            sql = """
+                WITH relevant_papers AS (
+                    SELECT paper_id FROM paper_mentions_target WHERE target_id = %(tid)s
+                    UNION
+                    SELECT paper_id FROM paper_validations   WHERE target_id = %(tid)s
+                )
+                SELECT pa.person_id,
+                       per.name AS person_name,
+                       COUNT(DISTINCT pa.paper_id) AS paper_count,
+                       SUM(
+                           (CASE WHEN p.publication_date >= '2023-01-01' THEN 2 ELSE 1 END)
+                           * (1 + LN(1 + COALESCE(p.citation_count, 0)))
+                       ) AS weighted_score,
+                       SUM(COALESCE(p.citation_count, 0)) AS total_citations,
+                       MAX(p.publication_date) AS most_recent,
+                       ARRAY_AGG(DISTINCT org.name) FILTER (WHERE org.name IS NOT NULL) AS affiliations
+                FROM paper_authors pa
+                JOIN relevant_papers rp ON rp.paper_id = pa.paper_id
+                LEFT JOIN papers p ON p.id = pa.paper_id
+                LEFT JOIN persons per ON per.id = pa.person_id
+                LEFT JOIN person_organizations po ON po.person_id = pa.person_id
+                LEFT JOIN organizations org ON org.id = po.org_id
+                GROUP BY pa.person_id, per.name
+                ORDER BY weighted_score DESC NULLS LAST, paper_count DESC
+                LIMIT %(lim)s
+            """
+        else:
+            params["iname"] = f"%{indication_name}%"
+            sql = """
+                SELECT pa.person_id,
+                       per.name AS person_name,
+                       COUNT(DISTINCT pa.paper_id) AS paper_count,
+                       SUM(
+                           (CASE WHEN p.publication_date >= '2023-01-01' THEN 2 ELSE 1 END)
+                           * (1 + LN(1 + COALESCE(p.citation_count, 0)))
+                       ) AS weighted_score,
+                       SUM(COALESCE(p.citation_count, 0)) AS total_citations,
+                       MAX(p.publication_date) AS most_recent,
+                       ARRAY_AGG(DISTINCT org.name) FILTER (WHERE org.name IS NOT NULL) AS affiliations
+                FROM paper_authors pa
+                JOIN papers p ON p.id = pa.paper_id
+                LEFT JOIN persons per ON per.id = pa.person_id
+                LEFT JOIN person_organizations po ON po.person_id = pa.person_id
+                LEFT JOIN organizations org ON org.id = po.org_id
+                WHERE p.mesh_terms::text ILIKE %(iname)s
+                   OR p.title ILIKE %(iname)s
+                GROUP BY pa.person_id, per.name
+                ORDER BY weighted_score DESC NULLS LAST, paper_count DESC
+                LIMIT %(lim)s
+            """
+        rows = self._execute_safe(sql, params)
+        return {
+            "query": {"target": target_symbol, "indication": indication_name},
+            "kols": rows,
+            "total": len(rows),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
+
+_default_queries: GraphQueries | None = None
+
+
+def get_graph_queries() -> GraphQueries:
+    global _default_queries
+    if _default_queries is None:
+        _default_queries = GraphQueries()
+    return _default_queries

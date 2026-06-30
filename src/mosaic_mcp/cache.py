@@ -1,0 +1,183 @@
+"""
+Response caching (Op-6) — unit-economics defense.
+
+Two layers, both keyed on the monotonic ``kg_version`` so an ingestion
+refresh transparently invalidates everything:
+
+- tool-result cache: (tool_name, normalized_params, kg_version)
+- agent-response cache: (normalized_query, agent_version, kg_version)
+
+Every operation is fail-safe: any cache error degrades to a normal
+(uncached) call. Cache reads are free to the user — callers must skip
+quota accounting on a hit. No PII enters cache keys (params/queries are
+normalised, never user identifiers).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import time
+from typing import Any
+
+from mosaic_mcp.db.connection import get_pool
+
+logger = logging.getLogger(__name__)
+
+# Tools that mutate state — never cached.
+NON_CACHEABLE: frozenset[str] = frozenset({
+    "mosaic_watchlist_create",
+    "mosaic_watchlist_add_item",
+    "mosaic_target_wishlist_add",
+})
+
+# Per-tool TTL seconds; _DEFAULT_TTL for anything unlisted.
+_DEFAULT_TTL = 3600
+_TTL_BY_TOOL: dict[str, int] = {
+    "mosaic_get_target_profile": 86_400,
+    "mosaic_kg_stats": 3_600,
+    "mosaic_find_opportunities": 21_600,
+    "mosaic_find_undruggable_targets": 21_600,
+}
+_AGENT_TTL = 86_400
+
+_kg_cache: dict[str, Any] = {"at": 0.0, "v": None}
+
+
+def _db():
+    return get_pool()
+
+
+def _kg_version() -> int:
+    """Current kg_version, cached in-process for 60s."""
+    now = time.time()
+    if _kg_cache["v"] is not None and now - _kg_cache["at"] < 60:
+        return _kg_cache["v"]
+    v = 1
+    try:
+        rows = _db().execute("SELECT kg_version FROM kg_metadata WHERE id = 1")
+        if rows and rows[0].get("kg_version") is not None:
+            v = int(rows[0]["kg_version"])
+    except Exception as e:
+        logger.debug("kg_version read failed, using %s: %s", v, e)
+    _kg_cache.update(at=now, v=v)
+    return v
+
+
+def normalize_params(params: dict[str, Any]) -> str:
+    """Stable, PII-free canonical form of tool params.
+
+    Lowercases string scalars (entity names are case-insensitive here),
+    sorts keys, drops None, and serialises deterministically.
+    """
+    def norm(v: Any) -> Any:
+        if isinstance(v, str):
+            return v.strip().lower()
+        if isinstance(v, dict):
+            return {k: norm(v[k]) for k in sorted(v) if v[k] is not None}
+        if isinstance(v, (list, tuple)):
+            return [norm(x) for x in v]
+        return v
+
+    clean = {k: norm(params[k]) for k in sorted(params) if params[k] is not None}
+    return json.dumps(clean, separators=(",", ":"), default=str)
+
+
+def _key(*parts: Any) -> str:
+    return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()
+
+
+def _get(table: str, key: str) -> Any | None:
+    try:
+        rows = _db().execute(
+            f"SELECT response FROM {table} "  # noqa: S608 - table is a literal
+            "WHERE cache_key = %s AND expires_at > NOW()",
+            (key,),
+        )
+        if rows:
+            return rows[0]["response"]
+    except Exception as e:
+        logger.debug("cache get skipped (%s): %s", table, e)
+    return None
+
+
+# --- tool-result cache ----------------------------------------------------
+
+def tool_cache_get(tool_name: str, params: dict[str, Any]) -> str | None:
+    if tool_name in NON_CACHEABLE:
+        return None
+    key = _key(tool_name, normalize_params(params), _kg_version())
+    hit = _get("tool_response_cache", key)
+    if hit is not None:
+        logger.info("cache_hit tool=%s", tool_name)
+        return hit if isinstance(hit, str) else json.dumps(hit)
+    logger.info("cache_miss tool=%s", tool_name)
+    return None
+
+
+def tool_cache_put(tool_name: str, params: dict[str, Any], response: str) -> None:
+    if tool_name in NON_CACHEABLE:
+        return
+    ttl = _TTL_BY_TOOL.get(tool_name, _DEFAULT_TTL)
+    v = _kg_version()
+    key = _key(tool_name, normalize_params(params), v)
+    try:
+        _db().execute(
+            """
+            INSERT INTO tool_response_cache
+                (cache_key, tool_name, kg_version, response, expires_at)
+            VALUES (%s, %s, %s, %s::jsonb, NOW() + (%s || ' seconds')::interval)
+            ON CONFLICT (cache_key) DO UPDATE
+                SET response = EXCLUDED.response,
+                    expires_at = EXCLUDED.expires_at
+            """,
+            (key, tool_name, v, json.dumps(response), str(ttl)),
+        )
+    except Exception as e:
+        logger.debug("cache put skipped (tool=%s): %s", tool_name, e)
+
+
+# --- agent-response cache -------------------------------------------------
+
+def agent_cache_get(query: str, agent_version: str) -> str | None:
+    key = _key(query.strip().lower(), agent_version, _kg_version())
+    hit = _get("agent_response_cache", key)
+    if hit is not None:
+        logger.info("cache_hit agent v=%s", agent_version)
+        return hit if isinstance(hit, str) else json.dumps(hit)
+    logger.info("cache_miss agent v=%s", agent_version)
+    return None
+
+
+def agent_cache_put(query: str, agent_version: str, response: str) -> None:
+    v = _kg_version()
+    key = _key(query.strip().lower(), agent_version, v)
+    try:
+        _db().execute(
+            """
+            INSERT INTO agent_response_cache
+                (cache_key, kg_version, response, expires_at)
+            VALUES (%s, %s, %s::jsonb, NOW() + (%s || ' seconds')::interval)
+            ON CONFLICT (cache_key) DO UPDATE
+                SET response = EXCLUDED.response,
+                    expires_at = EXCLUDED.expires_at
+            """,
+            (key, v, json.dumps(response), str(_AGENT_TTL)),
+        )
+    except Exception as e:
+        logger.debug("agent cache put skipped: %s", e)
+
+
+def purge_expired() -> int:
+    """Delete expired rows from both caches. Returns rows removed."""
+    n = 0
+    for tbl in ("tool_response_cache", "agent_response_cache"):
+        try:
+            rows = _db().execute(
+                f"DELETE FROM {tbl} WHERE expires_at <= NOW() RETURNING 1"  # noqa: S608
+            )
+            n += len(rows)
+        except Exception as e:
+            logger.debug("purge skipped (%s): %s", tbl, e)
+    return n

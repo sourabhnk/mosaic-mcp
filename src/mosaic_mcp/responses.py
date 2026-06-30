@@ -1,0 +1,985 @@
+"""
+Rich MCP response formatters.
+
+Wraps raw GraphQueries output with self-documenting structure:
+- _meta: section labels, data descriptions, freshness
+- Computed summaries and interpretations
+- Units and context on every numeric field
+
+Any MCP client (Claude Desktop, Cursor, Claude Code) can present
+these responses beautifully without custom formatting logic.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+# High-traffic oncology targets where an empty data layer is surprising
+# and most damaging to credibility (Task 1.1.R.3). An empty result on one
+# of these almost always means the layer has not been ingested yet, not
+# that the biology is absent — so we attach a wishlist CTA.
+WELL_KNOWN_TARGETS = frozenset({
+    "EGFR", "KRAS", "BRAF", "ALK", "MYC", "TP53", "PIK3CA", "PTEN", "MET",
+    "ERBB2", "HER2", "BRCA1", "BRCA2", "KIT", "ABL1", "BCR", "ROS1", "RET",
+    "NTRK1", "FGFR1", "FGFR2", "FGFR3", "CDK4", "CDK6", "MDM2", "BCL2",
+    "JAK2", "FLT3", "IDH1", "IDH2", "NRAS", "HRAS", "AKT1", "MTOR", "SMO",
+    "NOTCH1", "STK11", "VHL", "RB1", "CDKN2A", "ESR1", "AR", "PARP1", "ATM",
+    "CHEK2", "PDCD1", "CD274", "CTLA4", "VEGFA", "KDR",
+})
+
+
+def empty_scope_note(
+    entity: str,
+    what: str,
+    *,
+    hint: str | None = None,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    """Honest scope block for an empty / zero result.
+
+    Frames absence as *current Mosaic ingestion coverage*, never as a
+    claim that ``entity`` has no ``what``. Attaches a wishlist CTA when
+    ``entity`` is a well-known target, where an empty result is surprising
+    and most likely a coverage gap.
+    """
+    as_of_clause = f" (as of {as_of})" if as_of else ""
+    note: dict[str, Any] = {
+        "status": "empty",
+        "description": (
+            f"No {what} found for {entity} in the current Mosaic KG"
+            f"{as_of_clause}."
+        ),
+        "scope_note": (
+            f"This reflects current ingestion coverage in Mosaic, not an "
+            f"assertion that {entity} has no {what}. Verify against primary "
+            f"sources before drawing conclusions."
+        ),
+    }
+    if hint:
+        note["hint"] = hint
+    if str(entity).strip().upper() in WELL_KNOWN_TARGETS:
+        note["surprising"] = (
+            f"{entity} is a well-characterised target — an empty result "
+            f"here most likely means this layer has not been ingested yet."
+        )
+        note["wishlist_cta"] = (
+            f"If you expected {what} for {entity}, flag it via "
+            f"mosaic_target_wishlist_add so coverage can be prioritised."
+        )
+    return note
+
+
+def empty_scope_sentence(entity: str, what: str) -> str:
+    """One-line honest phrasing for string-returning interpreters."""
+    return (
+        f"No {what} for {entity} in the current Mosaic KG — this reflects "
+        f"ingestion coverage, not confirmed absence."
+    )
+
+
+def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
+    """Wrap get_target_deep_profile() output into a rich MCP response."""
+
+    symbol = profile.get("gene_symbol", "?")
+    name = profile.get("target_name", "")
+    counts = profile.get("counts", {})
+    scores = profile.get("scores")
+    sar = profile.get("sar_summary", {})
+
+    # --- Biology section ---
+    biology = {
+        "gene_symbol": symbol,
+        "target_name": name,
+        "target_class": profile.get("target_class"),
+        "protein_family": profile.get("protein_family"),
+        "uniprot_id": profile.get("uniprot_id"),
+        "chembl_id": profile.get("chembl_id"),
+        "entrez_id": profile.get("entrez_id"),
+        "druggability_tier": profile.get("druggability_tier"),
+        "subcellular_location": profile.get("subcellular_location"),
+        "protein_length_aa": profile.get("protein_length"),
+        "function": profile.get("function_description"),
+        "gene_names": profile.get("gene_names"),
+        "go_terms": profile.get("go_terms"),
+    }
+
+    # --- Scores section ---
+    scores_section = None
+    if scores:
+        def _bar(val):
+            if val is None:
+                return None
+            pct = round(val * 100)
+            filled = round(pct / 10)
+            return f"{'█' * filled}{'░' * (10 - filled)} {pct}/100"
+
+        momentum_dir = scores.get("momentum_direction", "stable")
+        arrow = {"rising": "↑", "declining": "↓"}.get(momentum_dir, "→")
+
+        scores_section = {
+            "target_attractiveness": {
+                "value": scores.get("target_attractiveness"),
+                "display": _bar(scores.get("target_attractiveness")),
+                "description": "Overall composite score combining all dimensions",
+            },
+            "scientific_validation": {
+                "value": scores.get("scientific_validation"),
+                "display": _bar(scores.get("scientific_validation")),
+                "description": "Strength of genetic, in vivo, and clinical evidence",
+            },
+            "druggability": {
+                "value": scores.get("druggability"),
+                "display": _bar(scores.get("druggability")),
+                "description": "Likelihood of finding a drug-like modulator",
+            },
+            "competitive_intensity": {
+                "value": scores.get("competitive_intensity"),
+                "display": _bar(scores.get("competitive_intensity")),
+                "description": "How crowded the target space is (higher = more competition)",
+            },
+            "momentum": {
+                "value": scores.get("momentum"),
+                "display": _bar(scores.get("momentum")),
+                "direction": f"{momentum_dir} {arrow}",
+                "description": "Recent publication and patent filing trend",
+            },
+        }
+
+    # --- SAR summary ---
+    sar_section = None
+    if sar and sar.get("total_compounds"):
+        best_ic50 = sar.get("best_ic50_nm")
+        mean_ic50 = sar.get("mean_ic50_nm")
+        sar_section = {
+            "total_compounds": sar["total_compounds"],
+            "best_ic50": _format_activity(best_ic50),
+            "mean_ic50": _format_activity(mean_ic50),
+            "highest_clinical_phase": sar.get("highest_phase"),
+            "assay_types_tested": sar.get("assay_type_count"),
+            "interpretation": _interpret_sar(sar),
+        }
+
+    # --- Top compounds with units ---
+    compounds = []
+    for c in profile.get("top_compounds", []):
+        compounds.append({
+            "compound_name": c.get("compound_name"),
+            "chembl_id": c.get("chembl_id"),
+            "activity": _format_activity(c.get("activity_value")),
+            "activity_type": c.get("activity_type", "IC50"),
+            "assay_type": c.get("assay_type"),
+            "clinical_phase": c.get("max_phase", 0),
+            "molecular_weight": c.get("molecular_weight"),
+        })
+
+    # --- Disease associations ---
+    diseases = []
+    for d in profile.get("disease_associations", []):
+        diseases.append({
+            "disease": d.get("indication_name"),
+            "therapeutic_area": d.get("therapeutic_area"),
+            "evidence_type": d.get("evidence_type"),
+            "association_score": d.get("association_score"),
+        })
+
+    # --- Validation evidence ---
+    val = profile.get("validation_evidence", {})
+    validation = {
+        "summary": val.get("by_type", {}),
+        "total_evidence_count": sum(val.get("by_type", {}).values()) if val.get("by_type") else 0,
+        "top_papers": [
+            {
+                "title": p.get("title"),
+                "journal": p.get("journal"),
+                "year": _extract_year(p.get("publication_date")),
+                "citations": p.get("citation_count"),
+                "pmid": p.get("pmid"),
+                "validation_type": p.get("validation_type"),
+                "model_system": p.get("model_system"),
+                "outcome": p.get("outcome"),
+            }
+            for p in val.get("top_papers", [])
+        ],
+        "interpretation": _interpret_validation(val.get("by_type", {})),
+    }
+
+    # --- Clinical pipeline ---
+    pipeline = [
+        {
+            "compound": p.get("compound_name"),
+            "chembl_id": p.get("chembl_id"),
+            "indication": p.get("indication_name"),
+            "phase": p.get("max_phase"),
+            "status": p.get("clinical_status"),
+        }
+        for p in profile.get("clinical_pipeline", [])
+    ]
+
+    # --- Competitive landscape ---
+    orgs = [
+        {
+            "organization": o.get("org_name"),
+            "type": o.get("org_type"),
+            "is_big_pharma": o.get("is_big_pharma"),
+            "patent_count": o.get("patent_count"),
+        }
+        for o in profile.get("top_organizations", [])
+    ]
+    big_pharma_count = sum(1 for o in orgs if o.get("is_big_pharma"))
+
+    # --- Pathways ---
+    pathways = [
+        {
+            "pathway": p.get("pathway_name"),
+            "source": p.get("source"),
+            "category": p.get("category"),
+        }
+        for p in profile.get("pathways", [])
+    ]
+
+    # --- PPIs ---
+    ppis = [
+        {
+            "partner": p.get("partner_symbol"),
+            "partner_name": p.get("partner_name"),
+            "confidence": p.get("confidence"),
+            "interaction_type": p.get("interaction_type"),
+        }
+        for p in profile.get("protein_interactions", [])
+    ]
+
+    # --- Publication trend ---
+    trend = profile.get("publication_trend", [])
+    trend_formatted = [
+        {"year": t.get("year"), "papers": t.get("paper_count")}
+        for t in trend
+    ]
+
+    # --- Structure (AlphaFold + druggability) ---
+    structure_section = format_structure_summary(profile.get("structure"))
+
+    # --- Semantic relations (if available) ---
+    sem_rels = profile.get("semantic_relations")
+    semantic_section = None
+    if sem_rels and sem_rels.get("total_semantic_relations", 0) > 0:
+        semantic_section = {
+            "moa_summary": sem_rels.get("moa_summary", {}),
+            "edge_counts": sem_rels.get("semantic_edge_counts", {}),
+            "total": sem_rels.get("total_semantic_relations", 0),
+        }
+
+    # --- Key insight ---
+    insight = _generate_insight(symbol, name, scores, sar, counts, big_pharma_count, validation)
+
+    return {
+        "_meta": {
+            "tool": "mosaic_get_target_profile",
+            "description": f"Comprehensive intelligence dossier for {symbol} ({name})",
+            "sections": [
+                "biology", "scores", "structure", "sar_summary", "top_compounds",
+                "disease_associations", "validation_evidence", "clinical_pipeline",
+                "competitive_landscape", "pathways", "protein_interactions",
+                "publication_trend", "key_insight",
+            ],
+            "data_coverage": {
+                "compounds": counts.get("compound_count", 0),
+                "patents": counts.get("patent_count", 0),
+                "papers": counts.get("paper_count", 0),
+                "organizations": counts.get("organization_count", 0),
+                "pathways": counts.get("pathway_count", 0),
+                "protein_interactions": counts.get("ppi_count", 0),
+                "disease_associations": counts.get("indication_count", 0),
+                "validation_evidence": counts.get("validation_count", 0),
+            },
+        },
+        "biology": biology,
+        "scores": scores_section,
+        "structure": structure_section,
+        "sar_summary": sar_section,
+        "top_compounds": compounds,
+        "disease_associations": diseases,
+        "validation_evidence": validation,
+        "clinical_pipeline": pipeline,
+        "competitive_landscape": {
+            "top_organizations": orgs,
+            "big_pharma_active": big_pharma_count,
+            "total_organizations": counts.get("organization_count", 0),
+        },
+        "pathways": pathways,
+        "protein_interactions": ppis,
+        "publication_trend": trend_formatted,
+        "semantic_relations": semantic_section,
+        "key_insight": insight,
+    }
+
+
+def format_competitive_landscape(data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap get_competitive_landscape() output."""
+    target = data.get("target", "?")
+    orgs = data.get("organizations", [])
+    big_pharma = [o for o in orgs if o.get("is_big_pharma")]
+
+    if not orgs:
+        return {
+            "_meta": {
+                "tool": "mosaic_competitive_landscape",
+                **empty_scope_note(
+                    target,
+                    "competitive landscape data (organizations, patents, "
+                    "compounds)",
+                ),
+            },
+            "target": target,
+            "top_organizations": [],
+            "big_pharma_players": [],
+            "summary": {
+                "total_organizations": 0,
+                "big_pharma_count": 0,
+                "competitive_intensity": "unknown",
+            },
+        }
+
+    # Cap to top 25 orgs to keep response manageable for LLMs
+    top_orgs = orgs[:25]
+
+    return {
+        "_meta": {
+            "tool": "mosaic_competitive_landscape",
+            "description": f"Competitive landscape for {target}",
+            "interpretation": (
+                f"{len(orgs)} organizations active on {target}. "
+                f"{len(big_pharma)} are Big Pharma. "
+                f"{data.get('total_compounds', 0)} compounds, {data.get('total_patents', 0)} patents."
+            ),
+        },
+        "target": target,
+        "top_organizations": top_orgs,
+        "big_pharma_players": [
+            {"name": o["name"], "patent_count": o.get("patent_count", 0)}
+            for o in big_pharma[:15]
+        ],
+        "summary": {
+            "total_organizations": len(orgs),
+            "showing_top": len(top_orgs),
+            "big_pharma_count": len(big_pharma),
+            "total_compounds": data.get("total_compounds", 0),
+            "total_patents": data.get("total_patents", 0),
+            "competitive_intensity": "high" if len(big_pharma) >= 3 else "moderate" if len(big_pharma) >= 1 else "low",
+        },
+    }
+
+
+def format_pathway_context(data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap get_pathway_context() output."""
+    target = data.get("target", "?")
+    pathways = data.get("pathways", [])
+    ppis = data.get("protein_interactions", [])
+    related = data.get("related_targets", [])
+
+    if not pathways and not ppis and not related:
+        return {
+            "_meta": {
+                "tool": "mosaic_pathway_context",
+                **empty_scope_note(
+                    target, "pathway, PPI, or co-pathway data"
+                ),
+            },
+            "target": target,
+            "pathways": [],
+            "protein_interactions": [],
+            "functionally_related_targets": [],
+            "summary": {
+                "pathway_count": 0,
+                "ppi_count": 0,
+                "co_pathway_targets": 0,
+            },
+        }
+
+    # Group related targets by shared pathway count
+    target_pathway_counts = {}
+    for r in related:
+        sym = r.get("target_symbol")
+        if sym not in target_pathway_counts:
+            target_pathway_counts[sym] = {
+                "symbol": sym,
+                "name": r.get("target_name"),
+                "target_class": r.get("target_class"),
+                "druggability": r.get("druggability"),
+                "shared_pathways": 0,
+            }
+        target_pathway_counts[sym]["shared_pathways"] += 1
+
+    functionally_related = sorted(
+        target_pathway_counts.values(),
+        key=lambda x: x["shared_pathways"],
+        reverse=True,
+    )[:15]
+
+    return {
+        "_meta": {
+            "tool": "mosaic_pathway_context",
+            "description": f"Biological pathway context for {target}",
+            "interpretation": (
+                f"{target} participates in {len(pathways)} pathways, "
+                f"has {len(ppis)} protein-protein interactions, and shares "
+                f"pathways with {len(target_pathway_counts)} other drug targets."
+            ),
+        },
+        "target": target,
+        "pathways": pathways,
+        "protein_interactions": ppis,
+        "functionally_related_targets": functionally_related,
+        "summary": {
+            "pathway_count": len(pathways),
+            "ppi_count": len(ppis),
+            "co_pathway_targets": len(target_pathway_counts),
+        },
+    }
+
+
+def format_compound_selectivity(data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap get_compound_selectivity_profile() output."""
+    compound = data.get("compound", {})
+    activities = data.get("activities", [])
+    selectivity = data.get("selectivity_data", [])
+
+    # Classify selectivity
+    target_count = len(activities)
+    if target_count <= 1:
+        selectivity_class = "highly selective (single target)"
+    elif target_count <= 3:
+        selectivity_class = "selective (2-3 targets)"
+    elif target_count <= 7:
+        selectivity_class = "moderately selective"
+    else:
+        selectivity_class = "promiscuous (many off-targets)"
+
+    # Format activities with units
+    formatted_activities = []
+    for a in activities:
+        formatted_activities.append({
+            "target": a.get("target_symbol"),
+            "target_name": a.get("target_name"),
+            "target_class": a.get("target_class"),
+            "activity": _format_activity(a.get("value")),
+            "activity_type": a.get("activity_type"),
+            "assay_type": a.get("assay_type"),
+            "pchembl": a.get("pchembl_value"),
+        })
+
+    return {
+        "_meta": {
+            "tool": "mosaic_compound_selectivity",
+            "description": f"Selectivity profile for {compound.get('name', '?')} ({compound.get('chembl_id', '')})",
+            "interpretation": (
+                f"Tested against {target_count} targets. "
+                f"Classification: {selectivity_class}."
+            ),
+        },
+        "compound": compound,
+        "selectivity_class": selectivity_class,
+        "activities": formatted_activities,
+        "selectivity_ratios": selectivity,
+        "target_count": target_count,
+    }
+
+
+def format_search_results(results: list[dict], query: str) -> dict[str, Any]:
+    """Wrap search_targets() output with enriched context."""
+    enriched = []
+    for r in results:
+        entry = {
+            "gene_symbol": r.get("gene_symbol"),
+            "target_name": r.get("target_name"),
+            "target_class": r.get("target_class"),
+            "druggability_tier": r.get("druggability_tier"),
+            "compound_count": r.get("compound_count", 0),
+            "patent_count": r.get("patent_count", 0),
+            "paper_count": r.get("paper_count", 0),
+        }
+        # Include scores if available
+        tas = r.get("target_attractiveness")
+        if tas is not None:
+            entry["target_attractiveness"] = round(tas, 3)
+            entry["scientific_validation"] = round(r.get("scientific_validation") or 0, 3)
+            entry["momentum"] = round(r.get("momentum") or 0, 3)
+            entry["momentum_direction"] = r.get("momentum_direction")
+        # Include function description (truncated)
+        func = r.get("function_description")
+        if func:
+            entry["function"] = func[:200] + ("..." if len(func) > 200 else "")
+        enriched.append(entry)
+
+    return {
+        "_meta": {
+            "tool": "mosaic_search_targets",
+            "description": f"Search results for '{query}'",
+            "hint": "Use mosaic_get_target_profile on any gene_symbol for the full dossier.",
+            "sorted_by": "target_attractiveness (descending)",
+        },
+        "query": query,
+        "targets": enriched,
+        "total": len(enriched),
+    }
+
+
+def format_indication_landscape(data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap get_indication_landscape() output."""
+    indication = data.get("indication", "?")
+    targets = data.get("targets", [])
+    compounds = data.get("compounds", [])
+
+    # Sort targets by association score
+    sorted_targets = sorted(
+        targets,
+        key=lambda t: t.get("association_score") or 0,
+        reverse=True,
+    )
+
+    return {
+        "_meta": {
+            "tool": "mosaic_indication_landscape",
+            "description": f"Therapeutic landscape for {indication}",
+            "interpretation": (
+                f"{len(targets)} targets implicated in {indication}, "
+                f"{len(compounds)} compounds in development."
+            ),
+        },
+        "indication": indication,
+        "targets": sorted_targets,
+        "compounds": compounds,
+        "summary": {
+            "target_count": len(targets),
+            "compound_count": len(compounds),
+            "druggable_targets": sum(
+                1 for t in targets
+                if t.get("druggability") and t["druggability"].startswith("Tier")
+            ),
+        },
+    }
+
+
+def format_compare_targets(results: list[dict]) -> dict[str, Any]:
+    """Wrap compare_targets() output."""
+    symbols = [r.get("gene_symbol", "?") for r in results]
+
+    # Add interpretive labels
+    for r in results:
+        tas = r.get("target_attractiveness")
+        if tas is not None:
+            r["attractiveness_label"] = (
+                "very attractive" if tas >= 0.7 else
+                "attractive" if tas >= 0.5 else
+                "moderate" if tas >= 0.3 else
+                "low priority"
+            )
+
+    return {
+        "_meta": {
+            "tool": "mosaic_compare_targets",
+            "description": f"Side-by-side comparison of {', '.join(symbols)}",
+            "hint": "Targets are ranked by target_attractiveness score. Use mosaic_get_target_profile for full dossier on any target.",
+        },
+        "targets": sorted(results, key=lambda r: r.get("target_attractiveness") or 0, reverse=True),
+        "count": len(results),
+    }
+
+
+def format_clinical_pipeline(data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap get_clinical_pipeline() output."""
+    target = data.get("target", "?")
+    pipeline = data.get("pipeline", [])
+
+    # Group by phase
+    by_phase: dict[int, int] = {}
+    for p in pipeline:
+        phase = p.get("trial_phase") or p.get("max_phase") or 0
+        by_phase[phase] = by_phase.get(phase, 0) + 1
+
+    return {
+        "_meta": {
+            "tool": "mosaic_clinical_pipeline",
+            "description": f"Clinical development pipeline for {target}",
+            "interpretation": (
+                f"{len(pipeline)} compound-indication pairs in clinical development. "
+                + ", ".join(f"Phase {k}: {v}" for k, v in sorted(by_phase.items(), reverse=True))
+            ),
+        },
+        "target": target,
+        "pipeline": pipeline,
+        "phase_distribution": by_phase,
+        "total_entries": len(pipeline),
+    }
+
+
+_TIER_DESCRIPTIONS = {
+    "highly_druggable": "Deep, well-defined pocket — small molecules likely tractable",
+    "druggable": "Identifiable pocket — small-molecule SBDD reasonable",
+    "challenging": "Shallow / disordered surface — consider PROTAC, degrader, or PPI inhibitor",
+    "undruggable": "No clear pocket — small-molecule unlikely; explore biologics or modality switch",
+    "unknown": "Insufficient structural signal to call",
+}
+
+
+def format_structure_summary(structure: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Wrap a target_structure row into an MCP-friendly summary."""
+    if not structure or not structure.get("uniprot_id"):
+        return None
+
+    mean_plddt = structure.get("mean_plddt")
+    disorder = structure.get("disorder_frac")
+    confident = structure.get("plddt_confident_frac")
+    top_score = structure.get("top_pocket_score")
+    pocket_count = structure.get("pocket_count")
+    tier = structure.get("structural_tier") or "unknown"
+
+    plddt_label = None
+    if mean_plddt is not None:
+        if mean_plddt >= 90:
+            plddt_label = "very high (model essentially solved)"
+        elif mean_plddt >= 70:
+            plddt_label = "confident"
+        elif mean_plddt >= 50:
+            plddt_label = "low (interpret with caution)"
+        else:
+            plddt_label = "very low (likely disordered)"
+
+    disorder_pct = round(disorder * 100, 1) if disorder is not None else None
+    confident_pct = round(confident * 100, 1) if confident is not None else None
+
+    return {
+        "uniprot_id": structure.get("uniprot_id"),
+        "alphafold_url": structure.get("afdb_url"),
+        "pdb_url": structure.get("pdb_url"),
+        "pae_url": structure.get("pae_url"),
+        "model_version": structure.get("afdb_version"),
+        "confidence": {
+            "mean_plddt": mean_plddt,
+            "label": plddt_label,
+            "confident_residues_pct": confident_pct,
+            "disordered_residues_pct": disorder_pct,
+            "seq_length": structure.get("seq_length"),
+        },
+        "druggability": {
+            "tier": tier,
+            "tier_description": _TIER_DESCRIPTIONS.get(tier),
+            "top_pocket_score": top_score,
+            "top_pocket_volume_a3": structure.get("top_pocket_volume"),
+            "pocket_count": pocket_count,
+            "pockets": structure.get("pockets"),
+        },
+        "interpretation": _interpret_structure(structure),
+    }
+
+
+def _interpret_structure(s: dict[str, Any]) -> str:
+    """Plain-English read of an AlphaFold + druggability row."""
+    parts: list[str] = []
+    mean_plddt = s.get("mean_plddt")
+    disorder = s.get("disorder_frac")
+    pocket_count = s.get("pocket_count")
+    top_score = s.get("top_pocket_score")
+    tier = s.get("structural_tier")
+
+    if mean_plddt is not None:
+        if mean_plddt >= 85:
+            parts.append("AlphaFold model is high-confidence")
+        elif mean_plddt < 60:
+            parts.append("AlphaFold model is low-confidence overall")
+
+    if disorder is not None and disorder > 0.4:
+        parts.append(
+            f"{round(disorder * 100)}% of residues are predicted disordered "
+            "— consider degrader or PPI strategies"
+        )
+
+    if pocket_count and top_score is not None:
+        parts.append(
+            f"{pocket_count} pocket(s) detected; top druggability score "
+            f"{top_score:.2f}"
+        )
+
+    if tier and tier != "unknown":
+        parts.append(_TIER_DESCRIPTIONS.get(tier, tier))
+
+    return (
+        ". ".join(parts) + "."
+        if parts
+        else "No structural assessment available from the current Mosaic KG "
+        "(reflects ingestion coverage, not confirmed absence)."
+    )
+
+
+def format_druggability(structure: dict[str, Any] | None, target: str) -> dict[str, Any]:
+    """Wrap a target_structure row into a druggability-focused MCP response."""
+    if not structure:
+        return {
+            "_meta": {
+                "tool": "mosaic_assess_druggability",
+                **empty_scope_note(
+                    target,
+                    "AlphaFold structure",
+                    hint="Structural druggability needs an ingested "
+                    "AlphaFold model for this target.",
+                ),
+            },
+            "target": target,
+            "available": False,
+        }
+
+    summary = format_structure_summary(structure)
+    return {
+        "_meta": {
+            "tool": "mosaic_assess_druggability",
+            "description": (
+                f"Structural druggability assessment for {target} "
+                "from AlphaFold + fpocket"
+            ),
+            "interpretation": summary["interpretation"] if summary else None,
+        },
+        "target": target,
+        "available": True,
+        "summary": summary,
+    }
+
+
+def _suggest_modality(row: dict[str, Any]) -> str:
+    """Suggest a modality strategy from structural signals."""
+    disorder = row.get("disorder_frac") or 0.0
+    pocket_count = row.get("pocket_count") or 0
+    top_score = row.get("top_pocket_score")
+
+    if disorder >= 0.5:
+        return "Targeted degrader (PROTAC / molecular glue) — predominantly disordered"
+    if pocket_count == 0 or (top_score is not None and top_score < 0.2):
+        return "Biologic / PPI inhibitor — no druggable pocket detected"
+    if top_score is not None and top_score < 0.4:
+        return "Fragment-based or cryptic-pocket discovery — shallow pocket"
+    return "Reassess: structural signals borderline; consider allosteric SBDD"
+
+
+def format_undruggable_targets(
+    rows: list[dict[str, Any]],
+    therapy_area: str | None,
+) -> dict[str, Any]:
+    """Wrap find_undruggable_targets() output for MCP clients."""
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        disorder = r.get("disorder_frac")
+        items.append({
+            "gene_symbol": r.get("gene_symbol"),
+            "target_name": r.get("target_name"),
+            "uniprot_id": r.get("uniprot_id"),
+            "alphafold_url": r.get("afdb_url"),
+            "structural_tier": r.get("structural_tier"),
+            "mean_plddt": r.get("mean_plddt"),
+            "disordered_residues_pct": (
+                round(disorder * 100, 1) if disorder is not None else None
+            ),
+            "pocket_count": r.get("pocket_count"),
+            "top_pocket_score": r.get("top_pocket_score"),
+            "compound_count": r.get("compound_count"),
+            "approved_drug_count": r.get("approved_drug_count"),
+            "validation_count": r.get("validation_count"),
+            "scientific_validation": r.get("scientific_validation"),
+            "competitive_intensity": r.get("competitive_intensity"),
+            "opportunity_score": (
+                round(r["opportunity_score"], 3)
+                if r.get("opportunity_score") is not None
+                else None
+            ),
+            "suggested_modality": _suggest_modality(r),
+        })
+
+    scope = (
+        f"in {therapy_area}" if therapy_area
+        else "across the knowledge graph"
+    )
+    return {
+        "_meta": {
+            "tool": "mosaic_find_undruggable_targets",
+            "description": (
+                f"Validated, structurally intractable targets {scope} — "
+                "white-space for PROTAC, glue, biologic, or PPI strategies"
+            ),
+            "interpretation": (
+                f"{len(items)} targets returned. Higher opportunity_score = "
+                "stronger validation × weaker pocket × less competition."
+            ),
+        },
+        "therapy_area": therapy_area,
+        "targets": items,
+        "total": len(items),
+    }
+
+
+def format_validation_summary(data: dict[str, Any]) -> dict[str, Any]:
+    """Wrap get_target_validation_summary() output."""
+    target = data.get("target", "?")
+    types = data.get("validation_types", [])
+
+    interpretation = _interpret_validation(
+        {r["validation_type"]: r["count"] for r in types}
+    )
+
+    return {
+        "_meta": {
+            "tool": "mosaic_target_validation",
+            "description": f"Experimental validation evidence for {target}",
+            "interpretation": interpretation,
+        },
+        "target": target,
+        "validation_types": types,
+        "top_papers": data.get("top_papers", []),
+        "total_evidence": data.get("total_evidence", 0),
+        # Pass through genetic-evidence rollups (DepMap CRISPR essentiality
+        # + AlphaMissense variant pathogenicity) added 2026-05-26.
+        "genetic_evidence": data.get("genetic_evidence", {}),
+    }
+
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+def _format_activity(value: float | None) -> str | None:
+    """Format an activity value with appropriate units."""
+    if value is None:
+        return None
+    if value < 1:
+        return f"{value * 1000:.1f} pM"
+    if value < 1000:
+        return f"{value:.1f} nM"
+    return f"{value / 1000:.2f} μM"
+
+
+def _extract_year(date_str: str | None) -> int | None:
+    if not date_str:
+        return None
+    try:
+        return int(str(date_str)[:4])
+    except (ValueError, IndexError):
+        return None
+
+
+def _interpret_sar(sar: dict) -> str:
+    """Generate a one-sentence SAR interpretation."""
+    best = sar.get("best_ic50_nm")
+    total = sar.get("total_compounds", 0)
+    phase = sar.get("highest_phase", 0)
+
+    parts = []
+    if best is not None:
+        if best < 10:
+            parts.append(f"highly potent lead (best IC50: {_format_activity(best)})")
+        elif best < 100:
+            parts.append(f"potent leads available (best IC50: {_format_activity(best)})")
+        elif best < 1000:
+            parts.append(f"moderate potency (best IC50: {_format_activity(best)})")
+        else:
+            parts.append(f"weak hits only (best IC50: {_format_activity(best)})")
+
+    if total > 100:
+        parts.append(f"well-explored SAR space ({total} compounds)")
+    elif total > 20:
+        parts.append(f"moderate SAR data ({total} compounds)")
+    else:
+        parts.append(f"limited SAR data ({total} compounds)")
+
+    if phase and phase >= 3:
+        parts.append(f"Phase {phase} clinical candidate exists")
+    elif phase and phase >= 1:
+        parts.append(f"compounds in Phase {phase}")
+
+    return (
+        ". ".join(parts) + "."
+        if parts
+        else "No SAR data in the current Mosaic KG (reflects ingestion "
+        "coverage, not confirmed absence)."
+    )
+
+
+def _interpret_validation(by_type: dict) -> str:
+    """Generate validation strength interpretation."""
+    if not by_type:
+        return (
+            "No validation evidence in the current Mosaic KG — this "
+            "reflects ingestion coverage, not confirmed absence of "
+            "experimental validation."
+        )
+
+    total = sum(by_type.values())
+    types_present = list(by_type.keys())
+
+    if "clinical" in by_type and "genetic" in by_type:
+        strength = "strong"
+    elif len(types_present) >= 3:
+        strength = "good"
+    elif len(types_present) >= 2:
+        strength = "moderate"
+    else:
+        strength = "limited"
+
+    parts = [f"{strength} validation ({total} evidence points)"]
+    for vtype in ["genetic", "in_vivo", "clinical", "pharmacological"]:
+        if vtype in by_type:
+            parts.append(f"{vtype}: {by_type[vtype]}")
+
+    return ". ".join(parts) + "."
+
+
+def _generate_insight(
+    symbol: str,
+    name: str,
+    scores: dict | None,
+    sar: dict,
+    counts: dict,
+    big_pharma_count: int,
+    validation: dict,
+) -> str:
+    """Generate a 2-3 sentence key insight about the target."""
+    parts = []
+
+    # Attractiveness assessment
+    if scores:
+        ta_entry = scores.get("target_attractiveness") if isinstance(scores, dict) else None
+        if isinstance(ta_entry, dict):
+            tas = ta_entry.get("value")
+        elif isinstance(ta_entry, (int, float)):
+            tas = ta_entry
+        else:
+            tas = None
+
+        if tas is not None:
+            if tas >= 0.7:
+                parts.append(f"{symbol} is a highly attractive drug target (TAS: {tas:.0%})")
+            elif tas >= 0.5:
+                parts.append(f"{symbol} is an attractive drug target (TAS: {tas:.0%})")
+            elif tas >= 0.3:
+                parts.append(f"{symbol} shows moderate attractiveness (TAS: {tas:.0%})")
+            else:
+                parts.append(f"{symbol} has low target attractiveness (TAS: {tas:.0%})")
+
+    # Competition
+    if big_pharma_count >= 3:
+        parts.append(f"Highly competitive space with {big_pharma_count} Big Pharma players active")
+    elif big_pharma_count >= 1:
+        parts.append(f"{big_pharma_count} Big Pharma organization(s) active")
+    else:
+        parts.append(
+            "No Big Pharma competition recorded in the current Mosaic KG "
+            "— confirm against external sources before treating as "
+            "white space"
+        )
+
+    # SAR maturity
+    best = sar.get("best_ic50_nm")
+    if best is not None and best < 100:
+        parts.append(f"Potent chemical matter exists (best IC50: {_format_activity(best)})")
+
+    # Validation
+    val_total = validation.get("total_evidence_count", 0)
+    if val_total > 20:
+        parts.append(f"Well-validated with {val_total} evidence points from literature")
+
+    return ". ".join(parts[:3]) + "." if parts else f"Insufficient data to assess {symbol}."

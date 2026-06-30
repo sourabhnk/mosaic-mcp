@@ -1,0 +1,290 @@
+"""
+Database connection manager.
+
+Provides a psycopg (v3) connection manager compatible with Neon serverless
+Postgres and standard PostgreSQL.
+
+Neon optimizations:
+- Uses pooled connection endpoint (-pooler suffix) for read queries
+- Supports separate read/write URLs for read replica routing
+- Handles cold-start reconnection (Neon autoscale-to-zero)
+- Ensures sslmode=require for Neon connections
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from contextlib import contextmanager
+from typing import Any, Generator
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
+import psycopg
+from psycopg.rows import dict_row
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_URL = (
+    "postgresql://mosaic_user:mosaic_dev_password@localhost:5432/mosaic_db"
+)
+
+# Maximum retries for Neon cold-start connection failures
+_NEON_CONNECT_RETRIES = 3
+_NEON_RETRY_DELAY_S = 1.0
+
+
+def _is_neon_url(url: str) -> bool:
+    """Check if a URL points to a Neon database."""
+    return "neon.tech" in url
+
+
+def _ensure_neon_params(url: str) -> str:
+    """Ensure Neon URLs have sslmode=require and appropriate timeouts."""
+    if not _is_neon_url(url):
+        return url
+
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+
+    # Ensure sslmode=require for Neon
+    if "sslmode" not in params:
+        params["sslmode"] = ["require"]
+
+    # Flatten params back to query string (single-value)
+    flat_params = {k: v[0] if isinstance(v, list) else v for k, v in params.items()}
+    new_query = urlencode(flat_params)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def _to_pooler_url(url: str) -> str:
+    """Convert a Neon direct URL to use the connection pooler.
+
+    Neon's built-in PgBouncer pooler is accessed by adding '-pooler'
+    to the endpoint hostname:
+        ep-cool-name-123456.us-east-2.aws.neon.tech
+        → ep-cool-name-123456-pooler.us-east-2.aws.neon.tech
+
+    Non-Neon URLs are returned unchanged.
+    """
+    if not _is_neon_url(url):
+        return url
+
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+
+    # Already using pooler
+    if "-pooler." in host:
+        return url
+
+    # Insert -pooler before the first dot
+    parts = host.split(".", 1)
+    if len(parts) == 2:
+        pooler_host = f"{parts[0]}-pooler.{parts[1]}"
+        # Reconstruct with pooler hostname (preserve port if any)
+        if parsed.port:
+            netloc = f"{parsed.username}:{parsed.password}@{pooler_host}:{parsed.port}"
+        else:
+            netloc = f"{parsed.username}:{parsed.password}@{pooler_host}"
+        return urlunparse(parsed._replace(netloc=netloc))
+
+    return url
+
+
+def _get_database_url() -> str:
+    """Get database URL from env var or .env file via pydantic settings."""
+    url = os.getenv("DATABASE_URL")
+    if url and url != _DEFAULT_URL:
+        return _ensure_neon_params(url)
+    # Fall back to pydantic Settings which reads .env files
+    try:
+        from mosaic_mcp._compat import get_settings
+        settings = get_settings()
+        if settings.database_url and "neon" in settings.database_url:
+            return _ensure_neon_params(settings.database_url)
+        return _ensure_neon_params(settings.database_url or settings.postgres_url)
+    except Exception:
+        return _DEFAULT_URL
+
+
+def _get_read_url() -> str:
+    """Get the read-only database URL.
+
+    Priority:
+    1. DATABASE_URL_READ env var (explicit read replica)
+    2. Neon pooler URL derived from DATABASE_URL (better for concurrent reads)
+    3. Same as primary DATABASE_URL
+    """
+    read_url = os.getenv("DATABASE_URL_READ")
+    if read_url:
+        return _ensure_neon_params(read_url)
+
+    primary = _get_database_url()
+    # For Neon, default reads to pooler endpoint
+    if _is_neon_url(primary):
+        return _to_pooler_url(primary)
+
+    return primary
+
+
+# ---------------------------------------------------------------------------
+# Connection manager with Neon cold-start resilience
+# ---------------------------------------------------------------------------
+
+class ConnectionManager:
+    """Manages database connections with Neon serverless optimizations.
+
+    Features:
+    - Auto-reconnect on Neon cold-start failures (scale-to-zero wake-up)
+    - Lazy connection initialization
+    - Single reusable connection per manager instance
+    """
+
+    def __init__(self, database_url: str | None = None) -> None:
+        self.database_url = database_url or _get_database_url()
+        self._conn: psycopg.Connection | None = None
+        self._is_neon = _is_neon_url(self.database_url)
+
+    def _connect(self) -> psycopg.Connection:
+        """Create a connection with retry logic for Neon cold starts."""
+        last_error: Exception | None = None
+        retries = _NEON_CONNECT_RETRIES if self._is_neon else 1
+
+        for attempt in range(retries):
+            try:
+                conn = psycopg.connect(
+                    self.database_url,
+                    row_factory=dict_row,
+                    autocommit=False,
+                    connect_timeout=10,
+                )
+                if attempt > 0:
+                    logger.info(
+                        f"Neon connection succeeded on attempt {attempt + 1}"
+                    )
+                return conn
+            except psycopg.OperationalError as e:
+                last_error = e
+                if attempt < retries - 1:
+                    delay = _NEON_RETRY_DELAY_S * (attempt + 1)
+                    logger.warning(
+                        f"Neon connection attempt {attempt + 1} failed "
+                        f"(cold start?), retrying in {delay:.1f}s: {e}"
+                    )
+                    time.sleep(delay)
+
+        raise last_error  # type: ignore[misc]
+
+    @property
+    def conn(self) -> psycopg.Connection:
+        if self._conn is None or self._conn.closed:
+            self._conn = self._connect()
+        return self._conn
+
+    def execute(
+        self,
+        sql: str,
+        params: tuple[Any, ...] | dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Execute a query and return list of dicts."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(sql, params)
+                if cur.description:
+                    rows = cur.fetchall()
+                    self.conn.commit()
+                    return list(rows)
+                self.conn.commit()
+                return []
+        except psycopg.OperationalError:
+            # Connection may have been closed by Neon autoscaler — reconnect
+            self._conn = None
+            with self.conn.cursor() as cur:
+                cur.execute(sql, params)
+                if cur.description:
+                    rows = cur.fetchall()
+                    self.conn.commit()
+                    return list(rows)
+                self.conn.commit()
+                return []
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def execute_many(
+        self,
+        sql: str,
+        params_seq: list[tuple | dict],
+    ) -> None:
+        """Execute a statement with many parameter sets."""
+        try:
+            with self.conn.cursor() as cur:
+                cur.executemany(sql, params_seq)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def ping(self) -> bool:
+        """Check if the connection is alive. Returns True/False."""
+        try:
+            self.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        if self._conn is not None and not self._conn.closed:
+            self._conn.close()
+            self._conn = None
+
+    def __enter__(self) -> "ConnectionManager":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+# ---------------------------------------------------------------------------
+# Module-level singletons & helpers
+# ---------------------------------------------------------------------------
+
+_default_manager: ConnectionManager | None = None
+_read_manager: ConnectionManager | None = None
+
+
+def get_pool(database_url: str | None = None) -> ConnectionManager:
+    """Get the default ConnectionManager (singleton) for read-write operations.
+
+    Named `get_pool` for API compat with the migration plan; internally
+    it's a single-connection manager suitable for MCP/script use.
+    """
+    global _default_manager
+    if _default_manager is None:
+        _default_manager = ConnectionManager(database_url)
+    return _default_manager
+
+
+def get_read_pool() -> ConnectionManager:
+    """Get a read-only ConnectionManager (singleton).
+
+    Uses DATABASE_URL_READ if set (e.g., Neon read replica),
+    otherwise auto-routes to Neon pooler endpoint for better
+    concurrent read performance. Falls back to primary URL.
+    """
+    global _read_manager
+    if _read_manager is None:
+        _read_manager = ConnectionManager(_get_read_url())
+    return _read_manager
+
+
+@contextmanager
+def get_connection(
+    database_url: str | None = None,
+) -> Generator[ConnectionManager, None, None]:
+    """Context manager that provides a ConnectionManager."""
+    mgr = ConnectionManager(database_url or _get_database_url())
+    try:
+        yield mgr
+    finally:
+        mgr.close()
