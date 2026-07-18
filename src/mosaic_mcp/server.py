@@ -1509,16 +1509,23 @@ def mosaic_synthetic_lethal_whitespace(params: SyntheticLethalInput) -> str:
     """Find synthetic-lethal *whitespace*: targets functionally coupled to
     a developed (drugged) target but themselves undeveloped.
 
-    For an anchor target with chemical matter, surfaces partners that
-    share STRING protein-protein interactions and/or Reactome pathways
-    with it yet have < 5 patents and no clinical compound — i.e. strong
-    biological coupling, low competitive activity. Ranked by a
-    whitespace score and returned with a deterministic suggested
-    experimental approach.
+    For an anchor target with chemical matter, surfaces partners coupled to
+    it by DepMap co-essentiality, STRING protein-protein interactions and/or
+    Reactome pathways. Returns TWO lists, deliberately not merged:
 
-    Scope: `co_functionality_proxy` is a PPI + shared-pathway proxy for
-    co-essentiality, NOT DepMap co-essentiality (DepMap ingestion is a
-    later sprint). Treat it as a hypothesis generator, not evidence.
+    - `candidates` — partners Mosaic covers, filtered to < 5 patents and no
+      clinical compound. Those counts are measured, so a whitespace claim is
+      supportable. Ranked by `whitespace_score`.
+    - `coupled_unassessed` — partners outside the curated universe. They are
+      coupled to the anchor, but their competitive status is UNKNOWN rather
+      than zero, so they carry null counts and no whitespace_score, and are
+      ranked by `coupling_strength` alone. Leads, not evidence. Do not
+      describe them as uncontested.
+
+    Scope: DepMap co-essentiality IS ingested; `co_functionality_basis` says
+    per candidate whether a row used it (`depmap_coessentiality`) or fell
+    back to the PPI + shared-pathway proxy (`ppi_pathway_proxy`). `lineage`
+    is still a label only — it does not filter. Hypothesis generator.
     """
     _check_tool_access("mosaic_synthetic_lethal_whitespace")
     gq = _gq()

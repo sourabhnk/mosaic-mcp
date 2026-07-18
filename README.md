@@ -2,7 +2,7 @@
 
 <!-- mcp-name: io.github.sourabhnk/mosaic-mcp -->
 
-Pre-clinical drug discovery intelligence as an MCP server. Query 800+ drug targets, 12K+ compounds, 46K+ papers, 18K+ clinical trials, and 16K+ patents through 44 specialized tools — 16 free for discovery, 28 Pro for competitive landscapes, whitespace, and thesis-grade analysis.
+Pre-clinical drug discovery intelligence as an MCP server. Query 760+ drug targets, 70K+ compounds, 48K+ papers, 18K+ clinical trials, and 16K+ patents through 44 specialized tools — 16 free for discovery, 28 Pro for competitive landscapes, whitespace, and thesis-grade analysis.
 
 ## Quick Start
 
@@ -84,14 +84,20 @@ status, drug comparison, drug repurposing candidates, and KOL discovery.
 
 | Entity | Count |
 |--------|-------|
-| Drug Targets | 801 (oncology + neuroscience + cardiovascular) |
-| Compounds | 12,756 |
-| Clinical Trials | 18,324 |
-| Papers | 46,354 |
-| Patents | 16,168 |
+| Drug Targets | 764 (oncology + neuroscience + cardiovascular) |
+| Compounds | 71,512 |
+| Clinical Trials | 18,580 |
+| Papers | 48,773 |
+| Patents | 16,189 |
 | Semantic Relations | 13,704 |
-| Indications | 15,013 |
-| Organizations | 45,496 |
+| Indications | 24,949 |
+| Organizations | 36,691 |
+
+<sub>Counts as of 2026-07-18. The live figures are always
+`mosaic_kg_stats`; run it rather than trusting this table. Targets went 802 →
+764 when duplicate and malformed rows were merged, and organizations
+153,852 → 36,691 when affiliation parsing was corrected — both are the count
+getting more honest, not the corpus shrinking.</sub>
 
 ## Configuration
 
