@@ -208,6 +208,11 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
     # --- Clinical pipeline ---
+    # `phase_basis` states the scope of `phase` rather than leaving the reader
+    # to assume it is per-indication. It is the compound's highest phase in any
+    # indication: ChEMBL's per-indication phase is not ingested, so an approved
+    # drug shows its approval phase on every indication row it appears under.
+    # Saying so is the difference between a caveat and an overclaim.
     pipeline = [
         {
             "compound": p.get("compound_name"),
@@ -215,6 +220,7 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
             "indication": p.get("indication_name"),
             "phase": p.get("max_phase"),
             "status": p.get("clinical_status"),
+            "phase_basis": p.get("phase_basis", "compound_max_any_indication"),
         }
         for p in profile.get("clinical_pipeline", [])
     ]

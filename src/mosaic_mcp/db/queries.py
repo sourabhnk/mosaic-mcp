@@ -453,10 +453,18 @@ class GraphQueries:
             LIMIT 100
         """, {"ids": ind_ids})
 
+        # `ci.clinical_status` is default-fill ('preclinical' on all 15,786
+        # rows) and was labelling approved drugs preclinical alongside a
+        # correct `c.max_phase`. Derive status from the phase instead.
         compounds = self._execute_safe("""
             SELECT c.id AS compound_id, c.name AS compound_name,
                    c.max_phase, c.compound_type,
-                   ci.clinical_status
+                   CASE
+                       WHEN c.max_phase IS NULL OR c.max_phase < 0 THEN 'unknown'
+                       WHEN c.max_phase >= 4 THEN 'approved'
+                       WHEN c.max_phase >= 1 THEN 'clinical'
+                       ELSE 'preclinical'
+                   END AS clinical_status
             FROM compound_indications ci
             JOIN compounds c ON c.id = ci.compound_id
             WHERE ci.indication_id = ANY(%(ids)s)
@@ -1089,16 +1097,41 @@ class GraphQueries:
         profile["top_organizations"] = orgs
 
         # 11. Clinical pipeline (15) — compound_indications first, fallback to target_indications
+        #
+        # Phase and status come from `compounds.max_phase`, NOT from
+        # `compound_indications.max_phase`/`clinical_status`. Those two columns
+        # are default-fill that ingestion never populated: measured 2026-07-19,
+        # all 15,786 rows carry max_phase = 0 and clinical_status =
+        # 'preclinical'. They have ONE distinct value each, so they cannot
+        # express a difference and are not data. Reading them made
+        # `CASE ci.max_phase WHEN 0 THEN 'Preclinical'` render every compound
+        # for every target as preclinical — SOTORASIB and ADAGRASIB, both
+        # approved, shipped as `phase: 0, "preclinical"` on the most-demoed
+        # target in the KG while `sar_summary.highest_clinical_phase` said 4
+        # off `compounds.max_phase` in the same payload.
+        #
+        # `phase_basis` is emitted because the honest scope of this number is
+        # the compound's highest phase in ANY indication — ChEMBL's true
+        # per-indication phase (`drug_indication.max_phase_for_ind`) is not
+        # ingested. Sotorasib is approved for NSCLC, not for every indication
+        # it is listed against; the field says so rather than implying it.
         pipeline = self._execute_safe("""
             SELECT c.name AS compound_name, c.chembl_id,
                    i.name AS indication_name,
-                   ci.max_phase, ci.clinical_status
+                   c.max_phase,
+                   CASE
+                       WHEN c.max_phase IS NULL OR c.max_phase < 0 THEN 'unknown'
+                       WHEN c.max_phase >= 4 THEN 'approved'
+                       WHEN c.max_phase >= 1 THEN 'clinical'
+                       ELSE 'preclinical'
+                   END AS clinical_status,
+                   'compound_max_any_indication'::text AS phase_basis
             FROM compound_targets ct
             JOIN compound_indications ci ON ci.compound_id = ct.compound_id
             JOIN compounds c ON c.id = ct.compound_id
             JOIN indications i ON i.id = ci.indication_id
             WHERE ct.target_id = %(t)s
-            ORDER BY ci.max_phase DESC NULLS LAST
+            ORDER BY c.max_phase DESC NULLS LAST
             LIMIT 15
         """, {"t": target})
 
@@ -1107,7 +1140,17 @@ class GraphQueries:
                 SELECT c.name AS compound_name, c.chembl_id,
                        i.name AS indication_name,
                        c.max_phase,
-                       CASE WHEN c.max_phase >= 1 THEN 'clinical' ELSE 'preclinical' END AS clinical_status,
+                       -- ChEMBL uses max_phase = -1 for "unknown", which the
+                       -- previous `>= 1 THEN clinical ELSE preclinical` mapped
+                       -- to 'preclinical' — asserting a fact about 30 compounds
+                       -- whose phase was explicitly not known.
+                       CASE
+                           WHEN c.max_phase IS NULL OR c.max_phase < 0 THEN 'unknown'
+                           WHEN c.max_phase >= 4 THEN 'approved'
+                           WHEN c.max_phase >= 1 THEN 'clinical'
+                           ELSE 'preclinical'
+                       END AS clinical_status,
+                       'compound_max_any_indication'::text AS phase_basis,
                        ti.association_score
                 FROM compound_targets ct
                 JOIN compounds c ON c.id = ct.compound_id
@@ -1407,11 +1450,22 @@ class GraphQueries:
             LEFT JOIN compounds c ON c.id = tc.compound_id
             WHERE tt.target_id = %(t)s
             ORDER BY
-                CASE tr.phase
-                    WHEN 'Phase 4' THEN 4
-                    WHEN 'Phase 3' THEN 3
-                    WHEN 'Phase 2' THEN 2
-                    WHEN 'Phase 1' THEN 1
+                -- CT.gov stores 'PHASE4' / 'EARLY_PHASE1' / 'NA', never
+                -- 'Phase 4'. The previous CASE compared against 'Phase 4'
+                -- and friends, so **no value ever matched** and every row
+                -- fell to ELSE 0 — the roster was returned unordered while
+                -- appearing to be ranked by phase. Verified against live
+                -- data 2026-07-19: PHASE2 4,426 / PHASE1 3,977 / PHASE3
+                -- 1,563 / PHASE4 961 / EARLY_PHASE1 320 / NA 4,170.
+                -- 'NA' means not-applicable (observational studies), which
+                -- is not phase 0, so it sorts with unknowns rather than
+                -- below Phase 1.
+                CASE upper(COALESCE(tr.phase, ''))
+                    WHEN 'PHASE4' THEN 5
+                    WHEN 'PHASE3' THEN 4
+                    WHEN 'PHASE2' THEN 3
+                    WHEN 'PHASE1' THEN 2
+                    WHEN 'EARLY_PHASE1' THEN 1
                     ELSE 0
                 END DESC,
                 tr.start_date DESC NULLS LAST
@@ -1426,22 +1480,30 @@ class GraphQueries:
                    c.chembl_id,
                    c.max_phase AS compound_max_phase,
                    i.name AS indication_name, i.therapeutic_area,
-                   CASE ci.max_phase
-                       WHEN 4 THEN 'Phase 4'
-                       WHEN 3 THEN 'Phase 3'
-                       WHEN 2 THEN 'Phase 2'
-                       WHEN 1 THEN 'Phase 1'
-                       WHEN 0 THEN 'Preclinical'
-                       ELSE NULL
+                   -- Was `CASE ci.max_phase`, but ci.max_phase is 0 on every
+                   -- row in the table, so this branch rendered 'Preclinical'
+                   -- unconditionally. Same defect as the dossier pipeline.
+                   CASE
+                       WHEN c.max_phase IS NULL OR c.max_phase < 0 THEN 'Unknown'
+                       WHEN c.max_phase >= 4 THEN 'Phase 4'
+                       WHEN c.max_phase = 3 THEN 'Phase 3'
+                       WHEN c.max_phase = 2 THEN 'Phase 2'
+                       WHEN c.max_phase = 1 THEN 'Phase 1'
+                       ELSE 'Preclinical'
                    END AS phase,
-                   ci.clinical_status AS overall_status,
+                   CASE
+                       WHEN c.max_phase IS NULL OR c.max_phase < 0 THEN 'unknown'
+                       WHEN c.max_phase >= 4 THEN 'approved'
+                       WHEN c.max_phase >= 1 THEN 'clinical'
+                       ELSE 'preclinical'
+                   END AS overall_status,
                    NULL::text AS lead_sponsor
             FROM compound_targets ct
             JOIN compound_indications ci ON ci.compound_id = ct.compound_id
             JOIN compounds c ON c.id = ct.compound_id
             JOIN indications i ON i.id = ci.indication_id
             WHERE ct.target_id = %(t)s
-            ORDER BY ci.max_phase DESC NULLS LAST, c.name
+            ORDER BY c.max_phase DESC NULLS LAST, c.name
             LIMIT 30
         """, {"t": target})
 
