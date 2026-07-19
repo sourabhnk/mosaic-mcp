@@ -158,7 +158,7 @@ class UsageInfo(BaseModel):
 
 ANONYMOUS_USER = User(
     id="anonymous",
-    email="anonymous@mosaic.bio",
+    email="anonymous@getmosaic.dev",
     name="Anonymous",
     tier=Tier.FREE,
     monthly_query_limit=5,  # 5 queries before signup required

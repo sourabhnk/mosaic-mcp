@@ -136,7 +136,7 @@ def _check_tool_access(tool_name: str) -> None:
     raise PaidTierRequired(
         f"Tool '{tool_name}' requires a Pro plan ($49/mo). "
         f"Free tier includes: {', '.join(sorted(FREE_TOOLS))}. "
-        f"Upgrade at https://mosaic.bio/pricing"
+        f"Upgrade at https://getmosaic.dev/pricing"
     )
 
 

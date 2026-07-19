@@ -10,7 +10,7 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [
-    { name = "Mosaic Bio", email = "hello@mosaic.bio" },
+    { name = "Mosaic Bio", email = "hello@getmosaic.dev" },
 ]
 keywords = [
     "mcp", "drug-discovery", "knowledge-graph", "pharma",
@@ -39,7 +39,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://getmosaic.dev"
 Repository = "https://github.com/sourabhnk/mosaic-mcp"
-Documentation = "https://getmosaic.dev"
+Documentation = "https://getmosaic.dev/docs"
 
 [project.scripts]
 mosaic-mcp = "mosaic_mcp.server:main"
