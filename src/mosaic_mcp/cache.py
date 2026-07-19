@@ -29,11 +29,28 @@ from mosaic_mcp.db.connection import get_pool
 
 logger = logging.getLogger(__name__)
 
-# Tools that mutate state — never cached.
+# Tools that mutate state, and per-user reads — never cached.
 NON_CACHEABLE: frozenset[str] = frozenset({
+    # Writes — caching a mutation is meaningless.
     "mosaic_watchlist_create",
     "mosaic_watchlist_add_item",
     "mosaic_target_wishlist_add",
+    # Per-user reads. These MUST stay here: the cache key is
+    # (tool_name, normalized_params, kg_version) plus the injected `__tier`,
+    # and carries **no principal**. Two users asking for the same
+    # watchlist_id at the same tier therefore produce the same key, so a
+    # cache hit would hand user B the response computed for user A —
+    # bypassing the ownership check in get_watchlist()/list_watchlists()
+    # entirely, since a hit returns before the query ever runs.
+    #
+    # Found the hard way: after ownership scoping landed, the ownership
+    # tests failed because a stale entry from a prior run was served without
+    # calling the query layer at all. The fix was incomplete without this.
+    #
+    # Caching them is also wrong on freshness grounds — add an item, read it
+    # back, and you would see the pre-add list for up to an hour.
+    "mosaic_watchlist_get",
+    "mosaic_watchlist_list",
 })
 
 # Per-tool TTL seconds; _DEFAULT_TTL for anything unlisted.

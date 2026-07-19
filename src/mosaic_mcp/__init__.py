@@ -6,9 +6,12 @@ PostgreSQL knowledge graph.
 
 Usage:
     pip install mosaic-mcp
-    export DATABASE_URL="postgresql://..."
+    export DATABASE_URL="postgresql://..."   # bring your own Postgres
     mosaic-mcp                               # starts stdio MCP server
-    mosaic-mcp --transport sse --port 3001   # SSE for remote clients
+
+This package is stdio-only. `--transport sse` raises NotImplementedError —
+remote access is served by the hosted endpoint (mcp.getmosaic.dev), not by
+this package. The flag was documented here as working; it never was.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"

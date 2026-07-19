@@ -4,7 +4,22 @@
 
 Pre-clinical drug discovery intelligence as an MCP server. Query 760+ drug targets, 70K+ compounds, 48K+ papers, 18K+ clinical trials, and 16K+ patents through 44 specialized tools — 16 free for discovery, 28 Pro for competitive landscapes, whitespace, and thesis-grade analysis.
 
-## Quick Start
+## Which one do you want?
+
+**This package is bring-your-own-database.** It is the MCP tool layer only —
+it ships the queries, not the data. You point it at a PostgreSQL instance you
+control and it serves 44 tools over it. There is no public read-only
+credential for Mosaic's knowledge graph, and earlier versions of these docs
+implied otherwise.
+
+**If you want Mosaic's actual curated KG** — 760+ targets, 70K+ compounds,
+48K+ papers, 18K+ trials, 16K+ patents, kept current by a monthly refresh —
+use the **hosted server** instead. It needs no database and no local install:
+
+- Remote MCP: `https://mcp.getmosaic.dev/sse`
+- Sign in / API keys: <https://getmosaic.dev>
+
+## Quick Start (self-hosted)
 
 ```bash
 pip install mosaic-mcp
@@ -20,7 +35,7 @@ Add to your `claude_desktop_config.json`:
     "mosaic": {
       "command": "mosaic-mcp",
       "env": {
-        "DATABASE_URL": "postgresql://reader:password@ep-xxx-pooler.neon.tech/mosaic_db?sslmode=require"
+        "DATABASE_URL": "postgresql://USER:PASSWORD@YOUR-HOST:5432/mosaic_db?sslmode=require"
       }
     }
   }
@@ -36,11 +51,14 @@ claude mcp add mosaic -- mosaic-mcp
 ### Standalone
 
 ```bash
-export DATABASE_URL="postgresql://..."
-export MOSAIC_API_KEY="msk_..."       # Optional — for Pro tools
-mosaic-mcp                             # stdio transport (default)
-mosaic-mcp --transport sse --port 3001 # SSE for remote clients
+export DATABASE_URL="postgresql://..."   # your own Postgres
+export MOSAIC_API_KEY="msk_..."          # Optional — for Pro tools
+mosaic-mcp                               # stdio transport
 ```
+
+This package is **stdio-only**. `--transport sse` exits with
+`NotImplementedError`; remote transport is served by the hosted endpoint
+above, not by this package. The flag was previously documented as working.
 
 ## Tools
 
@@ -103,9 +121,41 @@ getting more honest, not the corpus shrinking.</sub>
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DATABASE_URL` | Yes | PostgreSQL connection string (Neon hosted or self-hosted) |
+| `DATABASE_URL` | Yes | PostgreSQL connection string — your own instance |
 | `MOSAIC_API_KEY` | No | API key for Pro tool access |
 | `MOSAIC_TIER` | No | Override tier (`free`, `pro`, `enterprise`) |
+
+## Changelog
+
+### 1.2.0 — breaking change to the watchlist tools
+
+**`owner_key` must now be `anon:<token>`.** It was previously free text
+documented as "user id, email, or `anon:<token>`", which meant one caller
+could name another and read their lists. A bare id or email is now refused.
+
+Generate a random token, keep it, and pass the same one every time — it is
+what proves a list is yours. Calls that pass an email or bare id now fail
+with a message telling you this; they do not silently return someone else's
+data, which is what the old behaviour risked.
+
+Also in 1.2.0:
+
+- Watchlist reads are owner-scoped **in the SQL**, so a watchlist UUID is no
+  longer sufficient for read or write access, and they are excluded from the
+  response cache (a cache hit would otherwise return before the ownership
+  check ran).
+- `mosaic_synthetic_lethal_whitespace` now returns `candidates` and
+  `coupled_unassessed` as two separate lists. Partners outside the curated
+  universe carry null counts instead of zeros — an unmeasured competitor
+  count previously read as "no competition."
+- Project metadata now points at `getmosaic.dev`. 1.1.0 and earlier pointed
+  at a domain that is not ours.
+- Query/response layer resynced to the hosted server. This includes the
+  protein-protein-interaction reader fix: 1.1.0 counted PPIs from the legacy
+  `target_interactions` table, while the hosted server had already moved to
+  the populated `target_interactions_ext` table. Driven against hosted on
+  2026-07-19, EGFR reports 50 interactions at confidence 0.999; the 1.1.0
+  reader does not read that table for the profile count.
 
 ## License
 

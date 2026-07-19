@@ -407,6 +407,40 @@ def _tier_allows(tool_name: str) -> bool:
     return tool_name in FREE_TOOLS
 
 
+class WatchlistOwnerRequired(Exception):
+    """Raised when a session supplies no usable owner key."""
+
+
+def _watchlist_owner_key(requested: str | None) -> str:
+    """Resolve the owner identity for a watchlist operation.
+
+    `owner_key` used to be free text taken straight off the request and
+    documented as "user id, email, or 'anon:<token>'", so passing a customer's
+    email address listed their watchlists. That the field was untrustworthy is
+    not hypothetical: of the 9 rows in `watchlists` at the time of the fix, six
+    had a **gene symbol** as the owner key (EGFR, PIK3CA, ABL1, KDR, MAPK1) —
+    LLM clients filling an ambiguous "owner" field with whatever was in
+    context. A field models populate by guessing cannot be an identity.
+
+    This is the stdio package, which has no request principal (`auth.py` is a
+    stub — see sync_from_monorepo/_compat notes), so unlike the hosted server
+    there is no authenticated account to derive an owner from. Every session is
+    therefore confined to the `anon:` namespace, which cannot collide with the
+    hosted `user:<uuid>` keys. The token is a bearer secret the caller chose;
+    scope it accordingly.
+    """
+    req = (requested or "").strip()
+    if req.startswith("anon:") and len(req) > len("anon:"):
+        return req
+    raise WatchlistOwnerRequired(
+        "Watchlists need an identity. Pass owner_key='anon:<a random token you "
+        "keep>'. A bare id or email is not accepted — it would let one caller "
+        "name another. (The pip package is stdio-only and has no signed-in "
+        "account; use the hosted MCP server if you want watchlists tied to "
+        "your Mosaic account.)"
+    )
+
+
 def _with_db_error_handling(fn):
     """Catch DB connection errors and add Op-6 response caching.
 
@@ -517,29 +551,47 @@ class TargetWishlistInput(BaseModel):
     notes: str | None = Field(default=None, description="Optional context for why this target matters", max_length=1000)
 
 
+# `owner_key` was a free-text identity ("user id, email, or 'anon:<token>'"),
+# which meant naming someone returned their watchlists. It is now restricted to
+# the `anon:` namespace and validated by `_watchlist_owner_key`. `watchlist_id`
+# alone is no longer sufficient for read or write — see `get_watchlist` and
+# `add_watchlist_item` in db/queries.py, which scope on owner in the SQL.
+_OWNER_KEY_FIELD = Field(
+    default=None,
+    description=(
+        "'anon:<token>' you generate and keep. This is the stdio package: it "
+        "has no signed-in account, so watchlists are anonymous and the token "
+        "is what proves the list is yours."
+    ),
+    max_length=200,
+)
+
+
 class WatchlistCreateInput(BaseModel):
-    """Create a watchlist for a user/anon owner key."""
+    """Create a watchlist owned by the caller."""
     model_config = ConfigDict(str_strip_whitespace=True)
-    owner_key: str = Field(..., description="Owner identifier: user id, email, or 'anon:<token>'", min_length=1, max_length=200)
+    owner_key: str | None = _OWNER_KEY_FIELD
     name: str = Field(default="My watchlist", description="Watchlist name", max_length=120)
 
 
 class WatchlistAddItemInput(BaseModel):
-    """Add a watched entity to a watchlist."""
+    """Add a watched entity to one of the caller's watchlists."""
     model_config = ConfigDict(str_strip_whitespace=True)
     watchlist_id: str = Field(..., description="Watchlist UUID", min_length=1, max_length=64)
     item_type: str = Field(..., description="One of: target, indication, organization, compound, relation_type", min_length=1, max_length=40)
     item_value: str = Field(..., description="The entity value, e.g. 'EGFR' or 'non_small_cell_lung_carcinoma'", min_length=1, max_length=200)
+    owner_key: str | None = _OWNER_KEY_FIELD
 
 
 class WatchlistIdInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     watchlist_id: str = Field(..., description="Watchlist UUID", min_length=1, max_length=64)
+    owner_key: str | None = _OWNER_KEY_FIELD
 
 
 class WatchlistOwnerInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    owner_key: str = Field(..., description="Owner identifier: user id, email, or 'anon:<token>'", min_length=1, max_length=200)
+    owner_key: str | None = _OWNER_KEY_FIELD
 
 
 class CompoundIdWithLimit(BaseModel):
@@ -1204,11 +1256,12 @@ def mosaic_target_wishlist_add(params: TargetWishlistInput) -> str:
 def mosaic_watchlist_create(params: WatchlistCreateInput) -> str:
     """Create a watchlist to track targets, indications, orgs, or compounds.
 
-    owner_key is the user id, email, or an 'anon:<token>' for anonymous
-    sessions. Returns the new watchlist id to use with
-    mosaic_watchlist_add_item.
+    Pass owner_key='anon:<token>' — a random token you generate and keep. It is
+    what proves the list is yours on later reads. Returns the new watchlist id
+    for mosaic_watchlist_add_item.
     """
-    wl = _gq().create_watchlist(params.owner_key, params.name)
+    owner = _watchlist_owner_key(params.owner_key)
+    wl = _gq().create_watchlist(owner, params.name)
     return _json_result({"watchlist": wl, "created": bool(wl)})
 
 
@@ -1221,11 +1274,16 @@ def mosaic_watchlist_create(params: WatchlistCreateInput) -> str:
 @_with_db_error_handling
 def mosaic_watchlist_add_item(params: WatchlistAddItemInput) -> str:
     """Add a watched entity (target/indication/organization/compound/
-    relation_type) to a watchlist. Idempotent — re-adding is a no-op."""
+    relation_type) to one of your own watchlists. Idempotent — re-adding is a
+    no-op."""
+    owner = _watchlist_owner_key(params.owner_key)
     ok = _gq().add_watchlist_item(
-        params.watchlist_id, params.item_type, params.item_value
+        params.watchlist_id, params.item_type, params.item_value, owner
     )
     if not ok:
+        # Deliberately identical to the genuinely-missing case: distinguishing
+        # "exists but not yours" from "does not exist" would confirm the id to
+        # someone probing for it.
         return _json_result({"error": "watchlist not found",
                              "watchlist_id": params.watchlist_id})
     return _json_result({
@@ -1243,9 +1301,12 @@ def mosaic_watchlist_add_item(params: WatchlistAddItemInput) -> str:
 )
 @_with_db_error_handling
 def mosaic_watchlist_get(params: WatchlistIdInput) -> str:
-    """Get a watchlist with its items and recent detected events."""
-    wl = _gq().get_watchlist(params.watchlist_id)
+    """Get one of your own watchlists with its items and recent events."""
+    owner = _watchlist_owner_key(params.owner_key)
+    wl = _gq().get_watchlist(params.watchlist_id, owner)
     if wl is None:
+        # Same message whether it is missing or someone else's — see
+        # mosaic_watchlist_add_item.
         return _json_result({"error": "watchlist not found",
                              "watchlist_id": params.watchlist_id})
     return _json_result(wl)
@@ -1259,8 +1320,9 @@ def mosaic_watchlist_get(params: WatchlistIdInput) -> str:
 )
 @_with_db_error_handling
 def mosaic_watchlist_list(params: WatchlistOwnerInput) -> str:
-    """List an owner's watchlists with item and recent-event counts."""
-    rows = _gq().list_watchlists(params.owner_key)
+    """List your own watchlists with item and recent-event counts."""
+    owner = _watchlist_owner_key(params.owner_key)
+    rows = _gq().list_watchlists(owner)
     return _json_result({"watchlists": rows, "total": len(rows)})
 
 

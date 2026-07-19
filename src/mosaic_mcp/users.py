@@ -59,7 +59,28 @@ TIER_DAILY_TARGET_LIMITS: dict[Tier, int | None] = {
     Tier.ADMIN: None,
 }
 
-# Tools accessible per tier (free tier gets 9, rest are Pro+)
+# ---------------------------------------------------------------------------
+# THE TIER RULE (board S2, decided 2026-07-19)
+#
+#   Free answers "what do we know about X?" for one entity the user names.
+#   Pro answers "which X?" or "how do X and Y relate?" — anything that ranks,
+#   compares, or traverses to entities the user did not name.
+#
+# Corollaries:
+#   - Catalogue and navigation (kg_stats, list_*, search) are free: you cannot
+#     ask for an entity you cannot find.
+#   - A user's own saved data (watchlists, wishlist) is free. It is theirs.
+#   - `get_target_profile` is the deliberate exception. It is the free front
+#     door and samples six Pro tools' output, capped, with the true totals
+#     stated in `_meta.data_coverage` and `_meta.sampling`. The caps are the
+#     product boundary; the disclosed totals are the upgrade prompt.
+#
+# Adding a tool? Decide its tier by the rule, then add it to
+# `tests/test_tier_boundary.py::EXPECTED_TIERS`. That test fails on any
+# unclassified tool, so the boundary cannot drift silently.
+#
+# Free tier gets 16 of 44.
+# ---------------------------------------------------------------------------
 FREE_TOOLS = frozenset({
     "mosaic_search_targets",
     "mosaic_get_target_profile",

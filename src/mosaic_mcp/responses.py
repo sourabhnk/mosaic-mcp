@@ -229,7 +229,13 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
         }
         for o in profile.get("top_organizations", [])
     ]
-    big_pharma_count = sum(1 for o in orgs if o.get("is_big_pharma"))
+    # Counted server-side over every org on the target. Deriving it from
+    # `orgs` counts only the LIMIT 10 the dossier shows, so the value was
+    # capped at 10 by construction while reading as a measurement — KRAS
+    # rendered "10 Big Pharma players active" against 131 flagged of 209.
+    # format_competitive_landscape() (the Pro tool) already counts over the
+    # full set; this brings the free dossier in line.
+    big_pharma_count = counts.get("big_pharma_org_count", 0)
 
     # --- Pathways ---
     pathways = [
@@ -242,11 +248,27 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
     ]
 
     # --- PPIs ---
+    # The query selects `confidence_score`; this read `confidence`, a key that
+    # never existed, so every partner reported a null confidence while the
+    # column is populated for all 36,338 rows (EGFR's top partners sit at 999).
+    # Note `_execute_safe` cannot catch this class: the SQL is valid and the
+    # mismatch is in Python, where a missing key is None rather than an error.
+    # STRING scores are 0-1000; normalise to 0-1 as the other readers do.
+    def _conf(p: dict) -> float | None:
+        raw = p.get("confidence_score", p.get("confidence"))
+        if raw is None:
+            return None
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return round(v / 1000.0, 4) if v > 1 else round(v, 4)
+
     ppis = [
         {
             "partner": p.get("partner_symbol"),
             "partner_name": p.get("partner_name"),
-            "confidence": p.get("confidence"),
+            "confidence": _conf(p),
             "interaction_type": p.get("interaction_type"),
         }
         for p in profile.get("protein_interactions", [])
@@ -295,6 +317,26 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
                 "disease_associations": counts.get("indication_count", 0),
                 "validation_evidence": counts.get("validation_count", 0),
             },
+            # The dossier is a capped sample of every axis, by design — it is
+            # the free front door. `data_coverage` above is the true total per
+            # axis; the list blocks below are the head of each. Stating the cap
+            # is the difference between a sample and an implied census: 10 of
+            # 209 organizations read as "the competitors" when unlabelled.
+            "sampling": {
+                "note": (
+                    "List blocks are truncated samples, not complete sets. "
+                    "Compare each against data_coverage for the true total; "
+                    "the per-axis tools return full, filterable results."
+                ),
+                "caps": {
+                    "top_compounds": 10,
+                    "disease_associations": 15,
+                    "validation_evidence.top_papers": 5,
+                    "clinical_pipeline": 15,
+                    "competitive_landscape.top_organizations": 10,
+                    "protein_interactions": 10,
+                },
+            },
         },
         "biology": biology,
         "scores": scores_section,
@@ -306,7 +348,19 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
         "clinical_pipeline": pipeline,
         "competitive_landscape": {
             "top_organizations": orgs,
+            # `showing_top` mirrors format_competitive_landscape() so a reader
+            # can tell a capped sample from a complete list. Without it the
+            # 10 rows read as "the organizations active on this target".
+            "showing_top": len(orgs),
             "big_pharma_active": big_pharma_count,
+            # The count is now derived correctly (over all orgs, not the shown
+            # 10) but the underlying flag is not trustworthy — see S11/R13b.
+            # Say so rather than let a precise-looking integer imply precision.
+            "big_pharma_caveat": (
+                "is_big_pharma currently over-fires — it flags national labs "
+                "and small biotechs alongside large pharma, so treat this as "
+                "an upper bound, not a count of major players."
+            ),
             "total_organizations": counts.get("organization_count", 0),
         },
         "pathways": pathways,
@@ -968,14 +1022,27 @@ def _generate_insight(
             else:
                 parts.append(f"{symbol} has low target attractiveness (TAS: {tas:.0%})")
 
-    # Competition
-    if big_pharma_count >= 3:
-        parts.append(f"Highly competitive space with {big_pharma_count} Big Pharma players active")
-    elif big_pharma_count >= 1:
-        parts.append(f"{big_pharma_count} Big Pharma organization(s) active")
+    # Competition. Deliberately keyed on the total organization count, not on
+    # big_pharma_count: `organizations.is_big_pharma` over-fires badly today —
+    # 131 of KRAS's 209 patent-holders carry the flag, including
+    # `L LIVERMORE NAT SECURITY LLC`, `Leidos Biomedical Research` and a dozen
+    # seed-stage biotechs. Any headline built on it is unreliable until the
+    # curated list replaces the rule (board S11 / R13b).
+    #
+    # This clause previously read big_pharma_count off the LIMIT 10 org slice,
+    # so it was capped at 10 and, by accident, looked plausible. Correcting the
+    # count to run over all orgs made the classifier's error visible in prose
+    # ("191 Big Pharma players active" on EGFR), so the claim moves to the
+    # quantity that is actually measured: organization_count is a plain
+    # COUNT DISTINCT over the patent join and is trustworthy now.
+    org_count = counts.get("organization_count", 0)
+    if org_count >= 25:  # heuristic band, not a scored threshold
+        parts.append(f"Crowded space — {org_count} organizations hold patents on this target")
+    elif org_count >= 1:
+        parts.append(f"{org_count} organization(s) hold patents on this target")
     else:
         parts.append(
-            "No Big Pharma competition recorded in the current Mosaic KG "
+            "No patent-holding organizations recorded in the current Mosaic KG "
             "— confirm against external sources before treating as "
             "white space"
         )

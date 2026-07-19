@@ -938,6 +938,18 @@ class GraphQueries:
                  JOIN patent_organizations po ON po.patent_id = pmt.patent_id
                  JOIN organizations o ON o.id = po.org_id
                  WHERE pmt.target_id = %(t)s) AS organization_count,
+                -- Counted over ALL orgs on the target, not the LIMIT 10 slice
+                -- the dossier displays. The dossier previously derived
+                -- `big_pharma_active` from those 10 rows, so the figure was
+                -- capped at 10 by construction and read as a measurement:
+                -- KRAS rendered "10 Big Pharma players active" against 131
+                -- flagged of 209 orgs. See format_target_dossier().
+                (SELECT COUNT(DISTINCT o.id)
+                 FROM patent_mentions_target pmt
+                 JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+                 JOIN organizations o ON o.id = po.org_id
+                 WHERE pmt.target_id = %(t)s
+                   AND o.is_big_pharma) AS big_pharma_org_count,
                 (SELECT COUNT(*) FROM target_pathways WHERE target_id = %(t)s) AS pathway_count,
                 (SELECT COUNT(*) FROM target_interactions_ext WHERE target_id = %(t)s) AS ppi_count,
                 (SELECT COUNT(*) FROM target_indications WHERE target_id = %(t)s) AS indication_count,
@@ -3708,12 +3720,22 @@ class GraphQueries:
         )
 
     def add_watchlist_item(
-        self, watchlist_id: str, item_type: str, item_value: str
+        self, watchlist_id: str, item_type: str, item_value: str,
+        owner_key: str,
     ) -> bool:
-        """Idempotent add. Returns False if the watchlist doesn't exist."""
+        """Idempotent add. False if the watchlist doesn't exist OR isn't the
+        caller's.
+
+        `owner_key` is required, not optional: this existence check used to be
+        `WHERE id = %(w)s` alone, which made a watchlist UUID a bearer token
+        for *write* access to anyone's list. Scoping the lookup means the
+        ownership test cannot be skipped by a caller who forgets it — the only
+        way to reach the INSERT is to pass an owner, and a wrong owner reads as
+        "not found" rather than confirming the id exists.
+        """
         exists = self._execute_safe(
-            "SELECT 1 FROM watchlists WHERE id = %(w)s",
-            {"w": watchlist_id},
+            "SELECT 1 FROM watchlists WHERE id = %(w)s AND owner_key = %(o)s",
+            {"w": watchlist_id, "o": owner_key},
         )
         if not exists:
             return False
@@ -3731,10 +3753,20 @@ class GraphQueries:
         )
         return True
 
-    def get_watchlist(self, watchlist_id: str) -> dict[str, Any] | None:
+    def get_watchlist(
+        self, watchlist_id: str, owner_key: str
+    ) -> dict[str, Any] | None:
+        """Fetch a watchlist the caller owns. None if missing or not theirs.
+
+        `owner_key` is required. This lookup was previously keyed on the UUID
+        alone, so any caller holding or guessing an id could read another
+        user's watchlist, its items, and its detected events. Scoping the
+        SELECT keeps the check in the query rather than in every call site.
+        """
         head = self._execute_safe(
-            "SELECT id, owner_key, name, created_at FROM watchlists WHERE id = %(w)s",
-            {"w": watchlist_id},
+            """SELECT id, owner_key, name, created_at FROM watchlists
+               WHERE id = %(w)s AND owner_key = %(o)s""",
+            {"w": watchlist_id, "o": owner_key},
         )
         if not head:
             return None
