@@ -149,6 +149,33 @@ def _enforce_limit(tool_name: str, requested: int) -> int:
     max_allowed = limits.get(tier, limits.get(Tier.FREE, requested))
     return min(requested, max_allowed)
 
+
+def _paged(rows: list[dict], key: str, **extra) -> dict:
+    """Build a paged payload that tells the truth about what it withheld.
+
+    Hand-ported from the hosted server (board S7b). `sync_pip_package.py`
+    syncs the data layer but deliberately EXCLUDES server.py, and server.py is
+    what *calls* it -- so a query-layer change lands here only if a human
+    carries it. queries.py now emits `total_available` (COUNT(*) OVER (),
+    evaluated before LIMIT); without this function the pip package would leak
+    that column onto every row AND keep reporting the page size as `total`.
+    """
+    has_total = bool(rows) and "total_available" in rows[0]
+    total = int(rows[0]["total_available"]) if has_total else len(rows)
+    clean = [{k: v for k, v in r.items() if k != "total_available"} for r in rows]
+    payload = {**extra, key: clean, "returned": len(clean), "total": total}
+    if rows and not has_total:
+        # The query layer drifted out from under this copy. Say so rather than
+        # crashing OR silently republishing the page size as the total.
+        payload["_total_is_page_size"] = True
+    if total > len(clean):
+        payload["truncated"] = True
+        payload["_note"] = (
+            f"Showing {len(clean)} of {total}. Raise `limit`, or upgrade if you "
+            f"are at your tier's cap — see https://getmosaic.dev/pricing"
+        )
+    return payload
+
 # ---------------------------------------------------------------------------
 # Lifespan — shared DB connection
 # ---------------------------------------------------------------------------
@@ -847,11 +874,7 @@ def mosaic_get_target_compounds(params: GeneSymbolWithLimit) -> str:
     symbol = params.gene_symbol.strip().upper()
     limit = _enforce_limit("mosaic_get_target_compounds", params.limit)
     compounds = gq.get_target_compounds(symbol, limit)
-    return _json_result({
-        "target": symbol,
-        "compounds": compounds,
-        "total": len(compounds),
-    })
+    return _json_result(_paged(compounds, "compounds", target=symbol))
 
 
 # ---------------------------------------------------------------------------
@@ -878,11 +901,7 @@ def mosaic_get_target_patents(params: GeneSymbolWithLimit) -> str:
     symbol = params.gene_symbol.strip().upper()
     limit = _enforce_limit("mosaic_get_target_patents", params.limit)
     patents = gq.get_target_patents(symbol, limit)
-    return _json_result({
-        "target": symbol,
-        "patents": patents,
-        "total": len(patents),
-    })
+    return _json_result(_paged(patents, "patents", target=symbol))
 
 
 # ---------------------------------------------------------------------------
@@ -909,11 +928,7 @@ def mosaic_get_target_papers(params: GeneSymbolWithLimit) -> str:
     symbol = params.gene_symbol.strip().upper()
     limit = _enforce_limit("mosaic_get_target_papers", params.limit)
     papers = gq.get_target_papers(symbol, limit)
-    return _json_result({
-        "target": symbol,
-        "papers": papers,
-        "total": len(papers),
-    })
+    return _json_result(_paged(papers, "papers", target=symbol))
 
 
 # ---------------------------------------------------------------------------

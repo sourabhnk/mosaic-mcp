@@ -1595,7 +1595,8 @@ class GraphQueries:
             SELECT c.id AS compound_id, c.name AS compound_name,
                    c.chembl_id, c.smiles, c.max_phase,
                    ct.activity_type, ct.value AS activity_value,
-                   ct.unit, ct.pchembl_value
+                   ct.unit, ct.pchembl_value,
+                   COUNT(*) OVER () AS total_available
             FROM compound_targets ct
             JOIN compounds c ON c.id = ct.compound_id
             WHERE ct.target_id = %(target)s
@@ -1611,7 +1612,8 @@ class GraphQueries:
             SELECT p.id AS patent_id, p.title,
                    p.filing_date, p.publication_date,
                    p.country_code AS jurisdiction,
-                   ARRAY_AGG(DISTINCT o.name) FILTER (WHERE o.name IS NOT NULL) AS assignees
+                   ARRAY_AGG(DISTINCT o.name) FILTER (WHERE o.name IS NOT NULL) AS assignees,
+                   COUNT(*) OVER () AS total_available
             FROM patent_mentions_target pmt
             JOIN patents p ON p.id = pmt.patent_id
             LEFT JOIN patent_organizations po ON po.patent_id = p.id
@@ -1628,7 +1630,8 @@ class GraphQueries:
         target = self._resolve_target(target_symbol)
         return self._execute_safe("""
             SELECT p.id AS paper_id, p.title,
-                   p.publication_date, p.journal, p.pmid, p.doi
+                   p.publication_date, p.journal, p.pmid, p.doi,
+                   COUNT(*) OVER () AS total_available
             FROM paper_mentions_target pmt
             JOIN papers p ON p.id = pmt.paper_id
             WHERE pmt.target_id = %(target)s
