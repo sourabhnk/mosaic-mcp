@@ -14,4 +14,4 @@ remote access is served by the hosted endpoint (mcp.getmosaic.dev), not by
 this package. The flag was documented here as working; it never was.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"

@@ -1377,7 +1377,7 @@ def mosaic_target_scores(params: GeneSymbolInput) -> str:
 @mcp.tool(
     name="mosaic_target_validation",
     annotations={
-        "title": "Target Validation Evidence",
+        "title": "Assay Precedent (Target Validation)",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -1386,11 +1386,17 @@ def mosaic_target_scores(params: GeneSymbolInput) -> str:
 )
 @_with_db_error_handling
 def mosaic_target_validation(params: GeneSymbolInput) -> str:
-    """Get experimental validation evidence for a drug target.
+    """Assay precedent for a drug target: what has been tried, in what model system.
 
-    Returns genetic (CRISPR/siRNA), in vivo (animal models), clinical
-    (patient data), and pharmacological validation evidence from literature.
-    Includes specific papers with model systems and outcomes.
+    Returns literature-derived experimental precedent — genetic (CRISPR/siRNA/KO),
+    in vivo (mouse/rat/xenograft), pharmacological (inhibitor/SAR), and clinical-
+    trial evidence — re-classified per paper at query time. A paper may carry
+    several methods; counts are lower bounds, not exhaustive. Papers that name the
+    target in their title are flagged high-confidence and lead the ranked
+    exemplars. Outcomes are NOT auto-graded: open the linked exemplar papers to
+    read what actually happened. Also returns DepMap essentiality + AlphaMissense
+    pathogenicity when available. A target with no precedent returns an explicit
+    no_precedent_in_corpus status (corpus coverage, not confirmed absence).
     """
     _check_tool_access("mosaic_target_validation")
     gq = _gq()

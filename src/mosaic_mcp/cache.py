@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -125,8 +126,25 @@ def _get(table: str, key: str) -> Any | None:
 
 # --- tool-result cache ----------------------------------------------------
 
+def _bypass() -> bool:
+    """Is the cache switched off for this process?
+
+    ⚠️ THE 44-TOOL SWEEP CANNOT WORK WITHOUT THIS, and finding out why is
+    instructive. The cache keys on `kg_version`, NOT on code version, so a
+    formatter change does not invalidate it (that is the standing rule in
+    CLAUDE.md §2.3). The first run of `scripts/sweep_tools.py` against a
+    deliberately broken formatter therefore reported the OLD, correct values
+    and passed: every call logged `cache_hit`.
+
+    A detector that reads its own cache is not driving anything. Set
+    MOSAIC_BYPASS_CACHE=1 for any process whose job is to observe what the
+    code currently produces.
+    """
+    return os.environ.get("MOSAIC_BYPASS_CACHE", "") == "1"
+
+
 def tool_cache_get(tool_name: str, params: dict[str, Any]) -> str | None:
-    if tool_name in NON_CACHEABLE:
+    if _bypass() or tool_name in NON_CACHEABLE:
         return None
     key = _key(tool_name, normalize_params(params), _kg_version())
     hit = _get("tool_response_cache", key)
@@ -138,7 +156,9 @@ def tool_cache_get(tool_name: str, params: dict[str, Any]) -> str | None:
 
 
 def tool_cache_put(tool_name: str, params: dict[str, Any], response: str) -> None:
-    if tool_name in NON_CACHEABLE:
+    # Bypass on WRITE too: a sweep must not populate the cache other callers
+    # then read, and a bypassed process has no business warming it.
+    if _bypass() or tool_name in NON_CACHEABLE:
         return
     ttl = _TTL_BY_TOOL.get(tool_name, _DEFAULT_TTL)
     v = _kg_version()
@@ -190,15 +210,44 @@ def agent_cache_put(query: str, agent_version: str, response: str) -> None:
         logger.debug("agent cache put skipped: %s", e)
 
 
+class CachePurgeUnavailable(Exception):
+    """No cache table could be reached. Distinct from 'nothing to purge'."""
+
+
 def purge_expired() -> int:
-    """Delete expired rows from both caches. Returns rows removed."""
+    """Delete expired rows from both caches. Returns rows removed.
+
+    ⚠️ RAISES if NO table could be reached, and that is the whole point.
+
+    This used to catch every exception at `logger.debug` and return 0, so an
+    unreachable database was indistinguishable from an empty one. Measured on
+    the live nightly cron (run 29725406819, 2026-07-20): `DATABASE_URL:` was
+    EMPTY, nothing connected, and the job printed **"Purged 0 expired cache
+    row(s)"** and went green — every night, for as long as the secret has been
+    missing. "0 purged" reads exactly like "nothing needed purging", which is
+    why nobody saw it.
+
+    A missing table is still tolerated: `agent_response_cache` genuinely may
+    not exist on an older deployment, and that is a real condition rather than
+    a fault. But if BOTH fail, the database is unreachable and the caller must
+    hear about it.
+    """
     n = 0
+    reached = 0
+    failures: list[str] = []
     for tbl in ("tool_response_cache", "agent_response_cache"):
         try:
             rows = _db().execute(
                 f"DELETE FROM {tbl} WHERE expires_at <= NOW() RETURNING 1"  # noqa: S608
             )
             n += len(rows)
-        except Exception as e:
-            logger.debug("purge skipped (%s): %s", tbl, e)
+            reached += 1
+        except Exception as e:  # noqa: BLE001 — re-raised below if total
+            failures.append(f"{tbl}: {type(e).__name__}: {str(e).splitlines()[0][:120]}")
+            logger.warning("purge failed for %s: %s", tbl, e)
+    if reached == 0:
+        raise CachePurgeUnavailable(
+            "no cache table could be purged — the database was not reachable. "
+            + " | ".join(failures)
+        )
     return n

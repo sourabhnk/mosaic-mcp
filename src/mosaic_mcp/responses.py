@@ -152,12 +152,19 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
     # --- SAR summary ---
     sar_section = None
     if sar and sar.get("total_compounds"):
-        best_ic50 = sar.get("best_ic50_nm")
-        mean_ic50 = sar.get("mean_ic50_nm")
+        best_val = sar.get("best_ic50_nm")
+        mean_val = sar.get("mean_ic50_nm")
+        metric = _best_metric(sar)
         sar_section = {
             "total_compounds": sar["total_compounds"],
-            "best_ic50": _format_activity(best_ic50),
-            "mean_ic50": _format_activity(mean_ic50),
+            # R16: best_ic50_nm is the MIN activity value across ALL assay types.
+            # Report it as best_activity with its metric, and only populate the
+            # best_ic50 key when the best row genuinely IS an IC50 — so the key
+            # never labels a Kd/Ki as an IC50.
+            "best_activity": _format_activity(best_val),
+            "best_activity_metric": metric,
+            "best_ic50": _format_activity(best_val) if metric == "IC50" else None,
+            "mean_activity": _format_activity(mean_val),
             "highest_clinical_phase": sar.get("highest_phase"),
             "assay_types_tested": sar.get("assay_type_count"),
             "interpretation": _interpret_sar(sar),
@@ -359,13 +366,18 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
             # 10 rows read as "the organizations active on this target".
             "showing_top": len(orgs),
             "big_pharma_active": big_pharma_count,
-            # The count is now derived correctly (over all orgs, not the shown
-            # 10) but the underlying flag is not trustworthy — see S11/R13b.
-            # Say so rather than let a precise-looking integer imply precision.
-            "big_pharma_caveat": (
-                "is_big_pharma currently over-fires — it flags national labs "
-                "and small biotechs alongside large pharma, so treat this as "
-                "an upper bound, not a count of major players."
+            # The caveat that used to live here said the flag "over-fires ...
+            # treat this as an upper bound". That was true and is no longer:
+            # S11 replaced `org_type = 'pharma'` (4,072 flagged, including
+            # national labs) with a curated ~55-company list (78 flagged), and
+            # the same payload now shows Livermore and Leidos as false. Leaving
+            # the warning in place would tell a paying customer to distrust a
+            # number that is now correct — a stale caveat is a false claim in
+            # the same way a stale number is.
+            "big_pharma_basis": (
+                "curated list of major pharmaceutical companies (incl. "
+                "subsidiaries such as Genentech and Janssen), matched on a "
+                "canonical organization key. Not a size or revenue threshold."
             ),
             "total_organizations": counts.get("organization_count", 0),
         },
@@ -882,28 +894,71 @@ def format_undruggable_targets(
 
 
 def format_validation_summary(data: dict[str, Any]) -> dict[str, Any]:
-    """Wrap get_target_validation_summary() output."""
-    target = data.get("target", "?")
-    types = data.get("validation_types", [])
+    """Wrap get_target_validation_summary() output (S22 assay-precedent).
 
-    interpretation = _interpret_validation(
-        {r["validation_type"]: r["count"] for r in types}
-    )
+    Surfaces the query-time re-classified precedent — what has been tried, in
+    what model, with linked exemplars a scientist reads themselves. The old
+    positive/negative/mixed outcome verdict and the over-fired "clinical" count
+    are intentionally gone; see classify_validation() in queries.py.
+    """
+    target = data.get("target", "?")
+    assay_precedent = data.get("assay_precedent", {})
+    validation_types = data.get("validation_types", [])
 
     return {
         "_meta": {
             "tool": "mosaic_target_validation",
-            "description": f"Experimental validation evidence for {target}",
-            "interpretation": interpretation,
+            "description": (
+                f"Assay precedent for {target}: what has been tried, in what model system"
+            ),
+            "interpretation": _interpret_precedent(target, assay_precedent, validation_types),
+            "method": (
+                "Each target-linked paper is re-classified at query time (multi-label) "
+                "from its title+abstract into genetic / in_vivo / pharmacological / "
+                "clinical_trial cues. 'clinical_trial' requires a real trial cue, not a "
+                "bare patient mention; counts are lower bounds; model systems are "
+                "animal/specific only. Outcome is NOT auto-graded — read the linked "
+                "exemplars. Papers naming the target in their title are high-confidence."
+            ),
         },
         "target": target,
-        "validation_types": types,
-        "top_papers": data.get("top_papers", []),
+        "assay_precedent": assay_precedent,
+        "validation_types": validation_types,
         "total_evidence": data.get("total_evidence", 0),
-        # Pass through genetic-evidence rollups (DepMap CRISPR essentiality
-        # + AlphaMissense variant pathogenicity) added 2026-05-26.
+        # DepMap CRISPR essentiality + AlphaMissense variant pathogenicity.
         "genetic_evidence": data.get("genetic_evidence", {}),
     }
+
+
+def _interpret_precedent(
+    target: str, assay_precedent: dict[str, Any], validation_types: list[dict[str, Any]]
+) -> str:
+    """Honest one-line read of the precedent — floors, never a graded outcome."""
+    coverage = (assay_precedent or {}).get("coverage", {})
+    if coverage.get("status") == "no_precedent_in_corpus" or not validation_types:
+        return (
+            f"No experimental-validation precedent for {target} in the Mosaic corpus. "
+            "This reflects ingestion coverage, not confirmed absence of validation."
+        )
+    label = {
+        "clinical_trial": "trial-cued",
+        "in_vivo": "in vivo",
+        "genetic": "genetic",
+        "pharmacological": "pharmacological",
+    }
+    by = {v["validation_type"]: v.get("paper_count", 0) for v in validation_types}
+    parts = [
+        f"{by[t]} {label[t]}"
+        for t in ["clinical_trial", "in_vivo", "genetic", "pharmacological"]
+        if by.get(t)
+    ]
+    n = coverage.get("precedent_papers", 0)
+    tm = coverage.get("title_matched_papers", 0)
+    return (
+        f"{target}: {', '.join(parts)} precedent paper(s) — keyword-derived lower bounds. "
+        f"{tm} of {n} name {target} in the title (high-confidence subset). "
+        "Outcomes are not graded; open the exemplars to read what happened."
+    )
 
 
 # =========================================================================
@@ -930,22 +985,34 @@ def _extract_year(date_str: str | None) -> int | None:
         return None
 
 
+def _best_metric(sar: dict) -> str:
+    """The assay metric of the best (lowest-value) row, honestly named. R16.
+
+    `best_ic50_nm` is the MIN activity value regardless of assay type — for many
+    targets (KRAS's best row is a Kd) it is NOT an IC50. Naming it "IC50"
+    unconditionally is a scientific claim the data does not support. Falls back to
+    the generic "activity" when the type is unknown, never to "IC50".
+    """
+    return sar.get("best_activity_type") or "activity"
+
+
 def _interpret_sar(sar: dict) -> str:
     """Generate a one-sentence SAR interpretation."""
     best = sar.get("best_ic50_nm")
     total = sar.get("total_compounds", 0)
     phase = sar.get("highest_phase", 0)
+    metric = _best_metric(sar)
 
     parts = []
     if best is not None:
         if best < 10:
-            parts.append(f"highly potent lead (best IC50: {_format_activity(best)})")
+            parts.append(f"highly potent lead (best {metric}: {_format_activity(best)})")
         elif best < 100:
-            parts.append(f"potent leads available (best IC50: {_format_activity(best)})")
+            parts.append(f"potent leads available (best {metric}: {_format_activity(best)})")
         elif best < 1000:
-            parts.append(f"moderate potency (best IC50: {_format_activity(best)})")
+            parts.append(f"moderate potency (best {metric}: {_format_activity(best)})")
         else:
-            parts.append(f"weak hits only (best IC50: {_format_activity(best)})")
+            parts.append(f"weak hits only (best {metric}: {_format_activity(best)})")
 
     if total > 100:
         parts.append(f"well-explored SAR space ({total} compounds)")
@@ -1056,7 +1123,7 @@ def _generate_insight(
     # SAR maturity
     best = sar.get("best_ic50_nm")
     if best is not None and best < 100:
-        parts.append(f"Potent chemical matter exists (best IC50: {_format_activity(best)})")
+        parts.append(f"Potent chemical matter exists (best {_best_metric(sar)}: {_format_activity(best)})")
 
     # Validation
     val_total = validation.get("total_evidence_count", 0)

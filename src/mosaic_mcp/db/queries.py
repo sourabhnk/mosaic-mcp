@@ -77,6 +77,115 @@ def _org_merge_key(name: str) -> str:
     return _ORG_WS_RE.sub("", stripped).upper() or (name or "").strip()
 
 
+# =====================================================================
+# S22 — assay-precedent classifier (query-time re-classification)
+# =====================================================================
+# `paper_validations` stores ONE regex-derived label per (paper, target),
+# picked by a clinical > in_vivo > genetic > pharmacological priority. Two
+# properties (both MEASURED on prod, not assumed) make the stored label
+# unfit to surface as-is:
+#   1. "clinical" over-fires. The extractor's clinical regex matched the bare
+#      word "patients", so 11,403 of 13,937 stored-clinical rows (82%) carry
+#      NO real trial cue — they are just papers that say "patient".
+#   2. one-label-per-paper SHADOWS the other methods a paper used. A CRISPR
+#      knockout that also says "patients" is stored as clinical only, hiding
+#      the genetic signal (2,366 in_vivo + 1,779 genetic + 497 pharm signals
+#      were recoverable from under a stored "clinical" tag).
+# So we re-classify each paper's title+abstract at QUERY TIME, multi-label,
+# and require a real trial cue for the clinical bucket. Counts are therefore
+# lower bounds ("floors"), never graded outcomes — outcome is deliberately
+# NOT auto-graded (the stored positive/negative/mixed verdict was a naive
+# word count; a false "negative" tells a scientist to kill a program, so we
+# route "with what result" to the linked papers instead).
+#
+# Relevance: a paper that names the target in its TITLE is high-confidence.
+# On a prod spot-check, title-matched precedent rows were essentially all
+# on-target, while non-title rows carry incidental co-mentions (the
+# mention-is-not-relevance lesson). Title-match RANKS exemplars and is
+# reported per row; it is NEVER a hard filter (title recall is only ~29%).
+_AP_TYPE_PATTERNS: dict[str, re.Pattern] = {
+    "genetic": re.compile(
+        r"\b(knockdown|knockout|knock-out|siRNA|shRNA|CRISPR|Cas9|gene\s+silencing|"
+        r"gene\s+deletion|loss.of.function|gain.of.function|transgenic|overexpression)\b",
+        re.IGNORECASE,
+    ),
+    "in_vivo": re.compile(
+        r"\b(xenograft|mouse\s+model|in\s+vivo|animal\s+model|\bPDX\b|"
+        r"patient.derived\s+xenograft|tumou?r\s+model|rat\s+model|orthotopic|knock.?in\s+mice)\b",
+        re.IGNORECASE,
+    ),
+    "pharmacological": re.compile(
+        r"\b(IC50|EC50|Ki\s*=|Kd\s*=|potent\s+inhibitor|selective\s+inhibitor|dose.response|"
+        r"\bSAR\b|structure.activity\s+relationship|lead\s+compound|drug\s+candidate|"
+        r"pharmacokinetic|bioavailability)\b",
+        re.IGNORECASE,
+    ),
+    # tightened: a REAL trial cue only — never the bare word "patient".
+    "clinical_trial": re.compile(
+        r"(\bclinical\s+trial|\bphase\s+(?:0|[1-4]|i{1,3}|iv)\b|\brandomi[sz]ed|\bplacebo\b|"
+        r"\bNCT\d{4,}|\bdouble.blind|\bfirst.in.human|\bdose.escalat\w*)",
+        re.IGNORECASE,
+    ),
+}
+# animal / specific models only. "human"/"patient" is intentionally excluded:
+# it keys on the same over-firing "clinical"/"patient" tokens, so it is not a
+# trustworthy preclinical-model signal. xenograft/PDX are mouse in vivo.
+_AP_MODEL_PATTERNS: dict[str, re.Pattern] = {
+    "mouse": re.compile(r"\b(mouse|murine|mice|xenograft|PDX)\b", re.IGNORECASE),
+    "rat": re.compile(r"\b(rat|rats)\b", re.IGNORECASE),
+    "cell_line": re.compile(
+        r"\b(cell\s+lines?|HeLa|A549|MCF.?7|HEK.?293|U87|HCT.?116|PC.?3|MDA.MB)\b",
+        re.IGNORECASE,
+    ),
+    "zebrafish": re.compile(r"\b(zebrafish|danio)\b", re.IGNORECASE),
+}
+_AP_TYPE_ORDER = ["clinical_trial", "in_vivo", "genetic", "pharmacological"]
+
+
+def classify_validation(text: str) -> tuple[list[str], list[str]]:
+    """Multi-label re-classification of a paper's title+abstract.
+
+    Returns (validation_types, model_systems). An empty types list means the
+    paper carries no real validation cue for this target and is NOT a precedent
+    (this is how the "patient"-mention-only noise is dropped). Model systems are
+    animal/specific only; a precedent with no specific model is honestly
+    "model unspecified" at the caller.
+    """
+    text = text or ""
+    types = [name for name in _AP_TYPE_ORDER if _AP_TYPE_PATTERNS[name].search(text)]
+    models = [name for name, pat in _AP_MODEL_PATTERNS.items() if pat.search(text)]
+    return types, models
+
+
+def symbol_in_title(symbol: str, title: str | None) -> bool:
+    """True when the target symbol appears as a whole token in the paper title.
+
+    Boundary matches the SQL used to measure coverage: a non-alphanumeric (or
+    string edge) on each side, so ``anti-KRAS`` and ``KRAS-mutant`` both count
+    but ``KRASG12C`` does not. Used only to RANK exemplars, never to filter.
+    """
+    if not symbol or not title:
+        return False
+    return re.search(
+        r"(?<![A-Za-z0-9])" + re.escape(symbol) + r"(?![A-Za-z0-9])", title, re.IGNORECASE
+    ) is not None
+
+
+def _precedent_snippet(abstract: str | None, title: str | None) -> str | None:
+    """The first sentence carrying a validation cue — the "what result" the
+    scientist reads themselves (we do not auto-grade outcome)."""
+    if not abstract:
+        return None
+    # cheap sentence split; good enough for a preview snippet
+    for sentence in re.split(r"(?<=[.!?])\s+", abstract):
+        for pat in _AP_TYPE_PATTERNS.values():
+            if pat.search(sentence):
+                s = sentence.strip()
+                return (s[:277] + "…") if len(s) > 278 else s
+    s = abstract.strip()
+    return (s[:277] + "…") if len(s) > 278 else s
+
+
 class GraphQueries:
     """Multi-hop query helpers using relational SQL.
 
@@ -119,18 +228,50 @@ class GraphQueries:
             logger.info("Resolved alias %s -> %s", symbol, alias[0]["id"])
             return alias[0]["id"]
 
-        # Fuzzy name match — allows "epidermal growth factor" -> EGFR
+        # Fuzzy name match — allows "epidermal growth factor" -> EGFR.
+        #
+        # ⚠️ THIS BRANCH USED TO BE `ORDER BY LENGTH(name) ASC LIMIT 1` WITH NO
+        # AMBIGUITY TEST, which made it a misresolution engine across all 44
+        # symbol-taking tools. Board S15. Measured on prod:
+        #     'kinase'   matched  73 targets -> returned ALPK3
+        #     'receptor' matched 116 targets -> returned EPHB4
+        #     'protein'  matched 160 targets -> returned ABCB1
+        #     'a'        matched 643 targets -> returned AGT
+        # The caller got a confident, fully-populated dossier for whichever
+        # target happened to have the SHORTEST NAME. Nothing logged a warning
+        # and nothing downstream could tell it apart from a real hit.
+        #
+        # An exact name match is allowed to win outright. A substring match
+        # must be UNIQUE — if several targets contain the phrase, the input
+        # does not identify one of them, and resolving anyway is guessing.
+        # CLAUDE.md §3.5: resolve aggressively at query time, but a wrong edge
+        # is worse than a missing one, and that applies to entity resolution
+        # itself.
         name_query = symbol.lower()
-        name_match = self._execute_safe("""
-            SELECT id FROM targets
-            WHERE LOWER(name) LIKE %(q)s
-               OR LOWER(name) = %(exact)s
-            ORDER BY LENGTH(name) ASC
-            LIMIT 1
-        """, {"q": f"%{name_query}%", "exact": name_query})
-        if name_match:
-            logger.info("Resolved name '%s' -> %s", symbol, name_match[0]["id"])
-            return name_match[0]["id"]
+        exact_name = self._execute_safe(
+            "SELECT id FROM targets WHERE LOWER(name) = %(exact)s"
+            " ORDER BY LENGTH(name) ASC LIMIT 1",
+            {"exact": name_query},
+        )
+        if exact_name:
+            logger.info("Resolved exact name '%s' -> %s", symbol, exact_name[0]["id"])
+            return exact_name[0]["id"]
+
+        substring = self._execute_safe(
+            "SELECT id FROM targets WHERE LOWER(name) LIKE %(q)s"
+            " ORDER BY LENGTH(name) ASC LIMIT 2",
+            {"q": f"%{name_query}%"},
+        )
+        if len(substring) == 1:
+            logger.info("Resolved name '%s' -> %s", symbol, substring[0]["id"])
+            return substring[0]["id"]
+        if len(substring) > 1:
+            # Ambiguous. Say so out loud — this used to resolve silently.
+            logger.warning(
+                "Ambiguous target query %r matches multiple targets "
+                "(e.g. %s); refusing to guess.",
+                symbol, ", ".join(r["id"] for r in substring),
+            )
 
         return symbol
 
@@ -997,6 +1138,14 @@ class GraphQueries:
         sar = self._execute_safe("""
             SELECT COUNT(*) AS total_compounds,
                    MIN(ct.value) AS best_ic50_nm,
+                   -- R16: the activity_type of the MIN-value ("best") row, so the
+                   -- renderer can name the metric honestly. KRAS's best row is a Kd
+                   -- (0.02 nM), not an IC50; this field says so instead of the label
+                   -- fabricating "best IC50".
+                   (SELECT ct2.activity_type FROM compound_targets ct2
+                     WHERE ct2.target_id = %(t)s AND ct2.value IS NOT NULL
+                     ORDER BY ct2.value ASC NULLS LAST, ct2.compound_id ASC
+                     LIMIT 1) AS best_activity_type,
                    AVG(ct.value) AS mean_ic50_nm,
                    MAX(c.max_phase) AS highest_phase,
                    COUNT(DISTINCT ct.activity_type) AS assay_type_count
@@ -1340,29 +1489,139 @@ class GraphQueries:
         return dict(rows[0]) if rows else None
 
     def get_target_validation_summary(self, target_symbol: str) -> dict[str, Any]:
-        """Get validation evidence summary grouped by type."""
+        """Assay-precedent summary: what has been tried against this target, in
+        what model system — re-classified at query time (S22).
+
+        The stored ``paper_validations`` label is deliberately NOT surfaced
+        directly (see ``classify_validation`` for why: over-fired "clinical",
+        one-label shadowing, a naive outcome verdict). Each linked paper is
+        re-classified multi-label from its title+abstract; counts are
+        lower-bound "floors"; the stored outcome verdict is dropped in favour
+        of linked exemplar papers a scientist reads themselves. A paper naming
+        the target in its title is flagged high-confidence and leads exemplars.
+        """
         target = self._resolve_target(target_symbol)
+        srow = self._execute_safe(
+            "SELECT symbol FROM targets WHERE id = %(t)s", {"t": target}
+        )
+        symbol = (srow[0]["symbol"] if srow else str(target_symbol)).upper()
 
-        by_type = self._execute_safe("""
-            SELECT validation_type, COUNT(*) AS count,
-                   COUNT(DISTINCT CASE WHEN outcome = 'positive' THEN paper_id END) AS positive,
-                   COUNT(DISTINCT CASE WHEN outcome = 'negative' THEN paper_id END) AS negative,
-                   COUNT(DISTINCT CASE WHEN outcome = 'mixed' THEN paper_id END) AS mixed
-            FROM paper_validations
-            WHERE target_id = %(t)s
-            GROUP BY validation_type
-        """, {"t": target})
-
-        top_papers = self._execute_safe("""
-            SELECT p.title, p.journal, p.publication_date, p.pmid,
-                   p.citation_count,
-                   pv.validation_type, pv.model_system, pv.outcome
+        papers = self._execute_safe("""
+            SELECT p.id AS paper_id, p.title, p.abstract, p.journal,
+                   p.publication_date, p.pmid, p.citation_count
             FROM paper_validations pv
             JOIN papers p ON p.id = pv.paper_id
             WHERE pv.target_id = %(t)s
-            ORDER BY p.citation_count DESC NULLS LAST
-            LIMIT 10
         """, {"t": target})
+
+        # Query-time multi-label re-classification (the S22 core).
+        precedent: list[dict[str, Any]] = []
+        for p in papers:
+            title = p.get("title") or ""
+            abstract = p.get("abstract") or ""
+            types, models = classify_validation(f"{abstract} {title}")
+            if not types:
+                continue  # no real validation cue -> not a precedent (drops noise)
+            year: int | None = None
+            if p.get("publication_date"):
+                try:
+                    year = int(str(p["publication_date"])[:4])
+                except (ValueError, TypeError):
+                    year = None
+            pmid = p.get("pmid")
+            precedent.append({
+                "title": title or None,
+                "journal": p.get("journal"),
+                "year": year,
+                "pmid": pmid,
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None,
+                "validation_types": types,
+                "model_systems": models,  # [] = model unspecified
+                "target_in_title": symbol_in_title(symbol, title),
+                "evidence_snippet": _precedent_snippet(abstract, title),
+                "_cite": int(p.get("citation_count") or 0),
+                "_year": year or 0,
+            })
+
+        # "What's been tried, in what model" — distinct papers per (type, model).
+        # Multi-label: a paper counts under each type it used and each model it
+        # names. Counts are floors; NO outcome. model None -> "unspecified".
+        tried_cells: dict[tuple[str, str | None], dict[str, int]] = {}
+        by_type_counts: dict[str, dict[str, int]] = {}
+        for row in precedent:
+            row_models = row["model_systems"] or [None]
+            for vt in row["validation_types"]:
+                bt = by_type_counts.setdefault(vt, {"paper_count": 0, "title_matched": 0})
+                bt["paper_count"] += 1
+                bt["title_matched"] += 1 if row["target_in_title"] else 0
+                for m in row_models:
+                    cell = tried_cells.setdefault(
+                        (vt, m), {"paper_count": 0, "title_matched": 0}
+                    )
+                    cell["paper_count"] += 1
+                    cell["title_matched"] += 1 if row["target_in_title"] else 0
+        tried = [
+            {"validation_type": vt, "model_system": m, **counts}
+            for (vt, m), counts in tried_cells.items()
+        ]
+        tried.sort(key=lambda c: (-c["paper_count"], c["validation_type"], c["model_system"] or "~"))
+
+        # Backward-compat `validation_types` key, corrected: honest floors,
+        # NO positive/negative/mixed verdict.
+        validation_types = [
+            {"validation_type": vt, "paper_count": c["paper_count"], "title_matched": c["title_matched"]}
+            for vt, c in sorted(by_type_counts.items(), key=lambda kv: -kv[1]["paper_count"])
+        ]
+
+        # Exemplars: high-confidence first (target in title), then most cited,
+        # then most recent — the actionable "read this" surface.
+        exemplars = [
+            {k: v for k, v in ex.items() if not k.startswith("_")}
+            for ex in sorted(
+                precedent,
+                key=lambda r: (r["target_in_title"], r["_cite"], r["_year"]),
+                reverse=True,
+            )[:10]
+        ]
+
+        title_matched_total = sum(1 for r in precedent if r["target_in_title"])
+        if precedent:
+            coverage: dict[str, Any] = {
+                "precedent_papers": len(precedent),
+                "title_matched_papers": title_matched_total,
+                "candidate_papers_scanned": len(papers),
+                "note": (
+                    "precedent_papers each carry a real validation cue after "
+                    "query-time re-classification; the aggregate may still include "
+                    "papers where the target is incidental — target_in_title=true "
+                    "rows are the high-confidence subset."
+                ),
+            }
+        else:
+            coverage = {
+                "status": "no_precedent_in_corpus",
+                "candidate_papers_scanned": len(papers),
+                "note": (
+                    "no paper in the Mosaic corpus carries an experimental-validation "
+                    "cue for this target. This is corpus coverage, NOT confirmed "
+                    "absence of validation in the world."
+                ),
+            }
+
+        assay_precedent = {
+            "coverage": coverage,
+            "tried": tried,
+            "exemplars": exemplars,
+            "caveats": [
+                "Labels are keyword-derived from title+abstract and multi-label; "
+                "counts are lower bounds (floors), not exhaustive.",
+                "Outcome is intentionally NOT auto-graded — open the linked papers "
+                "to read what actually happened.",
+                "'clinical_trial' requires a real trial cue (trial/phase/randomised/"
+                "NCT), not a bare patient mention. Model systems are animal/specific "
+                "only.",
+            ],
+        }
 
         # Genetic / functional evidence layers — additive over the
         # paper-validation summary.
@@ -1416,10 +1675,10 @@ class GraphQueries:
                 }
 
         return {
-            "target": target,
-            "validation_types": by_type,
-            "top_papers": top_papers,
-            "total_evidence": sum(r["count"] for r in by_type),
+            "target": symbol,
+            "assay_precedent": assay_precedent,
+            "validation_types": validation_types,
+            "total_evidence": len(precedent),
             "genetic_evidence": genetic_evidence,
         }
 
@@ -1437,19 +1696,56 @@ class GraphQueries:
         target = self._resolve_target(target_symbol)
 
         # Primary: real trial roster from trials table
+        #
+        # ⚠️ TWO THINGS HERE ARE LOAD-BEARING. Board S13.
+        #
+        # 1. The `trial_compounds` join is restricted to compounds that
+        #    actually link to THIS target. It used to join on `nct_id` alone,
+        #    so every compound in a trial fanned out against every target the
+        #    trial touched — measured: ERBB2 returned 565 rows for 331 trials,
+        #    the extra 212 being compounds with no ERBB2 edge at all. A trial
+        #    of 6 drugs listed all 6 as though each were a HER2 agent.
+        #
+        # 2. `link_edge_grade` states WHY the trial is attached, and the sort
+        #    puts mechanism-grade links first. Without it the top of ERBB2's
+        #    roster is a CML/BCR-ABL study, because IMATINIB carries a binding
+        #    edge to ERBB2 — measured, 338 of ERBB2's 353 rows are
+        #    binding-assay grade and only 15 are mechanism. Potency cannot
+        #    separate them (imatinib pChEMBL 10.22 on ERBB2 vs lapatinib 8.8),
+        #    so the honest move is to rank by grade and SAY the grade, not to
+        #    silently filter. Same principle as S5's `phase_basis`: stating the
+        #    scope is the difference between a caveat and an overclaim.
         trials = self._execute_safe("""
             SELECT tr.nct_id, tr.brief_title, tr.phase, tr.overall_status,
                    tr.lead_sponsor, tr.sponsor_class, tr.start_date, tr.completion_date,
                    tr.enrollment, tr.has_results, tr.why_stopped,
                    tr.study_type, tr.conditions, tr.interventions,
                    COALESCE(c.pref_name, c.name, c.chembl_id) AS compound_name,
-                   c.chembl_id, c.max_phase AS compound_max_phase
+                   c.chembl_id, c.max_phase AS compound_max_phase,
+                   (SELECT CASE WHEN bool_or(ct.source = 'chembl_mechanism'
+                                          OR ct.mechanism_type IS NOT NULL)
+                                THEN 'mechanism' ELSE 'binding_assay' END
+                      FROM compound_targets ct
+                     WHERE ct.compound_id = tc.compound_id
+                       AND ct.target_id = tt.target_id)      AS link_edge_grade
             FROM trials tr
             JOIN trial_targets tt ON tt.nct_id = tr.nct_id
             LEFT JOIN trial_compounds tc ON tc.nct_id = tr.nct_id
+                 AND EXISTS (SELECT 1 FROM compound_targets ct
+                              WHERE ct.compound_id = tc.compound_id
+                                AND ct.target_id = tt.target_id)
             LEFT JOIN compounds c ON c.id = tc.compound_id
             WHERE tt.target_id = %(t)s
             ORDER BY
+                -- Mechanism-grade links first: those are trials of drugs whose
+                -- stated mechanism IS this target, rather than drugs that
+                -- merely bind it in an assay.
+                CASE WHEN EXISTS (SELECT 1 FROM compound_targets ct
+                                   WHERE ct.compound_id = tc.compound_id
+                                     AND ct.target_id = tt.target_id
+                                     AND (ct.source = 'chembl_mechanism'
+                                       OR ct.mechanism_type IS NOT NULL))
+                     THEN 0 ELSE 1 END,
                 -- CT.gov stores 'PHASE4' / 'EARLY_PHASE1' / 'NA', never
                 -- 'Phase 4'. The previous CASE compared against 'Phase 4'
                 -- and friends, so **no value ever matched** and every row
@@ -1576,6 +1872,10 @@ class GraphQueries:
                 (SELECT COUNT(*) FROM patent_mentions_target WHERE target_id = t.id) AS patent_count,
                 (SELECT COUNT(*) FROM paper_mentions_target WHERE target_id = t.id) AS paper_count,
                 (SELECT MIN(ct2.value) FROM compound_targets ct2 WHERE ct2.target_id = t.id) AS best_ic50_nm,
+                -- R16: name the metric — best_ic50_nm may be a Kd/Ki, not an IC50.
+                (SELECT ct4.activity_type FROM compound_targets ct4
+                  WHERE ct4.target_id = t.id AND ct4.value IS NOT NULL
+                  ORDER BY ct4.value ASC NULLS LAST, ct4.compound_id ASC LIMIT 1) AS best_activity_type,
                 (SELECT MAX(c2.max_phase) FROM compound_targets ct3
                  JOIN compounds c2 ON c2.id = ct3.compound_id
                  WHERE ct3.target_id = t.id) AS highest_phase,
@@ -1596,6 +1896,10 @@ class GraphQueries:
                    c.chembl_id, c.smiles, c.max_phase,
                    ct.activity_type, ct.value AS activity_value,
                    ct.unit, ct.pchembl_value,
+                   -- Window runs BEFORE LIMIT, so this is the true total, not
+                   -- the page size. The caller reported `total: len(rows)`,
+                   -- which is the clamped page and always equals it — a free
+                   -- user saw 10 of 40 and was told 10 was all of them.
                    COUNT(*) OVER () AS total_available
             FROM compound_targets ct
             JOIN compounds c ON c.id = ct.compound_id
@@ -1613,6 +1917,7 @@ class GraphQueries:
                    p.filing_date, p.publication_date,
                    p.country_code AS jurisdiction,
                    ARRAY_AGG(DISTINCT o.name) FILTER (WHERE o.name IS NOT NULL) AS assignees,
+                   -- Counts GROUPS (distinct patents), evaluated before LIMIT.
                    COUNT(*) OVER () AS total_available
             FROM patent_mentions_target pmt
             JOIN patents p ON p.id = pmt.patent_id
@@ -1760,7 +2065,10 @@ class GraphQueries:
                     SELECT DISTINCT ON (ct.target_id)
                         ct.target_id,
                         ct.value AS best_activity_value,
-                        COALESCE(ct.activity_type, 'IC50') AS best_activity_type,
+                        -- R16: was COALESCE(ct.activity_type, 'IC50') — defaulting a
+                        -- NULL type to IC50 manufactures the exact "best IC50" claim
+                        -- this field exists to make honest. NULL stays NULL.
+                        ct.activity_type AS best_activity_type,
                         ct.unit AS best_activity_unit,
                         ct.compound_id AS best_compound_id,
                         COALESCE(c.pref_name, c.name, c.chembl_id, ct.compound_id) AS best_compound_name,
@@ -1809,7 +2117,7 @@ class GraphQueries:
                     SELECT DISTINCT ON (ct.target_id)
                         ct.target_id,
                         ct.value AS best_activity_value,
-                        COALESCE(ct.activity_type, 'IC50') AS best_activity_type,
+                        ct.activity_type AS best_activity_type,  -- R16: no IC50 default
                         ct.unit AS best_activity_unit,
                         ct.compound_id AS best_compound_id,
                         COALESCE(c.pref_name, c.name, c.chembl_id, ct.compound_id) AS best_compound_name,
@@ -1901,7 +2209,9 @@ class GraphQueries:
                     c.inchikey, c.smiles,
                     t.id AS target_id,
                     MIN(ct.value) AS best_ic50_nm,
-                    (ARRAY_AGG(COALESCE(ct.activity_type, 'IC50')))[1] AS activity_type,
+                    -- R16: order the agg by value so the type is the MIN row's, and
+                    -- drop the COALESCE(...,'IC50') that mislabeled NULL/Kd/Ki as IC50.
+                    (ARRAY_AGG(ct.activity_type ORDER BY ct.value ASC NULLS LAST))[1] AS activity_type,
                     0.0 AS novelty_score,
                     0 AS patent_count
                 FROM compounds c
@@ -1918,7 +2228,9 @@ class GraphQueries:
                     c.inchikey, c.smiles,
                     t.id AS target_id,
                     MIN(ct.value) AS best_ic50_nm,
-                    (ARRAY_AGG(COALESCE(ct.activity_type, 'IC50')))[1] AS activity_type,
+                    -- R16: order the agg by value so the type is the MIN row's, and
+                    -- drop the COALESCE(...,'IC50') that mislabeled NULL/Kd/Ki as IC50.
+                    (ARRAY_AGG(ct.activity_type ORDER BY ct.value ASC NULLS LAST))[1] AS activity_type,
                     0.0 AS novelty_score,
                     0 AS patent_count
                 FROM compounds c
@@ -2093,10 +2405,14 @@ class GraphQueries:
         }
 
     def get_target_network(self, target_symbol: str) -> dict[str, Any]:
-        """Full knowledge graph traversal for a target — all connected entities.
+        """The 1-hop neighborhood of a target — every entity DIRECTLY linked to it.
 
-        Returns a network map with nodes and edges suitable for graph
-        visualization or comprehensive analysis.
+        Returns the target plus its directly-connected compounds, interacting
+        proteins, patent-holding organizations, pathways and diseases as nodes
+        and edges — a STAR centered on the target, assembled from independent
+        1-hop queries. This is NOT multi-hop graph traversal: it does not surface
+        a path such as target -> compound -> other target. Suitable for a
+        neighborhood visualization, not path-finding (S19: describe behaviour).
         """
         target = self._resolve_target(target_symbol)
 
@@ -2329,8 +2645,45 @@ class GraphQueries:
         """
         ppi_cte = ppi_cte_ext if has_ppi_ext else ppi_cte_legacy
 
-        # ---- Co-essentiality source: prefer Mosaic-vs-all-genes when present.
-        if has_coess_ext:
+        # ---- Co-essentiality source.
+        #
+        # ⚠️ THIS USED TO BE `if has_coess_ext: <ext only> elif has_coess:`,
+        # which made the legacy table UNREACHABLE in production, because _ext
+        # exists. That silently dropped every legacy pair with no _ext
+        # counterpart — measured on prod: **306 of 524 legacy co-essentiality
+        # pairs** (R26). The PPI branch immediately above already got this
+        # right and UNIONs both tables; the two layers handled the same
+        # pattern in opposite ways inside one function.
+        #
+        # The loss is NOT uniform, which is why it went unnoticed: for the
+        # tool's default anchors (the 8 targets with the most compounds) only
+        # 1 pair is legacy-only. It concentrates on targets a user has to name
+        # explicitly — NEFL 63 legacy-only pairs, PECAM1 28, NR2E3 16, POLG 11.
+        # So the tool looked healthy on every casual test and lost most of the
+        # co-essentiality layer for the mitochondrial/neuronal targets.
+        #
+        # UNION ALL + MAX, not UNION: both tables can describe the same (a,b)
+        # pair with different correlations, and plain UNION de-duplicates whole
+        # ROWS, so two differing correlations would survive as two rows and
+        # reach the FULL JOINs twice. Same reasoning as the PPI CTE above.
+        if has_coess_ext and has_coess:
+            coess_cte = """,
+        coess AS (
+            SELECT u.a, u.b, MAX(u.r) AS r
+            FROM (
+                SELECT ce.target_id AS a, ce.partner_symbol AS b,
+                       ABS(ce.correlation) AS r
+                FROM target_coessentiality_ext ce
+                JOIN anchors an ON an.a = ce.target_id
+                UNION ALL
+                SELECT ce.target_a_id AS a, ce.target_b_id AS b,
+                       ABS(ce.correlation) AS r
+                FROM target_coessentiality ce
+                JOIN anchors an ON an.a = ce.target_a_id
+            ) u
+            GROUP BY 1, 2
+        )"""
+        elif has_coess_ext:
             coess_cte = """,
         coess AS (
             SELECT ce.target_id AS a, ce.partner_symbol AS b,
@@ -3904,21 +4257,63 @@ class GraphQueries:
         if has_results_only:
             filters.append("t.has_results = TRUE")
 
+        # When the caller named a target, say WHY each trial is attached to it.
+        # A trial reaches a target through a drug that binds it, which is not
+        # the same claim as "this trial studies this target" — ERBB2's roster
+        # is 96% binding-assay grade. Board S13; the S5 `phase_basis` pattern.
+        # NOTE: `link_source` (trial_targets.match_source) is deliberately NOT
+        # emitted. It is 'intervention_chembl' for effectively every row —
+        # `condition_nlp` covers 14 targets, all "A"-prefixed — so it is a
+        # constant field carrying no discriminating information, and the sweep
+        # flagged it as such. `link_edge_grade` is the key that actually varies.
+        basis_cols = ""
+        if target_symbol:
+            basis_cols = """,
+                   (SELECT CASE WHEN bool_or(ct.source = 'chembl_mechanism'
+                                          OR ct.mechanism_type IS NOT NULL)
+                                THEN 'mechanism' ELSE 'binding_assay' END
+                      FROM trial_compounds tc
+                      JOIN compound_targets ct ON ct.compound_id = tc.compound_id
+                     WHERE tc.nct_id = t.nct_id
+                       AND ct.target_id = %(tid)s)                          AS link_edge_grade,
+                   (SELECT string_agg(DISTINCT COALESCE(c.pref_name, c.name), ', ')
+                      FROM trial_compounds tc
+                      JOIN compound_targets ct ON ct.compound_id = tc.compound_id
+                      JOIN compounds c ON c.id = tc.compound_id
+                     WHERE tc.nct_id = t.nct_id
+                       AND ct.target_id = %(tid)s)                          AS link_via_compounds"""
+
+        # Rank mechanism-grade links above binding-assay ones, matching
+        # get_clinical_pipeline. Without this the two tools disagree about the
+        # same target: measured on ERBB2, the pipeline led with NERATINIB
+        # (mechanism) while this one led with a CML study reached via IMATINIB,
+        # because it sorted only on has_results/start_date.
+        grade_order = ""
+        if target_symbol:
+            grade_order = """
+                CASE WHEN EXISTS (SELECT 1 FROM trial_compounds tc
+                                  JOIN compound_targets ct ON ct.compound_id = tc.compound_id
+                                 WHERE tc.nct_id = t.nct_id
+                                   AND ct.target_id = %(tid)s
+                                   AND (ct.source = 'chembl_mechanism'
+                                     OR ct.mechanism_type IS NOT NULL))
+                     THEN 0 ELSE 1 END,"""
+
         where = (" WHERE " + " AND ".join(filters)) if filters else ""
         sql = f"""
             SELECT t.nct_id, t.brief_title, t.phase, t.overall_status,
                    t.lead_sponsor, t.sponsor_class, t.start_date, t.completion_date,
                    t.enrollment, t.conditions, t.interventions, t.primary_outcomes,
-                   t.has_results, t.why_stopped, t.last_update_posted
+                   t.has_results, t.why_stopped, t.last_update_posted{basis_cols}
             FROM trials t
             {where}
-            ORDER BY
+            ORDER BY{grade_order}
                 CASE WHEN t.has_results THEN 0 ELSE 1 END,
                 t.start_date DESC NULLS LAST
             LIMIT %(lim)s
         """
         rows = self._execute_safe(sql, params)
-        return {
+        out: dict[str, Any] = {
             "filters": {
                 "target": target_symbol,
                 "compound": compound_name,
@@ -3928,6 +4323,22 @@ class GraphQueries:
             "trials": rows,
             "total_shown": len(rows),
         }
+        if target_symbol:
+            # Counts only — NO static legend text. An earlier draft shipped
+            # prose here ("a trial is attached through a drug that binds it…")
+            # and the 44-tool sweep correctly flagged all three strings as
+            # constant fields: they can never vary, so they are documentation
+            # wearing a data field's clothes, and they pollute the detector
+            # whose entire job is finding fields that cannot vary. The legend
+            # belongs in the tool description; the grade is already
+            # self-describing per row. Board S13b/S15.
+            out["_link_basis"] = {
+                "mechanism_grade_rows": sum(
+                    1 for r in rows if r.get("link_edge_grade") == "mechanism"),
+                "binding_assay_rows": sum(
+                    1 for r in rows if r.get("link_edge_grade") == "binding_assay"),
+            }
+        return out
 
     # =====================================================================
     # Compare two drugs (head-to-head)
