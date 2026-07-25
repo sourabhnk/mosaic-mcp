@@ -868,7 +868,11 @@ class GraphQueries:
             "edges": limited_edges,
             "node_count": len(limited_nodes),
             # what actually shipped in `nodes` (capped) — `total_by_type`
-            # below carries the true totals.
+            # below carries the totals AS HELD. Corrected 2026-07-25 (S24):
+            # these were called "the true totals", which they are not on the
+            # compounds and patents axes — ingestion is capped per target, so
+            # they are floors on what exists in the world. See the `sampling`
+            # block in `responses.py` for the measured caps.
             "by_type": {
                 "compounds": _shown(len(compounds)),
                 "papers": _shown(len(papers)),

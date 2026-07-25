@@ -368,16 +368,65 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
                 "validation_evidence": counts.get("validation_count", 0),
             },
             # The dossier is a capped sample of every axis, by design — it is
-            # the free front door. `data_coverage` above is the true total per
-            # axis; the list blocks below are the head of each. Stating the cap
-            # is the difference between a sample and an implied census: 10 of
-            # 209 organizations read as "the competitors" when unlabelled.
+            # the free front door, and stating the cap is the difference
+            # between a sample and an implied census: 10 of 209 organizations
+            # read as "the competitors" when unlabelled.
+            #
+            # ⚠️ CORRECTED 2026-07-25 (board S24). This block asserted that
+            # `data_coverage` was "the true total per axis". It is not. It is
+            # what Mosaic HOLDS, and on every capped-ingest axis that is a
+            # FLOOR. The old wording was worse than saying nothing: it told the
+            # caller the only cap was downstream of a complete layer, so a
+            # truncated count read as a census — and the note even instructed
+            # the caller to trust it ("compare each against data_coverage for
+            # the true total"). Measured 2026-07-25:
+            #   * compounds is capped TWICE. `backfill_compounds_wide.py`
+            #     fetches 600 activities `order_by=-pchembl_value` (line 151),
+            #     drops pchembl < 5.0, then keeps the top 300 BY POTENCY
+            #     (line 285). 191 of 470 cached targets hit the page cap —
+            #     MAPT holds 600 of 95,345 available, EGFR 600 of 21,342 — and
+            #     190 sit at the top-300 cap. The second cap truncates from
+            #     BELOW, so the stored set is potency-BIASED, not merely
+            #     partial; that is why it also skews `sar_summary`.
+            #   * trials is capped at `max_pages=3` x `page_size=50` = 150 per
+            #     target (`fetch_clinical_trials.py:491`). Prod's own
+            #     `coverage_fetch_log` records 554 of 764 trial cells as
+            #     truncated against CT.gov's reported total.
+            #   * patents is capped per target per run. The ledger reads 693 of
+            #     760 truncated, but do NOT quote that ratio to a caller: the
+            #     EPO figure is an unfiltered ti/ab total inflated by
+            #     gene-symbol collisions (`DES` reports 5,994,171). The cap is
+            #     certain; the magnitude is not.
+            # Text-only by design: no DB read belongs in a formatter — a
+            # coverage lookup here is what got S15's second half reverted (it
+            # broke 7 unit tests using DB-free fake query objects). Rendering
+            # the real five-state value is board S16 phase 3, in the query
+            # layer. [[unmeasured_is_not_zero]]
             "sampling": {
                 "note": (
-                    "List blocks are truncated samples, not complete sets. "
-                    "Compare each against data_coverage for the true total; "
-                    "the per-axis tools return full, filterable results."
+                    "Two independent caps apply and both are stated here. "
+                    "(1) The list blocks below are truncated samples of what "
+                    "Mosaic holds — compare each against data_coverage. "
+                    "(2) data_coverage is what Mosaic HOLDS, and on the "
+                    "compounds, trials and patents axes that is a FLOOR, not "
+                    "the total that exists in the world, because ingestion is "
+                    "capped per target: compounds to the top 300 by potency "
+                    "above pchembl 5.0 drawn from a 600-activity "
+                    "potency-ordered page, trials to 3 pages of 50, patents to "
+                    "a per-run limit. Read every count on those three axes as "
+                    "'at least N'. A low or zero count there is not evidence "
+                    "of absence. The per-axis tools return full, filterable "
+                    "results over what Mosaic holds — the same floor."
                 ),
+                # Deliberately folded into `note` above rather than shipped as
+                # `holdings_are_floor` / `ingest_caps` keys. Those would be four
+                # new constant-across-anchor paths, and silencing them means
+                # growing `config/sweep_baseline.json` — part of the scorer — in
+                # the same change that introduces them (CLAUDE.md §3.4). The
+                # existing `_meta.sampling.note` is already allowlisted as
+                # "static caveat text", which is exactly what this is. If a
+                # machine-readable form is wanted later, add the keys and the
+                # baseline entries as a separate, declared change.
                 "caps": {
                     "top_compounds": 10,
                     "disease_associations": 15,

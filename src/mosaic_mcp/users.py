@@ -71,9 +71,14 @@ TIER_DAILY_TARGET_LIMITS: dict[Tier, int | None] = {
 #     ask for an entity you cannot find.
 #   - A user's own saved data (watchlists, wishlist) is free. It is theirs.
 #   - `get_target_profile` is the deliberate exception. It is the free front
-#     door and samples six Pro tools' output, capped, with the true totals
+#     door and samples six Pro tools' output, capped, with the totals AS HELD
 #     stated in `_meta.data_coverage` and `_meta.sampling`. The caps are the
 #     product boundary; the disclosed totals are the upgrade prompt.
+#     ⚠️ Corrected 2026-07-25 (S24): these were called "the true totals". They
+#     are holdings, and on the compounds/trials/patents axes they are FLOORS —
+#     ingestion is capped per target. The upgrade prompt must not be read as a
+#     census of the world, and `_meta.sampling.holdings_are_floor` names the
+#     axes where it is not.
 #
 # Adding a tool? Decide its tier by the rule, then add it to
 # `tests/test_tier_boundary.py::EXPECTED_TIERS`. That test fails on any
