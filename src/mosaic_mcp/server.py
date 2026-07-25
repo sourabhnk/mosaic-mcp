@@ -9,7 +9,6 @@ Claude Desktop, Claude Code, or any MCP-compatible client.
 # (>=1.x) inspects raw `param.annotation` in Tool.from_function; PEP 563
 # stringized annotations make it call issubclass(<str>, Context) and crash.
 
-import datetime
 import json
 import logging
 import os
@@ -372,24 +371,68 @@ def _enrich_labels(data: Any) -> Any:
     return data
 
 
-_PROV_CACHE: dict[str, Any] = {"at": 0.0, "as_of": None}
+# Freshness states for the _provenance stamp. Emitted on BOTH paths, so the
+# field's PRESENCE never carries meaning — only its value does.
+FRESHNESS_KG_METADATA = "kg_metadata"  # read a real last_refresh_at; as_of is set
+FRESHNESS_UNAVAILABLE = "unavailable"  # could not read it; as_of is null, NOT today
+
+# `at` = when we last ATTEMPTED, not when we last succeeded. Gating on the
+# attempt (rather than on a truthy value) is load-bearing: the old guard was
+# `if _PROV_CACHE["as_of"] and ...`, so once as_of stops being truthy every tool
+# re-queries on every call — a retry storm against a database that is, by
+# construction, already unhealthy. Unknown is cached too, briefly.
+_PROV_CACHE: dict[str, Any] = {"at": 0.0, "as_of": None, "freshness": None}
+_PROV_TTL_OK_S = 300.0
+_PROV_TTL_UNAVAILABLE_S = 45.0  # short: a recovered DB must not keep reporting unknown
 
 
-def _provenance_as_of() -> str:
-    """KG freshness date for the _provenance stamp (cached 5 min)."""
+def _provenance_freshness() -> tuple[str | None, str]:
+    """KG freshness for the _provenance stamp: ``(as_of, freshness)``.
+
+    Returns ``as_of=None`` when ``kg_metadata`` cannot be read. It used to fall
+    back to ``datetime.date.today()``, which stamped EVERY tool response with
+    today's date whenever the lookup failed — rendering "we do not know how fresh
+    this is" as "this is maximally fresh". A plausible date is worse than no date
+    because nothing downstream can tell it was invented.
+    """
     now = time.time()
-    if _PROV_CACHE["as_of"] and now - _PROV_CACHE["at"] < 300:
-        return _PROV_CACHE["as_of"]
-    as_of = None
+    cached_state = _PROV_CACHE["freshness"]
+    if cached_state is not None:
+        ttl = _PROV_TTL_OK_S if cached_state == FRESHNESS_KG_METADATA else _PROV_TTL_UNAVAILABLE_S
+        if now - _PROV_CACHE["at"] < ttl:
+            return _PROV_CACHE["as_of"], cached_state
+
+    as_of: str | None = None
     try:
         meta = _gq().get_kg_metadata()
         if meta and meta.get("last_refresh_at"):
             as_of = str(meta["last_refresh_at"])[:10]
-    except Exception:
-        pass
-    as_of = as_of or datetime.date.today().isoformat()
-    _PROV_CACHE.update(at=now, as_of=as_of)
-    return as_of
+    except Exception as e:
+        logger.warning("provenance: kg_metadata unreadable, as_of=null: %s", e)
+
+    freshness = FRESHNESS_KG_METADATA if as_of else FRESHNESS_UNAVAILABLE
+    _PROV_CACHE.update(at=now, as_of=as_of, freshness=freshness)
+    return as_of, freshness
+
+
+def _provenance_as_of() -> str | None:
+    """The freshness DATE alone, or None when it cannot be read.
+
+    Kept as a separate accessor because ~10 call sites interpolate this into
+    prose. They are falsy-guarded, so None correctly drops the "(as of ...)"
+    clause instead of asserting a date nobody measured.
+    """
+    return _provenance_freshness()[0]
+
+
+def _as_of_clause() -> str:
+    """", as of YYYY-MM-DD" — or nothing when freshness is unreadable.
+
+    The one site that interpolates the date BARE, so it needs its own guard or
+    it prints "as of None".
+    """
+    as_of = _provenance_as_of()
+    return f", as of {as_of}" if as_of else ""
 
 
 def _json_result(data: Any) -> str:
@@ -407,11 +450,15 @@ def _json_result(data: Any) -> str:
         and "_provenance" not in data
         and "error" not in data
     ):
+        _as_of, _freshness = _provenance_freshness()
         data = {
             **data,
             "_provenance": {
                 "sources": ["mosaic_kg"],
-                "as_of": _provenance_as_of(),
+                # Always present, null when unknown — an absent key would
+                # mean "this build does not stamp freshness", a different fact.
+                "as_of": _as_of,
+                "freshness": _freshness,
                 "confidence_summary": None,
             },
         }
@@ -833,7 +880,7 @@ def mosaic_get_target_profile(params: GeneSymbolInput) -> str:
         return _json_result({
             "error": (
                 f"'{symbol}' is not in the current Mosaic KG "
-                f"(curated oncology target set, as of {_provenance_as_of()}). "
+                f"(curated oncology target set{_as_of_clause()}). "
                 "This is a coverage statement, not a claim that the gene "
                 "does not exist."
             ),

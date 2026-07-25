@@ -2291,10 +2291,35 @@ class GraphQueries:
                  WHERE pmt.target_id = t.id AND o.is_big_pharma = TRUE
                 ) AS big_pharma_count,
                 -- Opportunity score: high validation × low competition × has compounds
+                --
+                -- The momentum term that used to sit here
+                --   (* CASE WHEN ts.momentum_direction = 'rising' THEN 1.2 ELSE 1.0 END)
+                -- was REMOVED, not repaired, on 2026-07-25. It compared against
+                -- 'rising', a value nothing has ever written — compute_scores emits
+                -- accelerating/decelerating/stable — so it silently multiplied by
+                -- 1.0 for every target since it was written.
+                --
+                -- NOTE: no literal per-cent signs in this comment — psycopg parses
+                -- them as parameter placeholders and the whole query raises.
+                --
+                -- Repairing the vocabulary would have made it fire on 700 of 764 prod
+                -- targets (all the 'accelerating' ones), so its only real effect is a
+                -- blanket demotion of the 64-target minority. Measured on the v1
+                -- export, that reshuffles 17 of the top 20 rows of a ranking
+                -- customers act on. Worse, that minority bucket contains targets with
+                -- ZERO papers: compute_scores maps "no publication data" to the same
+                -- 'stable' label as "flat publication rate", so enabling the term
+                -- would demote whitespace candidates for having no measured history —
+                -- inverting the very thesis of this tool. Dead code produces no false
+                -- precision; a firing multiplier over a degenerate label does.
+                --
+                -- Deleting it leaves this tool's output byte-identical to what it
+                -- already returns. Momentum can come back as a ranking signal once
+                -- the classifier is fixed (it is currently a function of the calendar
+                -- — see the board task on compute_scores' hardcoded 2024-01-01 split).
                 CASE
                     WHEN ts.scientific_validation > 0 AND ts.competitive_intensity >= 0 THEN
                         ts.scientific_validation * (1.0 - COALESCE(ts.competitive_intensity, 0))
-                        * CASE WHEN ts.momentum_direction = 'rising' THEN 1.2 ELSE 1.0 END
                     ELSE 0
                 END AS opportunity_score
             FROM targets t

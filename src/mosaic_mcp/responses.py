@@ -16,7 +16,10 @@ these responses beautifully without custom formatting logic.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # High-traffic oncology targets where an empty data layer is surprising
 # and most damaging to credibility (Task 1.1.R.3). An empty result on one
@@ -30,6 +33,33 @@ WELL_KNOWN_TARGETS = frozenset({
     "NOTCH1", "STK11", "VHL", "RB1", "CDKN2A", "ESR1", "AR", "PARP1", "ATM",
     "CHEK2", "PDCD1", "CD274", "CTLA4", "VEGFA", "KDR",
 })
+
+
+# The vocabulary compute_scores actually writes — and that api/routers/* already
+# use. The MCP layer used to map {"rising": "↑", "declining": "↓"}, words nothing
+# in this system has ever written, so 709 of 764 prod targets fell through to the
+# flat default and KRAS went out to paying users as "accelerating →": a direction
+# contradicting its own label inside one string.
+_MOMENTUM_ARROWS = {"accelerating": "↑", "decelerating": "↓", "stable": "→"}
+
+
+def _momentum_arrow(direction: str | None) -> tuple[str, str]:
+    """``(label, arrow)`` for a momentum direction. Unknown is never disguised.
+
+    Both unknown cases are deliberate. A MISSING key is not "stable" — that is a
+    measured verdict, and defaulting to it is the same unmeasured-as-measured
+    defect this whole area keeps producing. And an UNRECOGNISED value must not
+    quietly borrow stable's arrow: a silent default is precisely how the
+    rising/accelerating drift stayed invisible for so long. If the vocabulary
+    ever drifts again, this is loud in the payload and in the log.
+    """
+    if direction is None:
+        return "unknown", "?"
+    arrow = _MOMENTUM_ARROWS.get(direction)
+    if arrow is None:
+        logger.warning("unrecognised momentum_direction %r — not rendering an arrow", direction)
+        return direction, "?"
+    return direction, arrow
 
 
 def empty_scope_note(
@@ -117,8 +147,7 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
             filled = round(pct / 10)
             return f"{'█' * filled}{'░' * (10 - filled)} {pct}/100"
 
-        momentum_dir = scores.get("momentum_direction", "stable")
-        arrow = {"rising": "↑", "declining": "↓"}.get(momentum_dir, "→")
+        momentum_dir, arrow = _momentum_arrow(scores.get("momentum_direction"))
 
         scores_section = {
             "target_attractiveness": {
