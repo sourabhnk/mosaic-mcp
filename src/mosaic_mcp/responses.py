@@ -40,7 +40,15 @@ WELL_KNOWN_TARGETS = frozenset({
 # in this system has ever written, so 709 of 764 prod targets fell through to the
 # flat default and KRAS went out to paying users as "accelerating →": a direction
 # contradicting its own label inside one string.
-_MOMENTUM_ARROWS = {"accelerating": "↑", "decelerating": "↓", "stable": "→"}
+_MOMENTUM_ARROWS = {
+    "accelerating": "↑",
+    "decelerating": "↓",
+    "stable": "→",
+    # Unmeasured states (S23e) are NAMED, not blank and not "stable".
+    "no_papers": "—",
+    "no_recent_publications": "—",
+    "insufficient_data": "—",
+}
 
 
 def _momentum_arrow(direction: str | None) -> tuple[str, str]:

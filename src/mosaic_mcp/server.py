@@ -1558,7 +1558,7 @@ def mosaic_find_opportunities(params: OpportunityInput) -> str:
     intensity. These are the best opportunities for novel drug programs
     where the biology is strong but Big Pharma hasn't crowded the space.
 
-    Ranked by opportunity_score = validation × (1 - competition) × momentum_boost.
+    Ranked by opportunity_score = validation × (1 - competition).
     """
     _check_tool_access("mosaic_find_opportunities")
     gq = _gq()
@@ -1571,7 +1571,7 @@ def mosaic_find_opportunities(params: OpportunityInput) -> str:
                 f"White-space drug target opportunities"
                 + (f" in {params.therapy_area}" if params.therapy_area else "")
             ),
-            "scoring": "opportunity_score = scientific_validation × (1 - competitive_intensity) × momentum_boost",
+            "scoring": "opportunity_score = scientific_validation × (1 - competitive_intensity)",
             "hint": "Use mosaic_get_target_profile on any gene_symbol for the full dossier.",
         },
         "opportunities": results,

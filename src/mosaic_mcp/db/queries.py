@@ -2097,10 +2097,21 @@ class GraphQueries:
                     COUNT(DISTINCT o.id) AS active_org_count,
                     0.0 AS target_attractiveness_score,
                     0.0 AS scientific_validation_score,
+                    -- This SELECT does not join target_scores. momentum_score
+                    -- and momentum_direction are NULL because "unknown" is the
+                    -- truth and their readers now carry NULL through (S23e).
+                    --
+                    -- competitive_intensity_score and druggability_score are
+                    -- STILL fabricated 0.0 here, and that is the same defect.
+                    -- They are left alone deliberately: `_as_float` in
+                    -- real_data_provider turns None straight back into 0.0, so
+                    -- NULLing them without also changing that reader, the
+                    -- pydantic defaults and the frontend would look fixed in SQL
+                    -- and behave identically. Filed rather than half-done.
                     0.0 AS competitive_intensity_score,
-                    0.0 AS momentum_score,
+                    NULL::float AS momentum_score,
                     0.0 AS druggability_score,
-                    'stable' AS momentum_direction
+                    NULL::varchar AS momentum_direction
                 FROM targets t
                 JOIN target_indications ti ON ti.target_id = t.id AND ti.indication_id = %(ind)s
                 LEFT JOIN patent_mentions_target pamt ON pamt.target_id = t.id
@@ -2146,10 +2157,21 @@ class GraphQueries:
                     COUNT(DISTINCT o.id) AS active_org_count,
                     0.0 AS target_attractiveness_score,
                     0.0 AS scientific_validation_score,
+                    -- This SELECT does not join target_scores. momentum_score
+                    -- and momentum_direction are NULL because "unknown" is the
+                    -- truth and their readers now carry NULL through (S23e).
+                    --
+                    -- competitive_intensity_score and druggability_score are
+                    -- STILL fabricated 0.0 here, and that is the same defect.
+                    -- They are left alone deliberately: `_as_float` in
+                    -- real_data_provider turns None straight back into 0.0, so
+                    -- NULLing them without also changing that reader, the
+                    -- pydantic defaults and the frontend would look fixed in SQL
+                    -- and behave identically. Filed rather than half-done.
                     0.0 AS competitive_intensity_score,
-                    0.0 AS momentum_score,
+                    NULL::float AS momentum_score,
                     0.0 AS druggability_score,
-                    'stable' AS momentum_direction
+                    NULL::varchar AS momentum_direction
                 FROM targets t
                 LEFT JOIN patent_mentions_target pamt ON pamt.target_id = t.id
                 LEFT JOIN paper_mentions_target pmt ON pmt.target_id = t.id
