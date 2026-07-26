@@ -141,10 +141,21 @@ def _coverage_state_block(coverage: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"available": True}
     for axis, c in sorted(coverage.items()):
         state = c.get("state")
+        basis = c.get("basis")
+        means = _COVERAGE_MEANING.get(state, "unrecognised coverage state")
+        # A DERIVED axis is truncated because an upstream fetch is incomplete,
+        # NOT because this axis hit a per-target cap. Saying "a per-target
+        # ingest cap was hit" for trials (basis derived:trial_compounds) would
+        # be a false explanation — the trials edges come from a compound search
+        # that has run for 0.56% of compounds. The "at least N" reading is the
+        # same; only the reason differs, and the reason has to be true.
+        if state == "truncated" and isinstance(basis, str) and basis.startswith("derived:"):
+            means = ("derived from an upstream fetch that is itself incomplete — "
+                     "read this count as 'at least N', never as complete")
         out[axis] = {
             "state": state,
-            "means": _COVERAGE_MEANING.get(state, "unrecognised coverage state"),
-            "basis": c.get("basis"),
+            "means": means,
+            "basis": basis,
             "counts_as_measurement": state in ("measured", "measured_zero"),
         }
     unmeasured = sorted(a for a, c in coverage.items()
