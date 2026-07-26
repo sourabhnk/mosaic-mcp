@@ -111,6 +111,72 @@ def empty_scope_note(
     return note
 
 
+# What each coverage state licenses a reader to conclude. Board S16 phase 3
+# defines the states; this is the only place they are put into words for a
+# caller, so the wording is deliberately about EVIDENCE, never about biology.
+_COVERAGE_MEANING = {
+    "measured": "the source was asked and this count is complete",
+    "measured_zero": "the source was asked and affirmatively reported nothing",
+    "truncated": "a per-target ingest cap was hit — read this count as 'at least N'",
+    "covered_but_unlinked": "the source holds records we did not link; the count understates",
+    "not_in_universe": "the source's own manifest does not contain this target",
+    "no_fetch_evidence": "we hold NO evidence a fetch ever ran — this is not a measurement",
+}
+# Axes where a zero cannot be read as an absence claim.
+_NOT_ABSENCE = {"truncated", "no_fetch_evidence", "covered_but_unlinked"}
+
+
+def _coverage_state_block(coverage: dict[str, Any]) -> dict[str, Any]:
+    """Per-axis coverage state for the dossier (board S24 clause 2).
+
+    Pure formatting over data the query layer already fetched — no DB access,
+    so the DB-free formatter tests keep working (the S15 lesson).
+    """
+    if not coverage:
+        # Distinguish "the coverage model has nothing for this target" from
+        # "every axis is fine". Absence of a block is not a clean bill.
+        return {"available": False,
+                "note": "no coverage model rows for this target; treat every "
+                        "count below as unlabelled"}
+    out: dict[str, Any] = {"available": True}
+    for axis, c in sorted(coverage.items()):
+        state = c.get("state")
+        out[axis] = {
+            "state": state,
+            "means": _COVERAGE_MEANING.get(state, "unrecognised coverage state"),
+            "basis": c.get("basis"),
+            "counts_as_measurement": state in ("measured", "measured_zero"),
+        }
+    unmeasured = sorted(a for a, c in coverage.items()
+                        if c.get("state") in _NOT_ABSENCE)
+    if unmeasured:
+        out["absence_claims_unsupported_on"] = unmeasured
+        out["note"] = (
+            "On the axes listed in absence_claims_unsupported_on, a low or zero "
+            "count is NOT evidence of absence — it reflects ingestion coverage. "
+            "Only axes with counts_as_measurement: true support an absence claim."
+        )
+    return out
+
+
+def _round_or_none(val: Any, digits: int = 3) -> float | None:
+    """Round, but keep NULL as NULL. Never `x or 0`.
+
+    The idiom this replaces — `round(x or 0, 3)` — maps BOTH `None` and a real
+    `0.0` onto `0.0`, which is the repo's most-repeated defect shape: a failure
+    and a measurement returning the same value. A NULL score means "we did not
+    measure this"; `0.0` means "we measured it and it is the worst possible
+    value". On a ranked field those are opposite claims.
+    """
+    if val is None:
+        return None
+    try:
+        return round(float(val), digits)
+    except (TypeError, ValueError):
+        logger.warning("non-numeric score value %r — rendering null, not 0.0", val)
+        return None
+
+
 def empty_scope_sentence(entity: str, what: str) -> str:
     """One-line honest phrasing for string-returning interpreters."""
     return (
@@ -367,6 +433,16 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
                 "disease_associations": counts.get("indication_count", 0),
                 "validation_evidence": counts.get("validation_count", 0),
             },
+            # Board S24 clause 2 — the per-target coverage STATE beside the
+            # count, not a generic caveat that reads the same for every target.
+            # This is what makes `compound_count` legible: 0 with
+            # `measured_zero` means ChEMBL was asked and said nothing, while 0
+            # with `no_fetch_evidence` means nobody ever asked. Those were the
+            # same number until S16 phase 3, and telling them apart is the
+            # entire reason that table exists.
+            # Data comes from `profile["coverage"]` (fetched in the query
+            # layer); nothing here touches the DB.
+            "coverage_state": _coverage_state_block(profile.get("coverage") or {}),
             # The dossier is a capped sample of every axis, by design — it is
             # the free front door, and stating the cap is the difference
             # between a sample and an implied census: 10 of 209 organizations
@@ -663,12 +739,32 @@ def format_search_results(results: list[dict], query: str) -> dict[str, Any]:
             "patent_count": r.get("patent_count", 0),
             "paper_count": r.get("paper_count", 0),
         }
-        # Include scores if available
-        tas = r.get("target_attractiveness")
-        if tas is not None:
-            entry["target_attractiveness"] = round(tas, 3)
-            entry["scientific_validation"] = round(r.get("scientific_validation") or 0, 3)
-            entry["momentum"] = round(r.get("momentum") or 0, 3)
+        # Scores. ⚠️ FIXED 2026-07-25 (board S17b) — this block had TWO
+        # unmeasured-as-measured defects, and they are S23e leaking through a
+        # second tool rather than anything new:
+        #   1. `round(... or 0, 3)` turned a NULL score into a measured **0.0**.
+        #      `or` is the trap, not `round`: it collapses None AND a real 0.0
+        #      onto the same output ([[debug-log-then-falsy-return]] — make the
+        #      two cases different values). Measured on prod 2026-07-25: **227 of
+        #      764 `target_scores` rows have `momentum` NULL**, so this tool
+        #      rendered 227 targets at "momentum 0.0" — bottom-of-the-range —
+        #      while `mosaic_get_target_profile` correctly rendered `null` for
+        #      the same targets. Two tools, one KG, opposite claims.
+        #      (The board's "139 unmeasurable" is stale; the measured figure is
+        #      227 after S23e's no_papers/insufficient_data split.)
+        #   2. Gating the whole block on `tas is not None` meant a null TAS
+        #      silently DELETED `scientific_validation` / `momentum` /
+        #      `momentum_direction` from the payload — absence of a key reads as
+        #      "this tool does not report that", not "unmeasured". Each field now
+        #      carries its own null.
+        # Emitted whenever the row carries a scores join at all, so the caller
+        # can tell "unmeasured" from "not offered".
+        score_keys = ("target_attractiveness", "scientific_validation",
+                      "momentum", "momentum_direction")
+        if any(k in r for k in score_keys):
+            entry["target_attractiveness"] = _round_or_none(r.get("target_attractiveness"))
+            entry["scientific_validation"] = _round_or_none(r.get("scientific_validation"))
+            entry["momentum"] = _round_or_none(r.get("momentum"))
             entry["momentum_direction"] = r.get("momentum_direction")
         # Include function description (truncated)
         func = r.get("function_description")
@@ -927,8 +1023,17 @@ def _suggest_modality(row: dict[str, Any]) -> str:
 def format_undruggable_targets(
     rows: list[dict[str, Any]],
     therapy_area: str | None,
+    unrankable: list[dict[str, Any]] | None = None,
+    structural_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Wrap find_undruggable_targets() output for MCP clients."""
+    """Wrap find_undruggable_targets() output for MCP clients.
+
+    `unrankable` (S17c) is a SEPARATE block, not holes in the ranked list:
+    structurally-qualifying candidates whose ranking inputs are unmeasured. They
+    are listed with a reason so "we could not rank this" can never be read as
+    "this ranked last" — and, because they are fetched by their own query, they
+    neither displace real opportunities nor get truncated away by the LIMIT.
+    """
     items: list[dict[str, Any]] = []
     for r in rows:
         disorder = r.get("disorder_frac")
@@ -954,8 +1059,24 @@ def format_undruggable_targets(
                 if r.get("opportunity_score") is not None
                 else None
             ),
+            # S17c: a null score is now legibly unranked rather than merely last.
+            "unrankable_reason": r.get("unrankable_reason"),
             "suggested_modality": _suggest_modality(r),
         })
+
+    unranked = [
+        {
+            "gene_symbol": r.get("gene_symbol"),
+            "target_name": r.get("target_name"),
+            "structural_tier": r.get("structural_tier"),
+            "top_pocket_score": r.get("top_pocket_score"),
+            "scientific_validation": r.get("scientific_validation"),
+            "competitive_intensity": r.get("competitive_intensity"),
+            "unrankable_reason": r.get("unrankable_reason"),
+        }
+        for r in (unrankable or [])
+    ]
+    n_unranked = len(unranked)
 
     scope = (
         f"in {therapy_area}" if therapy_area
@@ -969,14 +1090,70 @@ def format_undruggable_targets(
                 "white-space for PROTAC, glue, biologic, or PPI strategies"
             ),
             "interpretation": (
-                f"{len(items)} targets returned. Higher opportunity_score = "
+                f"{len(items)} ranked targets. Higher opportunity_score = "
                 "stronger validation × weaker pocket × less competition."
+                + (
+                    f" A further {n_unranked} target(s) meet the structural "
+                    "criteria but CANNOT be ranked — a score they are ranked by "
+                    "is unmeasured — and are listed under `unrankable` with a "
+                    "reason. They are missing a measurement, NOT scoring badly; "
+                    "the ranked list is therefore not the whole candidate "
+                    "population."
+                    if n_unranked else ""
+                )
             ),
         },
         "therapy_area": therapy_area,
         "targets": items,
         "total": len(items),
+        # S17c: a SEPARATE block, so "we could not rank this" is never read as
+        # "this ranked last" — and never silently truncated away by the LIMIT,
+        # which is what NULLS LAST alone did. Empty on prod today; populates
+        # once board S17e creates the first null.
+        "unrankable": unranked,
+        "unrankable_count": n_unranked,
+        # The population this tool could draw from AT ALL. A target whose pockets
+        # were never computed has NULL on both admission columns, so it cannot
+        # appear here at any threshold — and it is not in `unrankable` either,
+        # because it never became a candidate. It is simply absent. Stating the
+        # denominator is the difference between "these are the intractable
+        # targets" and "these are the intractable targets among the 38% we have
+        # analysed".
+        "structural_coverage": _structural_coverage_block(structural_coverage),
     }
+
+
+def _structural_coverage_block(cov: dict[str, Any] | None) -> dict[str, Any]:
+    """Denominators for `find_undruggable_targets`. Pure formatting, no DB."""
+    if not cov:
+        return {"available": False,
+                "note": "structural coverage could not be measured; treat this "
+                        "list as a sample of unknown completeness"}
+    analysed = cov.get("analysed") or 0
+    unanalysed = cov.get("unanalysed") or 0
+    structures = cov.get("structures_total") or 0
+    targets = cov.get("targets_total") or 0
+    pct = round(100.0 * analysed / structures, 1) if structures else None
+    out = {
+        "available": True,
+        "targets_in_kg": targets,
+        "with_a_structure": structures,
+        "pocket_analysed": analysed,
+        "pocket_unanalysed": unanalysed,
+        "analysed_pct_of_structures": pct,
+    }
+    if unanalysed:
+        out["note"] = (
+            f"This tool admits a target only via structural_tier or "
+            f"top_pocket_score. Both are NULL for {unanalysed} structures whose "
+            f"pockets were never computed, so those targets CANNOT appear here "
+            f"at any threshold and are not in `unrankable` either — they never "
+            f"became candidates. Read this ranking as drawn from the "
+            f"{analysed} analysed structures ({pct}% of the structural layer), "
+            f"NOT from the whole KG. Absence from this list is not evidence a "
+            f"target is tractable."
+        )
+    return out
 
 
 def format_validation_summary(data: dict[str, Any]) -> dict[str, Any]:

@@ -1112,6 +1112,34 @@ class GraphQueries:
         if counts:
             profile["counts"] = dict(counts[0])
 
+        # 2b. Coverage states for this target (board S24 clause 2, via S16 phase 3).
+        #
+        # This is the whole point of `target_coverage`: a count is only readable
+        # beside the state that says whether it is a measurement, a floor, or an
+        # admission that nobody looked. `data_coverage` previously shipped a bare
+        # integer with a generic caveat that applied identically to every target,
+        # which cannot distinguish EGFR's 632 papers from ACADVL's 0.
+        #
+        # Fetched HERE, in the query layer, and passed down — NOT looked up in
+        # the formatter. A DB round-trip inside `format_target_dossier` is what
+        # got S15's second half reverted: it broke 7 unit tests that drive the
+        # formatters with DB-free fake query objects, and those fakes are right.
+        cov = self._execute_safe("""
+            SELECT axis, state, value, source_available_count, basis, fetched_at
+            FROM target_coverage
+            WHERE target_id = %(t)s
+        """, {"t": target})
+        profile["coverage"] = {
+            r["axis"]: {
+                "state": r["state"],
+                "value": r["value"],
+                "source_available_count": r["source_available_count"],
+                "basis": r["basis"],
+                "fetched_at": r["fetched_at"].isoformat() if r["fetched_at"] else None,
+            }
+            for r in (cov or [])
+        }
+
         # 3. Target scores
         scores = self._execute_safe("""
             SELECT target_attractiveness, scientific_validation,
@@ -1452,11 +1480,51 @@ class GraphQueries:
                     AS validation_count,
                 -- Opportunity score: validation × structural intractability ×
                 -- (1 - competition).
-                (
-                    COALESCE(ts_score.scientific_validation, 0.3)
-                    * (1.0 - COALESCE(ts.top_pocket_score, 0.0))
-                    * (1.0 - COALESCE(ts_score.competitive_intensity, 0.0))
-                ) AS opportunity_score
+                --
+                -- ⚠️ FIXED 2026-07-25 (board S17c). This expression held THREE
+                -- COALESCEs that each turned "unmeasured" into the single most
+                -- favourable value the formula admits, inside an
+                -- `ORDER BY opportunity_score DESC`:
+                --   * COALESCE(competitive_intensity, 0.0) -> zero competition
+                --     -> multiplier 1.0 -> MAXIMUM opportunity -> sorted to the
+                --     TOP of a paid ranking. This is the ANGPTL3 defect verbatim
+                --     ("0.033 reads as white space"), except a null reads as
+                --     0.0 reads as white space. It does not fire today only
+                --     because prod currently holds zero NULL scores — board S17
+                --     is about to create them, which is why this lands FIRST.
+                --   * COALESCE(scientific_validation, 0.3) -> fabricates a
+                --     middling validation for a target that has none measured.
+                --   * COALESCE(top_pocket_score, 0.0) -> 1.0 intractability, i.e.
+                --     "maximally undruggable", for a target whose pockets were
+                --     never computed. Measured 2026-07-25: 461 of 739
+                --     target_structure rows have top_pocket_score AND
+                --     pocket_count both NULL, and ZERO rows mean "0 pockets
+                --     found" — so a NULL here is ALWAYS "not computed", never a
+                --     measurement. Currently unreachable (all 461 also have a
+                --     NULL structural_tier and so fail every WHERE branch), but
+                --     it is one tier backfill away from crediting ignorance as
+                --     intractability, which inverts this tool's whole thesis.
+                -- Now NULL-propagating: unmeasured yields NULL, and `NULLS LAST`
+                -- below keeps it out of the top instead of at it.
+                CASE
+                    WHEN ts_score.scientific_validation IS NULL
+                      OR ts_score.competitive_intensity IS NULL
+                      OR ts.top_pocket_score IS NULL
+                    THEN NULL
+                    ELSE ts_score.scientific_validation
+                         * (1.0 - ts.top_pocket_score)
+                         * (1.0 - ts_score.competitive_intensity)
+                END AS opportunity_score,
+                -- Name the reason, so an unranked row is legibly unranked rather
+                -- than merely last. Absence of a rank is a finding, not a gap.
+                CASE
+                    WHEN ts_score.scientific_validation IS NULL
+                        THEN 'scientific_validation is unmeasured for this target'
+                    WHEN ts_score.competitive_intensity IS NULL
+                        THEN 'competitive_intensity is unmeasured for this target'
+                    WHEN ts.top_pocket_score IS NULL
+                        THEN 'top_pocket_score was never computed for this structure'
+                END AS unrankable_reason
             FROM targets t
             JOIN target_structure ts ON ts.target_id = t.id
             LEFT JOIN target_scores ts_score ON ts_score.target_id = t.id
@@ -1470,7 +1538,127 @@ class GraphQueries:
                   )
                   {area_filter}
                   {validation_filter}
+                  -- ⚠️ MEASURED, NOT ASSUMED (S17c). `NULLS LAST` alone is NOT
+                  -- a fix, and driving an injected null proved it: with
+                  -- `LIMIT 25` and 25+ rankable rows, an unrankable target is
+                  -- pushed past the limit and DISAPPEARS — silent deletion by
+                  -- truncation, the very failure mode the null-propagation
+                  -- above was meant to prevent. So the ranked list now excludes
+                  -- unmeasured rows EXPLICITLY, and they are returned by
+                  -- `find_undruggable_unrankable()` as their own block where
+                  -- they do not compete for the caller's LIMIT.
+                  AND ts_score.scientific_validation IS NOT NULL
+                  AND ts_score.competitive_intensity IS NOT NULL
+                  AND ts.top_pocket_score IS NOT NULL
             ORDER BY opportunity_score DESC NULLS LAST
+            LIMIT %(limit)s
+        """, params)
+
+    def structural_analysis_coverage(self) -> dict[str, Any]:
+        """How much of the structural layer has actually been pocket-analysed.
+
+        `find_undruggable_targets` admits a target ONLY via `structural_tier` or
+        `top_pocket_score`. Both are NULL for every structure that pocket
+        detection never reached, so those targets cannot appear in it at any
+        threshold — and they do not appear in the `unrankable` block either,
+        because they never qualify as candidates in the first place. They are
+        simply absent, silently.
+
+        Measured 2026-07-25: `compute_druggability.py` ran 2026-05-05..09 over
+        309 of 739 structures and stopped; 461 are unanalysed. So the tool
+        currently draws from **38%** of the structural layer while presenting
+        itself as a survey of it. That is incompleteness, not inaccuracy — but
+        undisclosed incompleteness reads as completeness, which is the same
+        failure this codebase keeps paying for.
+
+        This returns the denominators so the tool can say so out loud. It is a
+        disclosure, not a fix: the fix is running pocket detection (board S24
+        follow-up steps 2-4).
+        """
+        rows = self._execute_safe("""
+            SELECT
+                (SELECT COUNT(*) FROM targets) AS targets_total,
+                (SELECT COUNT(*) FROM target_structure) AS structures_total,
+                (SELECT COUNT(*) FROM target_structure
+                  WHERE top_pocket_score IS NOT NULL) AS analysed,
+                (SELECT COUNT(*) FROM target_structure
+                  WHERE top_pocket_score IS NULL
+                    AND structural_tier IS NULL) AS unanalysed
+        """, {})
+        return dict(rows[0]) if rows else {}
+
+    def find_undruggable_unrankable(
+        self,
+        therapy_area: str | None = None,
+        max_pocket_score: float = 0.4,
+        min_disorder_frac: float = 0.0,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Structurally-qualifying targets that CANNOT be ranked, and why.
+
+        Board S17c. These meet every structural criterion of
+        `find_undruggable_targets` — the structural facts are measured — but a
+        score they are ranked BY is unmeasured, so a position in the ranking
+        would be fiction. They are still legitimate candidates, so they are
+        returned rather than dropped; they are simply not ranked.
+
+        Kept as a separate call, not merged into the ranked list, for the reason
+        the injected-null test exposed: sharing one LIMIT means unrankable rows
+        either displace real opportunities or get truncated away themselves.
+        Returns [] on prod today; populates once board S17e lands.
+        """
+        params: dict[str, Any] = {
+            "max_pocket_score": max_pocket_score,
+            "min_disorder_frac": min_disorder_frac,
+            "limit": limit,
+        }
+        area_filter = ""
+        if therapy_area:
+            area_filter = """
+                AND t.id IN (
+                    SELECT ti2.target_id FROM target_indications ti2
+                    JOIN indications i2 ON i2.id = ti2.indication_id
+                    WHERE LOWER(i2.therapeutic_area) LIKE %(area)s
+                       OR LOWER(i2.name) LIKE %(area)s
+                )
+            """
+            params["area"] = f"%{therapy_area.lower()}%"
+
+        return self._execute_safe(f"""
+            SELECT
+                t.id AS gene_symbol,
+                t.name AS target_name,
+                ts.structural_tier,
+                ts.top_pocket_score,
+                ts.disorder_frac,
+                ts_score.scientific_validation,
+                ts_score.competitive_intensity,
+                CASE
+                    WHEN ts_score.target_id IS NULL
+                        THEN 'this target has no target_scores row at all'
+                    WHEN ts_score.scientific_validation IS NULL
+                        THEN 'scientific_validation is unmeasured for this target'
+                    WHEN ts_score.competitive_intensity IS NULL
+                        THEN 'competitive_intensity is unmeasured for this target'
+                    WHEN ts.top_pocket_score IS NULL
+                        THEN 'top_pocket_score was never computed for this structure'
+                END AS unrankable_reason
+            FROM targets t
+            JOIN target_structure ts ON ts.target_id = t.id
+            LEFT JOIN target_scores ts_score ON ts_score.target_id = t.id
+            WHERE (
+                    ts.structural_tier IN ('challenging', 'undruggable')
+                    OR (ts.top_pocket_score IS NOT NULL
+                        AND ts.top_pocket_score < %(max_pocket_score)s)
+                    OR (ts.disorder_frac IS NOT NULL
+                        AND ts.disorder_frac >= %(min_disorder_frac)s
+                        AND %(min_disorder_frac)s > 0)
+                  )
+                  {area_filter}
+                  AND (ts_score.scientific_validation IS NULL
+                       OR ts_score.competitive_intensity IS NULL
+                       OR ts.top_pocket_score IS NULL)
+            ORDER BY t.id
             LIMIT %(limit)s
         """, params)
 
@@ -2343,19 +2531,94 @@ class GraphQueries:
                 -- already returns. Momentum can come back as a ranking signal once
                 -- the classifier is fixed (it is currently a function of the calendar
                 -- — see the board task on compute_scores' hardcoded 2024-01-01 split).
+                --
+                -- ⚠️ FIXED 2026-07-25 (board S17c). Two null defects, opposite
+                -- in direction, in the same six lines:
+                --   1. `COALESCE(ts.competitive_intensity, 0)` fabricated ZERO
+                --      competition for an unmeasured target — the ANGPTL3 defect,
+                --      and in THIS tool it is the whole claim, because low
+                --      competition IS the whitespace assertion.
+                --   2. `WHERE ts.competitive_intensity < 0.5` DELETED those rows
+                --      anyway: `NULL < 0.5` is NULL, so an unmeasured target
+                --      silently vanished from the JOIN — no row, no note, no
+                --      count. Silent deletion is the worse of the two, because a
+                --      fabricated score can at least be inspected. The
+                --      disappeared rows are precisely the low-coverage targets
+                --      this tool exists to surface.
+                -- The two masked each other: the COALESCE could never fire
+                -- because the WHERE removed every row that would have triggered
+                -- it. Fixing either alone would have exposed the other.
                 CASE
-                    WHEN ts.scientific_validation > 0 AND ts.competitive_intensity >= 0 THEN
-                        ts.scientific_validation * (1.0 - COALESCE(ts.competitive_intensity, 0))
+                    WHEN ts.scientific_validation IS NULL
+                      OR ts.competitive_intensity IS NULL
+                    THEN NULL
+                    WHEN ts.scientific_validation > 0
+                    THEN ts.scientific_validation * (1.0 - ts.competitive_intensity)
                     ELSE 0
                 END AS opportunity_score
             FROM targets t
             JOIN target_scores ts ON ts.target_id = t.id
-            WHERE ts.scientific_validation >= 0.3
+            -- The IS NOT NULL guards are DELIBERATE and now EXECUTABLE rather
+            -- than accidental. A null score cannot support a whitespace CLAIM —
+            -- "nobody is working on this" is exactly the assertion we cannot make
+            -- from an unmeasured competition axis ([[absence_claims_need_a_gate_not_a_prompt]]).
+            -- So these targets stay OUT of the ranked list, but they are counted
+            -- and reported in `_meta` rather than vanishing: deliberate exclusion
+            -- with a number, not silent deletion.
+            WHERE ts.scientific_validation IS NOT NULL
+              AND ts.competitive_intensity IS NOT NULL
+              AND ts.scientific_validation >= 0.3
               AND ts.competitive_intensity < 0.5
               {area_filter}
-            ORDER BY opportunity_score DESC
+            -- ⚠️ `NULLS LAST` is REQUIRED and was absent. Postgres sorts NULLs
+            -- FIRST under DESC, so the moment a null reaches this ORDER BY it is
+            -- crowned at the top of the whitespace list. The guards above make
+            -- that unreachable today; this makes it unreachable if they are ever
+            -- relaxed. Belt and braces, deliberately.
+            ORDER BY opportunity_score DESC NULLS LAST
             LIMIT %(limit)s
         """, params)
+
+    def count_whitespace_excluded_unmeasured(
+        self, therapy_area: str | None = None
+    ) -> int:
+        """Targets kept OUT of `find_whitespace_opportunities` by a NULL score.
+
+        Board S17c. The companion to the `IS NOT NULL` guards above: those
+        targets cannot support a whitespace claim, but their absence must be a
+        reported number rather than a silent deletion. Before this existed the
+        rows simply vanished — `NULL < 0.5` is NULL — with no row, no note and
+        no count, and they are precisely the low-coverage targets the tool is
+        for.
+
+        Deliberately a COUNT and not a list: listing them inside `opportunities`
+        would put unmeasured targets in a block whose entire meaning is "these
+        are opportunities", and consume the caller's LIMIT budget with rows that
+        are not. Returns 0 on prod today (no NULL scores exist yet) and starts
+        moving the moment board S17e lands.
+        """
+        params: dict[str, Any] = {}
+        area_filter = ""
+        if therapy_area:
+            area_filter = """
+                AND t.id IN (
+                    SELECT ti2.target_id FROM target_indications ti2
+                    JOIN indications i2 ON i2.id = ti2.indication_id
+                    WHERE LOWER(i2.therapeutic_area) LIKE %(area)s
+                       OR LOWER(i2.name) LIKE %(area)s
+                )
+            """
+            params["area"] = f"%{therapy_area.lower()}%"
+
+        rows = self._execute_safe(f"""
+            SELECT COUNT(*) AS n
+            FROM targets t
+            JOIN target_scores ts ON ts.target_id = t.id
+            WHERE (ts.scientific_validation IS NULL
+                   OR ts.competitive_intensity IS NULL)
+              {area_filter}
+        """, params)
+        return int(rows[0]["n"]) if rows else 0
 
     def get_org_portfolio(self, org_name: str) -> dict[str, Any]:
         """Get full portfolio for an organization: targets, patents, compounds.

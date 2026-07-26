@@ -1563,6 +1563,9 @@ def mosaic_find_opportunities(params: OpportunityInput) -> str:
     _check_tool_access("mosaic_find_opportunities")
     gq = _gq()
     results = gq.find_whitespace_opportunities(params.therapy_area, params.limit)
+    # S17c: targets a NULL score kept out of the ranked list. Reported, never
+    # silently dropped — they used to vanish because `NULL < 0.5` is NULL.
+    excluded = gq.count_whitespace_excluded_unmeasured(params.therapy_area)
 
     return _json_result({
         "_meta": {
@@ -1572,6 +1575,16 @@ def mosaic_find_opportunities(params: OpportunityInput) -> str:
                 + (f" in {params.therapy_area}" if params.therapy_area else "")
             ),
             "scoring": "opportunity_score = scientific_validation × (1 - competitive_intensity)",
+            "coverage": {
+                "excluded_unmeasured": excluded,
+                "note": (
+                    "Targets whose scientific_validation or competitive_intensity "
+                    "is unmeasured are EXCLUDED from this ranking, not scored as "
+                    "zero: an unmeasured competition axis cannot support the claim "
+                    "'nobody is working on this'. A non-zero count here means the "
+                    "ranked list is not the whole candidate population."
+                ),
+            },
             "hint": "Use mosaic_get_target_profile on any gene_symbol for the full dossier.",
         },
         "opportunities": results,
@@ -1617,7 +1630,19 @@ def mosaic_find_undruggable_targets(params: UndruggableInput) -> str:
         require_validation=params.require_validation,
         limit=params.limit,
     )
-    return _json_result(format_undruggable_targets(rows, params.therapy_area))
+    # S17c: structurally-qualifying candidates that cannot be RANKED because a
+    # score they are ranked by is unmeasured. Fetched separately so they neither
+    # displace real opportunities nor get truncated away by the shared LIMIT —
+    # the failure an injected-null test exposed in the NULLS-LAST-only version.
+    unrankable = gq.find_undruggable_unrankable(
+        therapy_area=params.therapy_area,
+        max_pocket_score=params.max_pocket_score,
+        min_disorder_frac=params.min_disorder_frac,
+        limit=params.limit,
+    )
+    return _json_result(
+        format_undruggable_targets(rows, params.therapy_area, unrankable=unrankable)
+    )
 
 
 # ---------------------------------------------------------------------------
