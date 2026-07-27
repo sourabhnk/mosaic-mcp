@@ -84,9 +84,10 @@ TIER_DAILY_TARGET_LIMITS: dict[Tier, int | None] = {
 # `tests/test_tier_boundary.py::EXPECTED_TIERS`. That test fails on any
 # unclassified tool, so the boundary cannot drift silently.
 #
-# Free tier gets 16 of 44.
+# Free tier gets 17 of 45.
 # ---------------------------------------------------------------------------
 FREE_TOOLS = frozenset({
+    "mosaic_start_here",  # orientation/capability map — always free, never gated
     "mosaic_search_targets",
     "mosaic_get_target_profile",
     "mosaic_get_target_compounds",

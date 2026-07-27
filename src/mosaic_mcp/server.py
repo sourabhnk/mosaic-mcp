@@ -819,6 +819,143 @@ class RelationSearchInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Tool 0: start_here — the front door
+# ---------------------------------------------------------------------------
+#
+# Ported from the hosted server, ADAPTED — not copied. Three things are true on
+# the hosted side and false here, and each would be a confident wrong answer:
+#
+#   1. Hosted enforces a monthly query quota and a daily unique-target limit.
+#      This package enforces NEITHER — it gates tools (`_check_tool_access`) and
+#      counts nothing. Reporting "50 queries/month" here would state a limit that
+#      does not exist. Omitted rather than guessed.
+#   2. Hosted's free tier is activated by a magic link. There is no magic link in
+#      a stdio package; tier comes from MOSAIC_TIER / MOSAIC_API_KEY.
+#   3. Hosted serves Mosaic's curated KG. **This package is bring-your-own-
+#      database** — it queries whatever DATABASE_URL points at, and there is no
+#      shared Mosaic database to connect to. That is the single most important
+#      orientation fact for a pip user and the hosted text never says it, because
+#      for a hosted user it is not true.
+
+_CAPABILITY_GROUPS: list[dict] = [
+    {"group": "Start with one target",
+     "answers": "Everything known about a single gene — profile, scores, druggability, assay precedent.",
+     "tools": ["mosaic_search_targets", "mosaic_get_target_profile", "mosaic_target_scores",
+               "mosaic_assess_druggability", "mosaic_target_validation", "mosaic_get_target_structure"],
+     "example": "mosaic_get_target_profile(gene_symbol='EGFR')"},
+    {"group": "Compounds & chemistry",
+     "answers": "What binds a target, how selective it is, its analogs and polypharmacology.",
+     "tools": ["mosaic_get_target_compounds", "mosaic_compound_selectivity", "mosaic_compound_analogs",
+               "mosaic_compound_polypharmacology", "mosaic_modality_gaps", "mosaic_compare_drugs"],
+     "example": "mosaic_compound_selectivity(compound_id='CHEMBL941')"},
+    {"group": "Clinical & regulatory",
+     "answers": "Trials for a target's drugs, real ClinicalTrials.gov records, FDA status, repurposing.",
+     "tools": ["mosaic_clinical_pipeline", "mosaic_trial_results", "mosaic_regulatory_status",
+               "mosaic_drug_repurposing"],
+     "example": "mosaic_clinical_pipeline(gene_symbol='ERBB2')"},
+    {"group": "Competitive & IP",
+     "answers": "Who is working on a target — patents, organizations, KOLs, talent flow.",
+     "tools": ["mosaic_competitive_landscape", "mosaic_get_target_patents", "mosaic_org_portfolio",
+               "mosaic_kol_finder", "mosaic_talent_migration"],
+     "example": "mosaic_competitive_landscape(gene_symbol='KRAS')"},
+    {"group": "Discovery & white-space",
+     "answers": "Find targets: underexplored, undruggable, synthetic-lethal, resistance-bypass, emerging, similar.",
+     "tools": ["mosaic_find_opportunities", "mosaic_find_undruggable_targets",
+               "mosaic_synthetic_lethal_whitespace", "mosaic_resistance_bypass_map",
+               "mosaic_emerging_signals", "mosaic_find_similar_targets", "mosaic_compare_targets"],
+     "example": "mosaic_find_opportunities(therapy_area='oncology')"},
+    {"group": "Biology & evidence",
+     "answers": "Pathways, network neighborhood, mechanism of action, papers, and the raw evidence trail.",
+     "tools": ["mosaic_pathway_context", "mosaic_target_network", "mosaic_target_mechanisms",
+               "mosaic_evidence_map", "mosaic_relation_search", "mosaic_get_target_papers"],
+     "example": "mosaic_pathway_context(gene_symbol='BRAF')"},
+    {"group": "Indications",
+     "answers": "Targets and compounds for a disease, and fine-grained oncology sub-indications.",
+     "tools": ["mosaic_indication_landscape", "mosaic_list_indications",
+               "mosaic_list_subindications", "mosaic_subindication_breakdown"],
+     "example": "mosaic_indication_landscape(indication_name='non-small cell lung cancer')"},
+    {"group": "Track & request",
+     "answers": "Save targets/orgs to a watchlist, request a target we don't cover yet, or check KG scope.",
+     "tools": ["mosaic_watchlist_create", "mosaic_watchlist_add_item", "mosaic_watchlist_get",
+               "mosaic_watchlist_list", "mosaic_target_wishlist_add", "mosaic_kg_stats"],
+     "example": "mosaic_kg_stats()"},
+]
+
+
+@mcp.tool(
+    name="mosaic_start_here",
+    annotations={
+        "title": "Start Here — what Mosaic can do",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def mosaic_start_here() -> str:
+    """Call this FIRST. Orientation for Mosaic's pre-clinical drug-target
+    intelligence: the full capability map (which tool answers which question),
+    which tools your tier includes, and how results are labelled.
+
+    Deliberately not gated — orientation must always work, including for a free
+    session. It needs no database of its own; if DATABASE_URL is unset or
+    unreachable it still answers, with `_provenance.as_of` null (the shared
+    response wrapper attempts a kg_metadata read and degrades rather than fails).
+    """
+    free = set(FREE_TOOLS)
+    tier = _get_session_tier()
+    groups = [
+        {**g, "tools": [{"name": t, "tier": "free" if t in free else "pro"} for t in g["tools"]]}
+        for g in _CAPABILITY_GROUPS
+    ]
+    # Counted from the map that is actually rendered, so this number cannot drift
+    # away from the list beside it the way a hardcoded "44" would.
+    mapped = {t for g in _CAPABILITY_GROUPS for t in g["tools"]}
+    return _json_result({
+        "what_is_mosaic": (
+            "A pre-clinical drug-target intelligence knowledge graph, delivered as "
+            "MCP tools over an oncology-focused KG (targets, compounds, trials, "
+            "patents, papers, structures, pathways)."
+        ),
+        "this_package_is_bring_your_own_database": (
+            "You are running the stdio `mosaic-mcp` package, which queries whatever "
+            "DATABASE_URL points at. There is no shared Mosaic database to connect "
+            "to, so every count below reflects YOUR database, not Mosaic's hosted KG. "
+            "For the hosted KG use the remote server at https://mcp.getmosaic.dev/sse."
+        ),
+        "why_it_is_different": (
+            "Every count carries a coverage STATE — measured, truncated, or "
+            "no_fetch_evidence — so a low or zero number is never silently read as "
+            "'none exists'. Unlike an LLM with web search, Mosaic tells you what it "
+            "has NOT measured. If a field says truncated/no_fetch_evidence, it is not "
+            "an absence claim."
+        ),
+        "your_tier": {
+            "tier": tier.value,
+            # Both counts are over the map rendered below, NOT over every tool the
+            # package defines — mosaic_start_here is free but is not in the map
+            # (you are already calling it), so a package-wide count would not
+            # reconcile with the list beside it. Name the denominator.
+            "tools_you_can_call_from_the_map": len(free & mapped) if tier is Tier.FREE else len(mapped),
+            "tools_in_the_map": len(mapped),
+            "unlock_pro_locally": (
+                "Set MOSAIC_API_KEY, or MOSAIC_TIER=pro, in the environment of the "
+                "MCP client that launches this server."
+            ),
+            "note": (
+                "This package gates which TOOLS you may call. It does not meter query "
+                "volume — per-month and per-day limits apply to the hosted server, not here."
+            ),
+        },
+        "capabilities": groups,
+        "tip": (
+            "Most workflows start from a gene: call mosaic_get_target_profile(gene_symbol=...) "
+            "then branch into compounds, clinical, or competitive tools from the map above."
+        ),
+    })
+
+
+# ---------------------------------------------------------------------------
 # Tool 1: search_targets
 # ---------------------------------------------------------------------------
 
