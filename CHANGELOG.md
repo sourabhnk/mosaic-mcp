@@ -4,6 +4,31 @@ All notable user-facing changes to the `mosaic-mcp` package. This package
 bundles Mosaic's knowledge-graph query and rendering layer; it is
 bring-your-own-database. Dates are UTC.
 
+## 1.6.0 — 2026-07-27
+
+Adds one tool: an orientation front door. No behaviour changes to the existing 44.
+
+### `mosaic_start_here` — call it first
+
+- Returns the full capability map — all 44 tools in 8 groups, each with what it
+  answers, a runnable example, and whether your tier can call it. The problem it
+  solves: 44 tools with no entry point means a client picks one by name-matching
+  and often picks wrong.
+- **Not gated**, so a free session can always call it, and it needs no database
+  of its own — if `DATABASE_URL` is unset or unreachable it still answers, with
+  `_provenance.as_of` null. Orientation should not fail because setup is
+  incomplete.
+- It states plainly that **this package is bring-your-own-database**: it queries
+  whatever `DATABASE_URL` points at, there is no shared Mosaic database to
+  connect to, and every count reflects *your* database. If you wanted Mosaic's
+  hosted knowledge graph, it points you at `https://mcp.getmosaic.dev/sse`.
+- It does **not** report a monthly query quota or a daily target limit, because
+  this package does not enforce them — it gates which *tools* you may call and
+  meters nothing. Those limits belong to the hosted server. The payload says so
+  rather than leaving you to assume either way.
+
+`mosaic_start_here` is included in the free tier (now 17 tools of 45).
+
 ## 1.5.0 — 2026-07-26
 
 A correctness release. Every change below removes a way the tools could return a

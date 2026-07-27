@@ -127,9 +127,10 @@ getting more honest, not the corpus shrinking.</sub>
 
 ## Changelog
 
-Full history in [CHANGELOG.md](CHANGELOG.md). Latest: **1.5.0** — honest trial
-semantics (developed-against, not incidental), coverage floors, and unmeasured
-scores render as null. Selected older entries below.
+Full history in [CHANGELOG.md](CHANGELOG.md). Latest: **1.6.0** — adds
+`mosaic_start_here`, a free, ungated orientation tool that maps all 44 tools and
+states plainly that this package is bring-your-own-database. Selected older
+entries below.
 
 ### 1.2.0 — breaking change to the watchlist tools
 
