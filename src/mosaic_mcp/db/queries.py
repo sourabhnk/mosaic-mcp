@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import psycopg
@@ -21,6 +22,70 @@ import psycopg
 from mosaic_mcp.db.connection import ConnectionManager, get_pool, get_read_pool
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Target resolution outcomes — reset plan v3, A5
+# ---------------------------------------------------------------------------
+# Until 2026-08-07 `_resolve_target` had exactly two outcomes rendered as one
+# value: it returned the canonical id on a hit, and the input unchanged on a
+# miss. After C3.3 archived 704 of 764 targets, "the input unchanged" covered
+# two completely different answers:
+#
+#     "GBA"                -> "GBA"   (GBA1 is in the KG; we chose not to cover it)
+#     "NOT_A_REAL_GENE_XYZ"-> "NOT_A_REAL_GENE_XYZ"   (never existed)
+#
+# That is this repo's signature defect — two states sharing one value — landing
+# on the product's own central distinction: *we do not cover this* is not *this
+# does not exist*. At 704 archived symbols it is now the most common failure a
+# visitor hits, so it cannot stay a note.
+#
+# PARTNER is declared here although Phase B has not built the tier yet: the
+# resolver reads `targets.tier` when the column exists and reports DOSSIER for
+# every live row when it does not. Wiring the name now means B2 turns it on by
+# adding a column, not by editing this file again.
+RESOLUTION_DOSSIER = "dossier"    # live, and may be the subject of a claim
+RESOLUTION_PARTNER = "partner"    # live, hop destination only — never a subject
+RESOLUTION_ARCHIVED = "archived"  # in archive.*: exists, deliberately out of scope
+RESOLUTION_UNKNOWN = "unknown"    # no row anywhere, in either schema
+
+RESOLUTION_STATES = (
+    RESOLUTION_DOSSIER,
+    RESOLUTION_PARTNER,
+    RESOLUTION_ARCHIVED,
+    RESOLUTION_UNKNOWN,
+)
+
+
+@dataclass(frozen=True)
+class TargetResolution:
+    """What we know about a symbol the caller typed.
+
+    `symbol` carries the canonical id for **every** state except UNKNOWN,
+    including ARCHIVED — "GBA" resolves to "GBA1, archived", which is a far
+    more useful answer than "GBA, never heard of it" and is the whole point of
+    the class.
+
+    `archive_checked` is False on a deployment that has no `archive` schema
+    (production, today). There, ARCHIVED is unreachable and UNKNOWN means "not
+    in the live universe", NOT "does not exist" — an absent detector must not
+    be reported as a negative result. See CLAUDE.md §1.
+    """
+
+    query: str
+    symbol: str | None
+    status: str
+    matched_by: str | None = None
+    archive_checked: bool = False
+
+    @property
+    def is_live(self) -> bool:
+        """True when the symbol resolves to a row in the live universe."""
+        return self.status in (RESOLUTION_DOSSIER, RESOLUTION_PARTNER)
+
+    @property
+    def may_carry_a_claim(self) -> bool:
+        """Only a dossier-tier target may be the subject of a published claim."""
+        return self.status == RESOLUTION_DOSSIER
 
 # gap-fix 8: a partner gene surfaced by the graph but NOT in the curated target
 # set has no KG patent/compound coverage at all — so its "0 patents / 0
@@ -201,32 +266,63 @@ class GraphQueries:
 
     def __init__(self, db: ConnectionManager | None = None) -> None:
         self.db = db or get_read_pool()
+        # Schema-shape probes, cached per instance. Both answer questions about
+        # the DEPLOYMENT, not the data, so they cannot go stale within a
+        # process the way a row count would.
+        self._column_cache: dict[tuple[str, str, str], bool] = {}
+        self._archive_present: bool | None = None
 
-    def _resolve_target(self, symbol: str) -> str:
-        """Resolve a target symbol or name to its canonical ID.
+    # -- resolution -------------------------------------------------------
 
-        Resolution order:
-        1. Direct ID match (exact gene symbol)
-        2. Gene name alias (JSONB array containment)
-        3. Fuzzy name match (case-insensitive LIKE on name/function_description)
-        Returns the canonical ID, or the original symbol if no match found.
+    def _has_column(self, table: str, column: str, schema: str = "public") -> bool:
+        """Cached existence probe. Used to light up `targets.tier` when Phase B
+        adds it, without a second code path here."""
+        key = (schema, table, column)
+        if key not in self._column_cache:
+            rows = self._execute_safe(
+                "SELECT 1 FROM information_schema.columns"
+                " WHERE table_schema = %(sch)s AND table_name = %(t)s"
+                "   AND column_name = %(c)s",
+                {"sch": schema, "t": table, "c": column},
+            )
+            self._column_cache[key] = bool(rows)
+        return self._column_cache[key]
+
+    def _archive_is_present(self) -> bool:
+        """Whether this deployment carries the `archive` schema at all.
+
+        Probed explicitly rather than inferred from an empty result: an absent
+        table makes `_execute_safe` return `[]`, which is exactly the value a
+        present-but-no-match lookup returns. Reporting "not archived" off a
+        missing schema would be `unmeasured_is_not_zero` in the one function
+        written to end it.
         """
-        symbol = symbol.strip().upper()
-        # Direct ID match is the fast path
+        if self._archive_present is None:
+            rows = self._execute_safe(
+                "SELECT to_regclass('archive.targets') IS NOT NULL AS present"
+            )
+            self._archive_present = bool(rows and rows[0].get("present"))
+        return self._archive_present
+
+    def _match_in(self, schema: str, symbol: str) -> tuple[str, str] | None:
+        """(canonical_id, matched_by) for `symbol` in `schema.targets`, or None.
+
+        One resolution order, run against either schema, so the live universe
+        and the archive cannot answer the same question differently.
+        """
         direct = self._execute_safe(
-            "SELECT id FROM targets WHERE id = %(s)s",
-            {"s": symbol},
+            f"SELECT id FROM {schema}.targets WHERE id = %(s)s", {"s": symbol}
         )
         if direct:
-            return symbol
-        # Check gene_names aliases
+            return direct[0]["id"], "id"
+
         alias = self._execute_safe(
-            "SELECT id FROM targets WHERE gene_names @> to_jsonb(%(s)s::text) LIMIT 1",
+            f"SELECT id FROM {schema}.targets"
+            " WHERE gene_names @> to_jsonb(%(s)s::text) LIMIT 1",
             {"s": symbol},
         )
         if alias:
-            logger.info("Resolved alias %s -> %s", symbol, alias[0]["id"])
-            return alias[0]["id"]
+            return alias[0]["id"], "alias"
 
         # Fuzzy name match — allows "epidermal growth factor" -> EGFR.
         #
@@ -246,34 +342,114 @@ class GraphQueries:
         # does not identify one of them, and resolving anyway is guessing.
         # CLAUDE.md §3.5: resolve aggressively at query time, but a wrong edge
         # is worse than a missing one, and that applies to entity resolution
-        # itself.
+        # itself. A5 extends the same rule to the archive: "we archived
+        # something vaguely like what you typed" is a guess too.
         name_query = symbol.lower()
         exact_name = self._execute_safe(
-            "SELECT id FROM targets WHERE LOWER(name) = %(exact)s"
+            f"SELECT id FROM {schema}.targets WHERE LOWER(name) = %(exact)s"
             " ORDER BY LENGTH(name) ASC LIMIT 1",
             {"exact": name_query},
         )
         if exact_name:
-            logger.info("Resolved exact name '%s' -> %s", symbol, exact_name[0]["id"])
-            return exact_name[0]["id"]
+            return exact_name[0]["id"], "name"
 
         substring = self._execute_safe(
-            "SELECT id FROM targets WHERE LOWER(name) LIKE %(q)s"
+            f"SELECT id FROM {schema}.targets WHERE LOWER(name) LIKE %(q)s"
             " ORDER BY LENGTH(name) ASC LIMIT 2",
             {"q": f"%{name_query}%"},
         )
         if len(substring) == 1:
-            logger.info("Resolved name '%s' -> %s", symbol, substring[0]["id"])
-            return substring[0]["id"]
+            return substring[0]["id"], "name_substring"
         if len(substring) > 1:
-            # Ambiguous. Say so out loud — this used to resolve silently.
             logger.warning(
-                "Ambiguous target query %r matches multiple targets "
+                "Ambiguous target query %r matches multiple %s targets "
                 "(e.g. %s); refusing to guess.",
-                symbol, ", ".join(r["id"] for r in substring),
+                symbol, schema, ", ".join(r["id"] for r in substring),
+            )
+        return None
+
+    def resolve_target_status(self, symbol: str) -> TargetResolution:
+        """Resolve a symbol to one of four states — reset plan v3, A5.
+
+        `dossier` · `partner` · `archived` · `unknown`. The archive lookup runs
+        only on a live miss, so the hot path costs exactly what it did before.
+
+        Ordering matters: the live universe is consulted first, so a symbol
+        that is both live and (impossibly) archived answers live. The migration
+        guarantees the two sets are disjoint — measured 2026-08-07, overlap 0 —
+        but the resolver does not depend on that holding.
+        """
+        query = symbol.strip().upper()
+
+        live = self._match_in("public", query)
+        if live:
+            canonical, matched_by = live
+            status = RESOLUTION_DOSSIER
+            if self._has_column("targets", "tier"):
+                rows = self._execute_safe(
+                    "SELECT tier FROM targets WHERE id = %(t)s", {"t": canonical}
+                )
+                tier = (rows[0].get("tier") if rows else None) or RESOLUTION_DOSSIER
+                # Only the two LIVE tiers are accepted here. A row physically
+                # present in `targets` cannot be `archived` or `unknown`, and
+                # honouring such a value would make `is_live` False for a row
+                # that is — sending `_resolve_target` back to the raw input for
+                # a target that exists. B2 constrains the column; this refuses
+                # to trust it anyway.
+                status = tier if tier in (
+                    RESOLUTION_DOSSIER, RESOLUTION_PARTNER) else RESOLUTION_DOSSIER
+                if status != tier:
+                    logger.warning(
+                        "targets.tier for %s is %r, which is not a live tier — "
+                        "treating as %s", canonical, tier, RESOLUTION_DOSSIER)
+            if matched_by != "id":
+                logger.info("Resolved %s (%s) -> %s", query, matched_by, canonical)
+            return TargetResolution(
+                query=query,
+                symbol=canonical,
+                status=status,
+                matched_by=matched_by,
+                archive_checked=False,  # no need to look; it resolved live
             )
 
-        return symbol
+        if not self._archive_is_present():
+            return TargetResolution(
+                query=query, symbol=None, status=RESOLUTION_UNKNOWN,
+                matched_by=None, archive_checked=False,
+            )
+
+        archived = self._match_in("archive", query)
+        if archived:
+            canonical, matched_by = archived
+            logger.info(
+                "Resolved %s (%s) -> %s — ARCHIVED, outside the current scope",
+                query, matched_by, canonical,
+            )
+            return TargetResolution(
+                query=query, symbol=canonical, status=RESOLUTION_ARCHIVED,
+                matched_by=matched_by, archive_checked=True,
+            )
+
+        return TargetResolution(
+            query=query, symbol=None, status=RESOLUTION_UNKNOWN,
+            matched_by=None, archive_checked=True,
+        )
+
+    def _resolve_target(self, symbol: str) -> str:
+        """Resolve a target symbol or name to its canonical **live** ID.
+
+        Return contract UNCHANGED by A5, deliberately: the canonical id when
+        the symbol is in the live universe, the input upper-cased otherwise.
+        27 call sites interpolate this straight into a `WHERE target_id = ...`,
+        and handing them an archived id would turn "no coverage" into "a
+        covered target with no rows" — a worse lie than the one being fixed.
+
+        Callers that need to TELL THE USER which of the four states they hit
+        must call `resolve_target_status`. This one cannot express it; that is
+        the whole reason the other exists.
+        """
+        r = self.resolve_target_status(symbol)
+        return r.symbol if r.is_live else r.query
 
     def resolve_compound_by_name(self, name: str) -> str | None:
         """Resolve a compound by common name (e.g., 'imatinib') to its ID."""
@@ -1124,11 +1300,28 @@ class GraphQueries:
         # the formatter. A DB round-trip inside `format_target_dossier` is what
         # got S15's second half reverted: it broke 7 unit tests that drive the
         # formatters with DB-free fake query objects, and those fakes are right.
-        cov = self._execute_safe("""
-            SELECT axis, state, value, source_available_count, basis, fetched_at
-            FROM target_coverage
-            WHERE target_id = %(t)s
-        """, {"t": target})
+        # `target_coverage` is an OPTIONAL table — present in prod, absent on
+        # branch/BYO databases. Probe with to_regclass FIRST, exactly like every
+        # other optional table in this file (target_essentiality,
+        # target_coessentiality_ext, target_structure_neighbors, …). This one
+        # read had lost the guard, and the cost was not a harmless empty result:
+        # a bare SELECT on a missing table raises UndefinedTable, and
+        # ConnectionManager.execute rolls the whole connection back on ANY
+        # exception (connection.py) *before* this layer swallows it — silently
+        # discarding the caller's in-flight transaction. That is what red-lined
+        # the nightly mutation sweep from 2026-07-24 on: the sweep's
+        # shared-transaction perturbation got rolled back by this unguarded read,
+        # so `before == after` and Detector 2 cried the S5 defect falsely.
+        has_coverage = self._execute_safe(
+            "SELECT to_regclass('target_coverage') AS t"
+        )
+        cov = []
+        if has_coverage and has_coverage[0].get("t"):
+            cov = self._execute_safe("""
+                SELECT axis, state, value, source_available_count, basis, fetched_at
+                FROM target_coverage
+                WHERE target_id = %(t)s
+            """, {"t": target})
         profile["coverage"] = {
             r["axis"]: {
                 "state": r["state"],
@@ -1844,27 +2037,39 @@ class GraphQueries:
                 }
 
         # AlphaMissense variant pathogenicity (per-target rollup).
-        am = self._execute_safe(
-            "SELECT to_regclass('target_variant_pathogenicity') AS t"
-        )
-        if am and am[0].get("t"):
-            row = self._execute_safe(
-                """SELECT uniprot_id, n_variants, mean_score, pct_pathogenic,
-                          hotspot_residues, license
-                   FROM target_variant_pathogenicity WHERE target_id = %(t)s""",
-                {"t": target},
-            )
-            if row:
-                r = row[0]
-                genetic_evidence["alphamissense"] = {
-                    "uniprot_id": r["uniprot_id"],
-                    "n_missense_variants": int(r["n_variants"] or 0),
-                    "mean_pathogenicity": float(r["mean_score"] or 0),
-                    "pct_pathogenic": float(r["pct_pathogenic"] or 0),
-                    "hotspot_residues": r["hotspot_residues"] or [],
-                    "license": r["license"],
-                    "source": "AlphaMissense (DeepMind, 2023)",
-                }
+        #
+        # ⛔ WITHHELD 2026-08-03 — reset plan C1.3. AlphaMissense is licensed
+        # CC BY-NC-SA 4.0. That is not an inference: the upstream file's own
+        # first line reads `# Licensed under CC BY-NC-SA 4.0 license`
+        # (AlphaMissense_aa_substitutions.tsv.gz, fetched and read 2026-08-03),
+        # and `enrich_alphamissense.py` writes `license='CC-BY-NC-SA-4.0'` onto
+        # every one of the 322 rows.
+        #
+        # This block was reached only from `mosaic_target_validation`, a **Pro**
+        # tool — i.e. non-commercially-licensed data inside a paid product. The
+        # enrichment script's own docstring anticipated exactly this and said
+        # the flag exists "so the tool layer can enforce". **Nothing ever read
+        # it.** The licence string was carried all the way into the payload and
+        # then ignored: a label mistaken for a control.
+        #
+        # The rows are NOT deleted. They are evidence of what was served, the
+        # table is the cheapest path back if the licence question resolves the
+        # other way, and deleting them would erase the record of the cause.
+        #
+        # Restoring this needs a licence determination, not a code change. If it
+        # is restored, gate on tier at the TOOL layer where the tier is known —
+        # this function cannot see it, which is why the original design failed.
+        genetic_evidence["alphamissense"] = {
+            "state": "withheld_licence",
+            "reason": (
+                "AlphaMissense is CC BY-NC-SA 4.0 (non-commercial, share-alike). "
+                "Mosaic is a commercial product, so this evidence class is "
+                "withheld rather than served."
+            ),
+            "source": "AlphaMissense (DeepMind, 2023)",
+            "upstream_licence": "CC-BY-NC-SA-4.0",
+            "withheld_since": "2026-08-03",
+        }
 
         return {
             "target": symbol,
@@ -3127,17 +3332,49 @@ class GraphQueries:
             score = round(
                 driver * (1.0 / (1 + patents_b)) * (1 + math.log1p(val_b)), 4
             ) if in_kg else None
+            # Shared-pathway count, and the basis label that depends on it.
+            #
+            # `sp` counts rows in `target_pathways`, which is keyed to the
+            # curated universe — so for a partner OUTSIDE it, `sp` is
+            # structurally 0. That is the same trap `patents_b` carries above.
+            # Publishing 0 says "we looked for shared pathways and found none"
+            # when the truth is "we could not look", and deriving `ppi_only`
+            # from it repeats the error one level up: the row gets labelled
+            # "protein interaction alone" when it should say "protein
+            # interaction, pathways unassessed".
+            #
+            # Found by the sweep on 2026-08-07, the first run after this tool
+            # went from one anchor to five: every `coupled_unassessed` row
+            # reported `shared_pathways = 0` while every other unknown on the
+            # same row was correctly `null`. One field away from the fix.
+            sp = int(r["sp"] or 0) if in_kg else None
+            if basis != "ppi_pathway_proxy":
+                basis_out = basis            # real co-essentiality; sp irrelevant
+            elif not in_kg:
+                basis_out = "ppi_pathways_unassessed"
+            elif sp:
+                basis_out = "ppi_pathway_proxy"
+            else:
+                basis_out = "ppi_only"
+
             cands.append({
+                # FINDING 6: `druggability_tier` was rendered on both the anchor
+                # and the partner and is NULL on 100% of `targets` rows
+                # (PRE-C3.3 §P3 measured it; nothing writes it but
+                # `run_repro.py`, into a throwaway repro database). A key that
+                # is always null reads as "we measured this, and the answer is
+                # nothing" — `constant-columns-render-like-data`, on a paid
+                # tool. Dropped from this payload rather than published as data.
+                # Drop-or-backfill across the rest of the product is a standing
+                # open decision and not this tool's to make.
                 "anchor": {"symbol": r["a"], "name": r["a_name"],
-                           "target_class": r["a_class"],
-                           "druggability_tier": r["a_tier"]},
+                           "target_class": r["a_class"]},
                 "whitespace_partner": {
                     "symbol": r["b"],
                     # When partner is not a Mosaic target tb columns are NULL —
                     # surface that distinction so the UI/agent can flag it.
                     "name": r["b_name"],
                     "target_class": r["b_class"],
-                    "druggability_tier": r["b_tier"],
                     "in_mosaic_kg": bool(r.get("b_in_mosaic")),
                     # gap-fix 8: out-of-set partner counts are not whitespace —
                     # Mosaic doesn't cover the gene. Render "not assessed".
@@ -3150,11 +3387,48 @@ class GraphQueries:
                     "patent_count": patents_b if in_kg else None,
                     "compound_count": int(r["compounds_b"] or 0) if in_kg else None,
                     "validation_evidence": val_b if in_kg else None,
+                    # FINDING 6: `druggability_tier` is NULL on 100% of rows of
+                    # `targets` (PRE-C3.3 §P3) and was rendered on every row of
+                    # a paid tool. A key that is always null reads as "measured,
+                    # and the answer is nothing". Dropped here rather than
+                    # published as data; drop-or-backfill across the rest of the
+                    # product is an open decision, not this tool's to make.
+                    # FINDING 4: the competition filter is `max_phase_b < 1`,
+                    # and it is correct — `compounds.max_phase` discriminates
+                    # (1,569 rows at phase 4). What it cannot see is an
+                    # incomplete edge set. GRIN1 passed as whitespace holding
+                    # 176 compounds of which every one is phase 0, because the
+                    # stored set is the ChEMBL assay tail and not the approved
+                    # NMDA drugs that exist in the world. A well-populated
+                    # target with no clinical compound at all is a claim about
+                    # our coverage as much as about the world, and the caller
+                    # has to be told which.
+                    "clinical_absence_caveat": (
+                        (f"{int(r['compounds_b'] or 0)} compounds are linked to "
+                         f"{r['b']} and none has reached phase 1. For a target "
+                         f"with this much chemistry that more likely reflects "
+                         f"an incomplete compound set than a genuine absence of "
+                         f"clinical interest — verify before treating 'no "
+                         f"clinical compound' as a finding.")
+                        if in_kg and int(r["compounds_b"] or 0) >= 25 else None),
                 },
                 "co_functionality_proxy": co_func,
                 "co_essentiality_r": coess_r if coess_r > 0 else None,
-                "co_functionality_basis": basis,
-                "shared_pathways": int(r["sp"] or 0),
+                # FINDING 2/3: name only the signals that actually contributed.
+                #
+                # ...and only where they could be checked. `sp` counts rows in
+                # `target_pathways`, which is keyed to the curated universe, so
+                # for a partner outside it `sp` is STRUCTURALLY 0 — the same
+                # trap `patents_b` carries a few lines up. Reporting 0 there
+                # says "we looked for shared pathways and found none" when the
+                # truth is "we could not look", and labelling the row
+                # `ppi_only` on the strength of it repeats the mistake one
+                # level up. Caught by the sweep on 2026-08-07, once the tool
+                # was driven across five anchors instead of one: every single
+                # `coupled_unassessed` row reported `shared_pathways = 0` while
+                # every other unknown on that same row was correctly `null`.
+                "co_functionality_basis": basis_out,
+                "shared_pathways": sp,
                 "ppi_confidence": round(conf_norm, 4),
                 # Always measured — it is the only thing we know about an
                 # out-of-coverage partner, and the key its list is ranked by.
@@ -3183,10 +3457,48 @@ class GraphQueries:
         assessable.sort(key=lambda c: c["whitespace_score"], reverse=True)
         unassessed.sort(key=lambda c: c["coupling_strength"], reverse=True)
 
+        # FINDING 5. The structured fields did their job — an unassessed partner
+        # carries null counts, a null whitespace_score and an explicit
+        # not_assessed_reason. Then `suggested_approach` handed the reader
+        # "RALGDS as a synthetic-lethal monotherapy in KRAS-altered tumors":
+        # a confident therapeutic recommendation, on the exact gene whose result
+        # this project withdrew a paper over, generated for a row the tool has
+        # just finished saying it did not assess.
+        #
+        # A caveat in a sibling field does not survive a model reading the
+        # sentence. Prose is the last place an absence claim gets back in, which
+        # is the same mechanism the C6.2 truncation rule exists for. So the
+        # unassessed list states the coupling and stops.
+        for c in unassessed:
+            p = c["whitespace_partner"]["symbol"]
+            a = c["anchor"]["symbol"]
+            c["suggested_approach"] = (
+                f"Lead only: {p} is coupled to {a} "
+                f"(coupling {c['coupling_strength']}), but {p} is outside "
+                f"Mosaic's curated universe, so its patents, compounds and "
+                f"clinical status are UNMEASURED — not zero. Assess {p} before "
+                f"forming any hypothesis about it."
+            )
+
         cands = assessable
         n_real = sum(1 for c in cands[:limit]
                      if c["co_functionality_basis"] == "depmap_coessentiality")
         n_non_mosaic = len(unassessed)
+        assessed_fraction = (
+            len(assessable) / (len(assessable) + n_non_mosaic)
+            if (assessable or n_non_mosaic) else 0.0
+        )
+        # FINDING 2/3. `co_functionality_basis` said `ppi_pathway_proxy` for
+        # every fallback row, including the 8 of 10 whose `shared_pathways` is
+        # 0 — so the label named two signals where one had contributed. The row
+        # data always said so; the label did not, and the label is what a
+        # reader trusts. `_relabel_basis` (below) splits it, and the counts here
+        # let a caller see at a glance how much of the result rests on protein
+        # interaction alone rather than on co-essentiality.
+        n_ppi_only = sum(1 for c in cands[:limit]
+                         if c["co_functionality_basis"] == "ppi_only")
+        n_proxy = sum(1 for c in cands[:limit]
+                      if c["co_functionality_basis"] == "ppi_pathway_proxy")
         if has_coess_ext:
             method = ("DepMap Mosaic-vs-all-genes coessentiality where "
                       "available, else PPI + shared-pathway proxy")
@@ -3218,12 +3530,50 @@ class GraphQueries:
                 "zero, so they carry null counts and no whitespace_score. Do "
                 "not describe them as uncontested."
             ),
-            "sufficient_for_absence_claim": bool(cands),
+            # FINDING 1 (2026-08-04, first drive of this tool). This was
+            # `bool(cands)` — "we found rows", which is not a statement about
+            # evidence at all. Measured on KRAS: it returned True with 38
+            # assessed partners against 768 outside the universe, i.e. it
+            # authorised an absence claim over a coupled set that was 95%
+            # unexamined. That is `unmeasured_is_not_zero` inside the one field
+            # whose entire job is to prevent it.
+            #
+            # The rule now: an absence claim needs candidates AND a coupled set
+            # that was mostly assessable. The fraction is published beside the
+            # verdict so a caller can disagree with the threshold rather than
+            # having to trust it.
+            "sufficient_for_absence_claim": bool(cands) and assessed_fraction >= 0.5,
+            "assessed_fraction": round(assessed_fraction, 4),
+            "assessed_fraction_note": (
+                f"{len(assessable)} of {len(assessable) + n_non_mosaic} coupled "
+                f"partners are inside the curated universe and therefore "
+                f"assessable. An absence claim over the coupled set is only "
+                f"supportable when most of it was assessed; this run is "
+                f"{assessed_fraction:.1%}."
+            ),
             "method": method,
             "depmap_loaded": has_any_coess,
             "depmap_extended_loaded": has_coess_ext,
             "string_extended_loaded": has_ppi_ext,
             "candidates_using_real_coessentiality": n_real,
+            "candidates_using_ppi_only": n_ppi_only,
+            "candidates_using_ppi_and_pathway": n_proxy,
+            # FINDING 2/3, stated where a reader will see it. Measured on KRAS:
+            # 1 of 10 candidates rested on DepMap co-essentiality and 8 on
+            # protein interaction with no shared pathway at all. The tool is
+            # named for synthetic lethality; on most rows the evidence is that
+            # two proteins interact. That is a legitimate hypothesis generator
+            # and a poor synthetic-lethal claim, and the difference belongs in
+            # the payload rather than in the reader's assumptions.
+            "basis_note": (
+                f"{n_real} of {len(cands[:limit])} returned candidates rest on "
+                f"DepMap co-essentiality. {n_ppi_only} rest on protein "
+                f"interaction ALONE (no shared pathway) and {n_proxy} on "
+                f"interaction plus a shared pathway. A proxy row is a "
+                f"hypothesis about functional coupling, not measured synthetic "
+                f"lethality — read `co_functionality_basis` per row before "
+                f"describing any of them as synthetic-lethal."
+            ),
             "candidates_outside_mosaic_kg": n_non_mosaic,
         }
 

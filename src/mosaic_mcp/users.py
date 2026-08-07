@@ -84,7 +84,14 @@ TIER_DAILY_TARGET_LIMITS: dict[Tier, int | None] = {
 # `tests/test_tier_boundary.py::EXPECTED_TIERS`. That test fails on any
 # unclassified tool, so the boundary cannot drift silently.
 #
-# Free tier gets 17 of 45.
+# Free tier gets 5 of 9, after C3.3 step 3 cut 36 tools to the dossier keep-set
+# (2026-08-07). Counted, not assumed: 9 is `^def mosaic_*` in
+# src/mcp/server.py, 5 is len(FREE_TOOLS).
+#
+# 12 of the previous 17 free names no longer resolve to a tool. That matters
+# beyond tidiness: this list is rendered VERBATIM into the paid-tier refusal a
+# user reads, so a stale name advertises a tool that would 404 on call. The
+# invariant in tests/test_tier_boundary.py is what catches it.
 # ---------------------------------------------------------------------------
 FREE_TOOLS = frozenset({
     "mosaic_get_target_profile",

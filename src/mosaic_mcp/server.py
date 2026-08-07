@@ -29,7 +29,10 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from mosaic_mcp.db.connection import ConnectionManager, get_read_pool
-from mosaic_mcp.db.queries import GraphQueries
+from mosaic_mcp.db.queries import (
+    GraphQueries,
+    RESOLUTION_ARCHIVED,
+)
 from mosaic_mcp.users import (
     FREE_TOOLS,
     TIER_RESULT_LIMITS,
@@ -906,15 +909,51 @@ def mosaic_get_target_profile(params: GeneSymbolInput) -> str:
     profile = gq.get_target_deep_profile(symbol)
 
     if profile is None:
+        # A5 — the miss is no longer one answer. Ask the resolver WHICH miss
+        # this is before writing a sentence about it. A pip install points at
+        # the user's OWN database, so `archive_checked` is usually False here
+        # and the message says so rather than implying a check that never ran.
+        res = gq.resolve_target_status(symbol)
+
+        if res.status == RESOLUTION_ARCHIVED:
+            canonical = res.symbol or symbol
+            named = (
+                f"'{symbol}' ({canonical})" if canonical != symbol else f"'{symbol}'"
+            )
+            return _json_result({
+                "error": (
+                    f"{named} is in this Mosaic KG but OUTSIDE the current "
+                    f"dossier scope{_as_of_clause()}. The data is held and "
+                    "coverage was deliberately narrowed; this is a scope "
+                    "decision, not a gap in the underlying graph and not a "
+                    "claim about the gene."
+                ),
+                "target": symbol,
+                "resolved_target": canonical,
+                "resolution_status": res.status,
+                "wishlist_cta": (
+                    f"{canonical} can be restored to the covered set — request "
+                    "it via mosaic_target_wishlist_add."
+                ),
+            })
+
         wellknown = symbol in WELL_KNOWN_TARGETS
+        coverage_sentence = (
+            "This is a coverage statement, not a claim that the gene does not "
+            "exist."
+            if res.archive_checked else
+            "This deployment cannot distinguish 'archived' from 'never "
+            "ingested' — it carries no archive schema."
+        )
         return _json_result({
             "error": (
                 f"'{symbol}' is not in the current Mosaic KG "
                 f"(curated oncology target set{_as_of_clause()}). "
-                "This is a coverage statement, not a claim that the gene "
-                "does not exist."
+                f"{coverage_sentence}"
             ),
             "target": symbol,
+            "resolution_status": res.status,
+            "archive_checked": res.archive_checked,
             "wishlist_cta": (
                 f"{symbol} is a well-characterised target — flag it via "
                 "mosaic_target_wishlist_add to prioritise coverage."

@@ -858,31 +858,94 @@ def format_compare_targets(results: list[dict]) -> dict[str, Any]:
     }
 
 
+# `get_clinical_pipeline` caps its trial roster at this many rows. Named here
+# so the formatter can say "at least N" rather than republishing a LIMIT as a
+# total. Keep in step with the LIMIT in queries.get_clinical_pipeline.
+CLINICAL_PIPELINE_ROSTER_CAP = 50
+
+# CT.gov's own vocabulary. `NA` is observational — not-applicable, NOT phase 0.
+_CTGOV_PHASE_LABEL = {
+    "PHASE4": "Phase 4",
+    "PHASE3": "Phase 3",
+    "PHASE2": "Phase 2",
+    "PHASE1": "Phase 1",
+    "EARLY_PHASE1": "Early Phase 1",
+    "NA": "Not applicable (observational)",
+}
+
+
 def format_clinical_pipeline(data: dict[str, Any]) -> dict[str, Any]:
-    """Wrap get_clinical_pipeline() output."""
+    """Wrap get_clinical_pipeline() output.
+
+    ⚠️ FIXED 2026-08-07 (reset plan v3, A3). This read
+    ``p.get("trial_phase") or p.get("max_phase") or 0``. The rows carry neither
+    key — `get_clinical_pipeline` emits ``phase`` (CT.gov's 'PHASE4' / 'PHASE2'
+    / 'NA') and ``compound_max_phase`` — so **every row fell through to 0** and
+    the tool rendered, for EGFR:
+
+        "50 compound-indication pairs in clinical development. Phase 0: 50"
+
+    against a roster that is 29 PHASE4 and 21 PHASE3. Measured on production
+    2026-08-07, so this has been shipping. It is S5 exactly — a phase field
+    with one distinct value rendering approved drugs as preclinical — in the
+    formatter rather than the query.
+
+    It surfaced only because C3.3 archived TP53's extra trials, which pushed
+    the fifth anchor up to the roster cap; with 38 rows there, the sweep saw
+    variation in the COUNT and never looked at the KEY. A detector that reads
+    "one distinct value across anchors" cannot see a field that is uniformly
+    wrong until the counts happen to line up.
+
+    Two guards against a repeat:
+      * an unrecognised phase is labelled `unknown`, never `0`. A missing
+        measurement must not share a value with a real phase.
+      * the roster cap is reported instead of being republished as a total,
+        so "N in clinical development" cannot be read as a complete count.
+        Plan v3's truncation rule: a truncated axis may support presence
+        claims, never absence claims.
+    """
     target = data.get("target", "?")
     pipeline = data.get("pipeline", [])
 
-    # Group by phase
-    by_phase: dict[int, int] = {}
+    by_phase: dict[str, int] = {}
     for p in pipeline:
-        phase = p.get("trial_phase") or p.get("max_phase") or 0
-        by_phase[phase] = by_phase.get(phase, 0) + 1
+        raw = p.get("phase")
+        if raw:
+            label = _CTGOV_PHASE_LABEL.get(str(raw).upper(), str(raw))
+        else:
+            mp = p.get("compound_max_phase")
+            label = f"Phase {int(mp)}" if mp not in (None, "") and int(mp) >= 1 else "unknown"
+        by_phase[label] = by_phase.get(label, 0) + 1
 
-    return {
+    returned = len(pipeline)
+    capped = returned >= CLINICAL_PIPELINE_ROSTER_CAP
+    at_least = "at least " if capped else ""
+    payload: dict[str, Any] = {
         "_meta": {
             "tool": "mosaic_clinical_pipeline",
             "description": f"Clinical development pipeline for {target}",
             "interpretation": (
-                f"{len(pipeline)} compound-indication pairs in clinical development. "
-                + ", ".join(f"Phase {k}: {v}" for k, v in sorted(by_phase.items(), reverse=True))
+                f"{at_least}{returned} compound-indication pairs in clinical "
+                "development. "
+                + ", ".join(f"{k}: {v}" for k, v in sorted(
+                    by_phase.items(), key=lambda kv: (-kv[1], kv[0])))
             ),
         },
         "target": target,
         "pipeline": pipeline,
         "phase_distribution": by_phase,
-        "total_entries": len(pipeline),
+        "returned": returned,
+        "total_entries": returned,
     }
+    if capped:
+        payload["truncated"] = True
+        payload["_note"] = (
+            f"The trial roster is capped at {CLINICAL_PIPELINE_ROSTER_CAP} rows, "
+            f"and {returned} came back — read this as 'at least "
+            f"{CLINICAL_PIPELINE_ROSTER_CAP}', not as the total. It cannot "
+            "support a claim about what is ABSENT from the pipeline."
+        )
+    return payload
 
 
 _TIER_DESCRIPTIONS = {
