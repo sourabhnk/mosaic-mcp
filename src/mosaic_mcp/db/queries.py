@@ -56,6 +56,27 @@ RESOLUTION_STATES = (
 )
 
 
+class NotADossierSubject(Exception):
+    """Raised when a non-dossier symbol reaches a claim-bearing code path.
+
+    Reset plan v3, B2: *"Every claim-bearing path asserts `tier = 'dossier'`
+    and raises otherwise."*
+
+    RAISED, not returned, and the distinction is the whole point. A returned
+    error value is one `if` away from being ignored, and this codebase's entire
+    defect history is well-formed values that meant something other than they
+    appeared to. An exception cannot be silently treated as success by a caller
+    that forgot to check.
+
+    "Claim-bearing" means: anything whose output becomes a published assertion
+    about a target — the evidence bundle and the dossier synthesis that reads
+    it. It deliberately does NOT mean the read tools. A user asking about a
+    partner-tier gene should get an honest answer about what we hold, not a
+    stack trace; see `mosaic_get_target_profile`, which resolves the tier and
+    says so in the payload.
+    """
+
+
 @dataclass(frozen=True)
 class TargetResolution:
     """What we know about a symbol the caller typed.
@@ -271,6 +292,7 @@ class GraphQueries:
         # process the way a row count would.
         self._column_cache: dict[tuple[str, str, str], bool] = {}
         self._archive_present: bool | None = None
+        self._partner_tier_present: bool | None = None
 
     # -- resolution -------------------------------------------------------
 
@@ -287,6 +309,24 @@ class GraphQueries:
             )
             self._column_cache[key] = bool(rows)
         return self._column_cache[key]
+
+    def _partner_tier_is_present(self) -> bool:
+        """Whether this deployment carries the partner tier at all.
+
+        Probed explicitly for the same reason as `_archive_is_present`: an
+        absent table makes `_execute_safe` return `[]`, which is the value a
+        present-but-no-match lookup also returns. Reporting "not a partner" off
+        a missing table would be `unmeasured_is_not_zero` inside the resolver.
+
+        Genuinely absent in two places today: production (until Phase C) and
+        every pip install, which is BYO-database.
+        """
+        if self._partner_tier_present is None:
+            rows = self._execute_safe(
+                "SELECT to_regclass('public.target_partners') IS NOT NULL AS present"
+            )
+            self._partner_tier_present = bool(rows and rows[0].get("present"))
+        return self._partner_tier_present
 
     def _archive_is_present(self) -> bool:
         """Whether this deployment carries the `archive` schema at all.
@@ -374,43 +414,56 @@ class GraphQueries:
         `dossier` · `partner` · `archived` · `unknown`. The archive lookup runs
         only on a live miss, so the hot path costs exactly what it did before.
 
-        Ordering matters: the live universe is consulted first, so a symbol
-        that is both live and (impossibly) archived answers live. The migration
-        guarantees the two sets are disjoint — measured 2026-08-07, overlap 0 —
-        but the resolver does not depend on that holding.
+        ORDER, and each step is a decision:
+
+        1. `targets` — dossier. Membership of that table IS the tier (B2), so
+           there is nothing further to consult.
+        2. `target_partners` — partner.
+        3. `archive.targets` — archived.
+        4. otherwise unknown.
+
+        Step 2 before step 3 matters and is not arbitrary. 103 of the 2,717
+        partners are ALSO in `archive.targets` — genes archived out of the
+        dossier universe that the CRISPR screens then surfaced as neighbours.
+        For those, `partner` is the true and more useful answer: they are in
+        scope now, as hop destinations. `archived` would say we hold nothing
+        current about them, which is wrong.
+
+        B2 REPLACED THE A5 HOOK. A5 read `targets.tier` on the assumption B2
+        would add a column. It did not: 168 SQL sites already read `targets`,
+        43 of them in the scorer, so a tier column would have changed their
+        meaning without editing them. The tier is a separate table, and the
+        column read is gone rather than left as dead code that would silently
+        take precedence if anyone ever added the column.
         """
         query = symbol.strip().upper()
 
         live = self._match_in("public", query)
         if live:
             canonical, matched_by = live
-            status = RESOLUTION_DOSSIER
-            if self._has_column("targets", "tier"):
-                rows = self._execute_safe(
-                    "SELECT tier FROM targets WHERE id = %(t)s", {"t": canonical}
-                )
-                tier = (rows[0].get("tier") if rows else None) or RESOLUTION_DOSSIER
-                # Only the two LIVE tiers are accepted here. A row physically
-                # present in `targets` cannot be `archived` or `unknown`, and
-                # honouring such a value would make `is_live` False for a row
-                # that is — sending `_resolve_target` back to the raw input for
-                # a target that exists. B2 constrains the column; this refuses
-                # to trust it anyway.
-                status = tier if tier in (
-                    RESOLUTION_DOSSIER, RESOLUTION_PARTNER) else RESOLUTION_DOSSIER
-                if status != tier:
-                    logger.warning(
-                        "targets.tier for %s is %r, which is not a live tier — "
-                        "treating as %s", canonical, tier, RESOLUTION_DOSSIER)
             if matched_by != "id":
                 logger.info("Resolved %s (%s) -> %s", query, matched_by, canonical)
             return TargetResolution(
                 query=query,
                 symbol=canonical,
-                status=status,
+                status=RESOLUTION_DOSSIER,
                 matched_by=matched_by,
                 archive_checked=False,  # no need to look; it resolved live
             )
+
+        if self._partner_tier_is_present():
+            partner = self._execute_safe(
+                "SELECT symbol FROM target_partners WHERE symbol = %(s)s",
+                {"s": query},
+            )
+            if partner:
+                return TargetResolution(
+                    query=query,
+                    symbol=partner[0]["symbol"],
+                    status=RESOLUTION_PARTNER,
+                    matched_by="id",
+                    archive_checked=False,
+                )
 
         if not self._archive_is_present():
             return TargetResolution(
@@ -433,6 +486,78 @@ class GraphQueries:
         return TargetResolution(
             query=query, symbol=None, status=RESOLUTION_UNKNOWN,
             matched_by=None, archive_checked=True,
+        )
+
+    def _uncounted_partner_symbols(self) -> set[str]:
+        """Partner symbols whose activity counts have never been fetched — B3.
+
+        Returns a SET, and the empty set means "nothing is uncounted", which is
+        only reachable when the table exists and every row has been counted. On
+        a deployment with no partner tier this returns empty for a different
+        reason, and that is deliberately safe in this one direction: with no
+        partner tier there are no partner candidates to exclude.
+
+        NOT cached on the instance, unlike the schema probes. This is a
+        statement about DATA, and B3's counting job mutates it as it runs — a
+        cached copy would keep excluding partners that have since been counted,
+        which decays silently and in the direction of looking correct.
+        """
+        if not self._partner_tier_is_present():
+            return set()
+        rows = self._execute_safe(
+            """
+            SELECT symbol FROM target_partners
+            WHERE papers_state    NOT IN ('measured', 'measured_zero')
+               OR patents_state   NOT IN ('measured', 'measured_zero')
+               OR compounds_state NOT IN ('measured', 'measured_zero')
+            """
+        )
+        return {r["symbol"] for r in rows}
+
+    def assert_may_carry_a_claim(self, symbol: str) -> TargetResolution:
+        """Gate for claim-bearing paths. Returns the resolution or raises.
+
+        Reset plan v3, B2. Every one of the four states except `dossier` is
+        refused, and each refusal says something different, because "we do not
+        cover this" and "this is a neighbour we only counted" and "we have
+        never heard of this" are three different sentences to put in front of a
+        reader.
+
+        The partner case carries the rule verbatim from v3's own table — a
+        partner *may appear in a dossier, only as a named neighbour with a
+        count* — so a caller that hits this knows the fix is to cite the gene
+        as a neighbour, not to widen the tier.
+        """
+        r = self.resolve_target_status(symbol)
+        if r.may_carry_a_claim:
+            return r
+        if r.status == RESOLUTION_PARTNER:
+            raise NotADossierSubject(
+                f"{r.symbol} is PARTNER tier. It may appear in a dossier only "
+                "as a named neighbour with a count — never as the subject, and "
+                "it may not carry a published claim. Partner-tier genes have "
+                "identity and activity counts only; there is no depth behind "
+                "them to support one."
+            )
+        if r.status == RESOLUTION_ARCHIVED:
+            raise NotADossierSubject(
+                f"{r.query} resolves to {r.symbol}, which is ARCHIVED — it "
+                "exists in the KG and is deliberately outside the current "
+                "dossier scope. Restore it (scripts/restore_archived_target.py) "
+                "before making claims about it, or pick a covered target."
+            )
+        # Built as a plain string, NOT a multi-line expression inside f-string
+        # braces: that is PEP 701 and needs Python 3.12, while the Modal image
+        # is debian_slim(python_version="3.11"). It would parse here and be a
+        # SyntaxError in the container — a break that no local test can see.
+        archive_note = (
+            "" if r.archive_checked
+            else " (archive not checked: this deployment has no archive schema)"
+        )
+        raise NotADossierSubject(
+            f"{r.query} is UNKNOWN — no row in the dossier set, the partner "
+            f"tier{archive_note} or the archive. A claim needs a subject that "
+            "exists."
         )
 
     def _resolve_target(self, symbol: str) -> str:
@@ -3262,7 +3387,31 @@ class GraphQueries:
                      WHERE ct.target_id = pr.b) AS max_phase_b,
                    (SELECT COUNT(*) FROM paper_validations WHERE target_id = pr.b)
                      AS validation_b,
-                   (EXISTS (SELECT 1 FROM targets WHERE id = pr.b)) AS b_in_mosaic
+                   (EXISTS (SELECT 1 FROM targets WHERE id = pr.b)) AS b_in_mosaic,
+                   -- B4 — the partner tier joins the universe, but ONLY where
+                   -- its counts were actually fetched.
+                   --
+                   -- Every count above is keyed on `targets`, so for a partner
+                   -- gene they are structurally 0 and `patents_b < 5` is
+                   -- vacuously true. Admitting partners on membership alone
+                   -- would therefore hand the whitespace score its maximum to
+                   -- every gene nobody has counted — RALGDS at 2,687x. So
+                   -- membership is not the test; MEASUREMENT is.
+                   --
+                   -- `patents_b_partner` is NULL for an uncounted partner, and
+                   -- NULL is what the B3 exclusion keys on downstream. A
+                   -- counted partner brings its own numbers, taken from
+                   -- target_partners rather than from tables it has no rows in.
+                   (SELECT tp.patents_count FROM target_partners tp
+                     WHERE tp.symbol = pr.b
+                       AND tp.patents_state IN ('measured', 'measured_zero'))
+                     AS patents_b_partner,
+                   (SELECT tp.compounds_count FROM target_partners tp
+                     WHERE tp.symbol = pr.b
+                       AND tp.compounds_state IN ('measured', 'measured_zero'))
+                     AS compounds_b_partner,
+                   (EXISTS (SELECT 1 FROM target_partners tp
+                             WHERE tp.symbol = pr.b)) AS b_is_partner
             FROM pairs pr
             WHERE pr.b <> pr.a
         )
@@ -3271,6 +3420,7 @@ class GraphQueries:
         -- richer DepMap / STRING extended tables).
         SELECT s.a, s.b, s.conf, s.sp, s.coess_r, s.patents_b, s.compounds_b,
                s.max_phase_b, s.validation_b, s.b_in_mosaic,
+               s.b_is_partner, s.patents_b_partner, s.compounds_b_partner,
                ta.name AS a_name, ta.target_class AS a_class,
                ta.druggability_tier AS a_tier,
                tb.name AS b_name, tb.target_class AS b_class,
@@ -3288,6 +3438,12 @@ class GraphQueries:
         -- three-axis design collapsed to single-axis PPI on exactly the rows
         -- that survived. Split explicitly; the caller gets two lists.
         WHERE (s.b_in_mosaic AND s.patents_b < 5 AND s.max_phase_b < 1)
+           -- B4: a COUNTED partner is assessable on its own numbers. An
+           -- uncounted one still arrives here (it is coupled, and that is a
+           -- real measurement) but carries NULL counts, so B3's exclusion
+           -- routes it to `coupled_unassessed` rather than to a candidate.
+           OR (s.b_is_partner AND s.patents_b_partner IS NOT NULL
+               AND s.patents_b_partner < 5)
            OR (NOT s.b_in_mosaic)
         """
         rows = self._execute_safe(sql, {"anchors": anchors})
@@ -3313,9 +3469,23 @@ class GraphQueries:
                 basis = "ppi_pathway_proxy"
             if driver <= 0:
                 continue
-            patents_b = int(r["patents_b"] or 0)
+            # B4 — a counted partner scores on ITS OWN patent count, from
+            # target_partners. Falling back to `patents_b` here would use the
+            # `patent_mentions_target` count, which is 0 for any gene without a
+            # row in `targets` — i.e. every partner — and 1/(1+0) is the
+            # maximum this score can take. The whole tier would rank first.
+            is_partner = bool(r.get("b_is_partner"))
+            partner_patents = r.get("patents_b_partner")
+            if is_partner and partner_patents is not None:
+                patents_b = int(partner_patents)
+            else:
+                patents_b = int(r["patents_b"] or 0)
             val_b = int(r["validation_b"] or 0)
-            in_kg = bool(r.get("b_in_mosaic"))
+            # "In the KG" now means either tier — but only a COUNTED partner
+            # counts as assessable, because an uncounted one has no numbers to
+            # assess. B3's exclusion enforces that downstream on the symbol set.
+            in_kg = bool(r.get("b_in_mosaic")) or (
+                is_partner and partner_patents is not None)
             # A whitespace score multiplies coupling (measured) by competition
             # (1/(1+patents_b)) and validation. For a partner outside the
             # universe those last two are not small — they are UNKNOWN, and
@@ -3452,8 +3622,36 @@ class GraphQueries:
         # Two lists, never merged. Mixing them means ranking a measured
         # quantity against an unmeasured one and presenting the result to four
         # decimal places.
+        #
+        # B3 — "in the universe" is no longer sufficient to be assessable.
+        # The partner tier puts thousands of genes INSIDE the universe whose
+        # activity counts have never been fetched. Their counts are NULL and
+        # their state is `no_fetch_evidence`, and v3 is explicit that such a
+        # partner must be EXCLUDED from candidate generation, never ranked low:
+        # a whitespace score that divides by patent count assigns its maximum to
+        # whatever nobody has looked at, so an uncounted partner does not rank
+        # badly — it wins.
+        #
+        # Measured 2026-08-09, which is why this cannot be left to the
+        # in_mosaic_kg flag alone: NOS3 and HRH2 are partner tier and the KG's
+        # own AXIS_VALUE_SQL reports patents=0 papers=0 compounds=0 for both,
+        # because those tables are keyed on `target_id` and a partner has no row
+        # in `targets`. NOS3 is eNOS. Those zeros are ignorance, not biology.
+        uncounted = self._uncounted_partner_symbols()
+        blocked = [c for c in cands
+                   if c["whitespace_partner"].get("symbol") in uncounted]
+        for c in blocked:
+            c["not_assessed_reason"] = (
+                "partner tier, activity counts never fetched "
+                "(state: no_fetch_evidence) — excluded from candidates because "
+                "an unfetched count is not a low count"
+            )
+        cands = [c for c in cands
+                 if c["whitespace_partner"].get("symbol") not in uncounted]
+
         assessable = [c for c in cands if c["whitespace_partner"]["in_mosaic_kg"]]
         unassessed = [c for c in cands if not c["whitespace_partner"]["in_mosaic_kg"]]
+        unassessed.extend(blocked)
         assessable.sort(key=lambda c: c["whitespace_score"], reverse=True)
         unassessed.sort(key=lambda c: c["coupling_strength"], reverse=True)
 

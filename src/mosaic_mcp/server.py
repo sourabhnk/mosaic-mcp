@@ -1227,3 +1227,207 @@ def mosaic_clinical_pipeline(params: GeneSymbolInput) -> str:
 # Tool 14: compound_analogs
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# B4 — multi-hop tools restored (reset plan v3)
+#
+# HAND-MAINTAINED. scripts/sync_pip_package.py skips server.py, so a tool
+# added to the hosted server reaches neither pip copy on its own and the
+# FREE_TOOLS invariant is what catches the drift. Added to BOTH copies in
+# the same session as the hosted change, per CLAUDE.md 2.4.
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    name="mosaic_synthetic_lethal_whitespace",
+    annotations={
+        "title": "Synthetic-Lethal Whitespace",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+@_with_db_error_handling
+def mosaic_synthetic_lethal_whitespace(params: SyntheticLethalInput) -> str:
+    """Find synthetic-lethal *whitespace*: targets functionally coupled to
+    a developed (drugged) target but themselves undeveloped.
+
+    For an anchor target with chemical matter, surfaces partners coupled to
+    it by DepMap co-essentiality, STRING protein-protein interactions and/or
+    Reactome pathways. Returns TWO lists, deliberately not merged:
+
+    - `candidates` — partners Mosaic covers, filtered to < 5 patents and no
+      compound past phase 0. Those counts are measured, so a whitespace claim
+      is supportable. Ranked by `whitespace_score`. **Read
+      `clinical_absence_caveat`**: it is set when a partner carries substantial
+      chemistry yet nothing clinical, which usually means our compound set is
+      incomplete rather than that the world has no clinical interest.
+    - `coupled_unassessed` — partners outside the curated universe. They are
+      coupled to the anchor, but their competitive status is UNKNOWN rather
+      than zero, so they carry null counts and no whitespace_score, and are
+      ranked by `coupling_strength` alone. Leads, not evidence. Do not
+      describe them as uncontested.
+
+    Scope: DepMap co-essentiality IS ingested, but most rows do not use it.
+    `co_functionality_basis` is one of `depmap_coessentiality` (measured
+    co-essentiality), `ppi_pathway_proxy` (protein interaction AND a shared
+    pathway), `ppi_only` (protein interaction alone, pathways checked and none
+    shared — the weakest, and on a KRAS anchor the most common), or
+    `ppi_pathways_unassessed` (interaction only, and pathways COULD NOT be
+    checked because the partner is outside the curated universe — those rows
+    also carry `shared_pathways: null`, not 0). `basis_note` gives the split.
+    A proxy row is a hypothesis about functional coupling, not measured
+    synthetic lethality.
+
+    `sufficient_for_absence_claim` is false unless most of the coupled set was
+    assessable; `assessed_fraction` reports how much was. `lineage` is still a
+    label only — it does not filter. Hypothesis generator.
+    """
+    _check_tool_access("mosaic_synthetic_lethal_whitespace")
+    gq = _gq()
+    result = gq.find_synthetic_lethal_whitespace(
+        approved_target=params.approved_target,
+        lineage=params.lineage,
+        limit=params.limit,
+    )
+
+    if not result.get("candidates"):
+        return _json_result({
+            "_meta": {
+                "tool": "mosaic_synthetic_lethal_whitespace",
+                **empty_scope_note(
+                    params.approved_target or "the developed-target set",
+                    "synthetic-lethal whitespace candidates",
+                    hint=(
+                        "Needs coupling to a drugged anchor via DepMap "
+                        "co-essentiality, STRING PPI or Reactome pathways. "
+                        + (
+                            f"NOTE: {result.get('coupled_unassessed_total', 0)} "
+                            "coupled partner(s) WERE found but sit outside the "
+                            "curated universe, so their competitive status "
+                            "cannot be assessed — see `coupled_unassessed`. "
+                            "An empty `candidates` here means 'not assessable', "
+                            "not 'no coupling exists'."
+                            if result.get("coupled_unassessed_total")
+                            else "No coupled partners found at all."
+                        )
+                    ),
+                    as_of=_provenance_as_of(),
+                ),
+            },
+            **result,
+        })
+
+    return _json_result({
+        "_meta": {
+            "tool": "mosaic_synthetic_lethal_whitespace",
+            "description": (
+                "Synthetic-lethal whitespace partners for "
+                + (params.approved_target or "top developed targets")
+            ),
+            "scoring": (
+                "candidates: whitespace_score = coupling x 1/(1+patents_B) "
+                "x (1 + ln(1+validation_evidence_B)), where coupling is "
+                "DepMap co-essentiality when available else the PPI/pathway "
+                "proxy. coupled_unassessed: ranked by coupling_strength only "
+                "— the competition term is undefined for a gene outside "
+                "coverage, so it is not computed rather than assumed zero."
+            ),
+            "caveat": result.get("method"),
+            "coverage": result.get("coverage_note"),
+        },
+        **result,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool: modality_gaps (KG-native, Move 2 Task 2.4.R.3)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="mosaic_resistance_bypass_map",
+    annotations={
+        "title": "Resistance Bypass Map",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+@_with_db_error_handling
+def mosaic_resistance_bypass_map(params: ResistanceBypassInput) -> str:
+    """Candidate resistance-bypass / escape targets for a given target.
+
+    From a deterministic keyword pass over the literature
+    (resistance_relations — GLiREL has no resistance edge type), surfaces
+    targets co-mentioned with the query target in resistance-context
+    abstracts, ranked by a drugability-gap score (strong resistance
+    evidence, low development activity). Hypothesis generator, not
+    evidence — every row carries its source snippet.
+    """
+    _check_tool_access("mosaic_resistance_bypass_map")
+    gq = _gq()
+    result = gq.find_resistance_bypass_map(
+        target=params.target, indication=params.indication
+    )
+    if not result.get("bypass_candidates"):
+        return _json_result({
+            "_meta": {
+                "tool": "mosaic_resistance_bypass_map",
+                **empty_scope_note(
+                    params.target, "resistance-bypass candidates",
+                    hint="No resistance-context co-mentions found. Run "
+                         "scripts/extract_resistance_relations.py if the "
+                         "resistance_relations layer is unpopulated.",
+                    as_of=_provenance_as_of(),
+                ),
+            },
+            **result,
+        })
+    return _json_result({
+        "_meta": {
+            "tool": "mosaic_resistance_bypass_map",
+            "description": (
+                f"Resistance-bypass candidates for {result['target']}"
+            ),
+            "scoring": (
+                "drugability_gap = evidence_papers x avg_confidence "
+                "x 1/(1+patents_bypass)"
+            ),
+            "caveat": result.get("method"),
+        },
+        **result,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool: talent_migration (KG-native, Move 2 Task 2.4.R.4)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="mosaic_target_network",
+    annotations={
+        "title": "Target Knowledge Graph Network",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+@_with_db_error_handling
+def mosaic_target_network(params: GeneSymbolInput) -> str:
+    """Get the 1-hop neighborhood around a drug target.
+
+    Returns the entities DIRECTLY connected to the target — compounds, diseases,
+    pathways, patent-holding organizations, interacting proteins — as nodes and
+    edges. This is a star centered on the target (independent 1-hop lookups), not
+    a multi-hop graph traversal: it shows the target's immediate context, not
+    paths that hop through intermediate entities.
+    """
+    _check_tool_access("mosaic_target_network")
+    gq = _gq()
+    symbol = params.gene_symbol.strip().upper()
+    result = gq.get_target_network(symbol)
+    return _json_result(result)
