@@ -4,6 +4,55 @@ All notable user-facing changes to the `mosaic-mcp` package. This package
 bundles Mosaic's knowledge-graph query and rendering layer; it is
 bring-your-own-database. Dates are UTC.
 
+## 1.7.0 — 2026-08-10
+
+Whitespace and resistance-bypass answers now say what they could not measure,
+instead of reporting it as zero. One behaviour change worth reading before
+upgrading.
+
+### A partner with an approved drug is no longer "whitespace"
+
+- `mosaic_synthetic_lethal_whitespace` judged a curated target on two tests
+  (few patents AND no clinical compound) but a neighbour-tier gene on patents
+  alone. Patent counts systematically under-report that tier — patents name
+  proteins, not genes ("histamine H2 receptor", never HRH2) — so genes with
+  approved drugs were surfacing as unexplored. Both tiers now get both tests.
+- Each candidate carries `max_phase`. It was read internally for years by a
+  crowding check and never written, so the clinical half of that check silently
+  did nothing.
+
+### ⚠️ `shared_pathways` and `validation_evidence` can now be `null`
+
+- Both count tables keyed to the curated universe, so for a neighbour-tier gene
+  they were structurally `0` — and published as if measured. They are now
+  `null`, meaning "not measurable for this gene", and the accompanying
+  `co_functionality_basis` reads `ppi_pathways_unassessed` rather than
+  `ppi_only`.
+- **If you parse these as integers, handle `null`.** A zero you cannot
+  distinguish from an unknown is the thing this release exists to remove.
+
+### `mosaic_resistance_bypass_map` says which zero
+
+- Gains `zero_reason` and `zero_reason_counts`, matching the whitespace tool.
+  Present on every response, `null` when candidates were returned.
+- `zero_reason_counts.resistance_backed` vs `ppi_fallback_only` is the one to
+  read: this tool falls back to protein-interaction partners when the
+  resistance layer is empty for a target, so a non-empty answer does not by
+  itself mean there is resistance evidence behind it.
+
+### Counts that are floors now say so
+
+- `compound_count_is_floor` marks a compound count that stopped at a scan
+  budget. `true` means "at least N", and the caveat text says so in words too.
+
+### Compatibility
+
+- This package is bring-your-own-database, and this release queries columns
+  that a schema built for 1.6.0 does not have. It probes for them: where they
+  are absent the queries still run, neighbour-tier genes are reported as
+  uncounted rather than assessed, and nothing is admitted on a measurement your
+  database cannot supply. No migration is required to upgrade.
+
 ## 1.6.0 — 2026-07-27
 
 Adds one tool: an orientation front door. No behaviour changes to the existing 44.

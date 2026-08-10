@@ -293,6 +293,7 @@ class GraphQueries:
         self._column_cache: dict[tuple[str, str, str], bool] = {}
         self._archive_present: bool | None = None
         self._partner_tier_present: bool | None = None
+        self._partner_max_phase_present_cache: bool | None = None
 
     # -- resolution -------------------------------------------------------
 
@@ -327,6 +328,35 @@ class GraphQueries:
             )
             self._partner_tier_present = bool(rows and rows[0].get("present"))
         return self._partner_tier_present
+
+    def _partner_max_phase_present(self) -> bool:
+        """Whether `target_partners` carries the clinical-phase columns.
+
+        The TABLE probe above is not enough for the pip package, which is
+        BYO-database: a user whose schema predates
+        `migrations/2026_08_09_partner_max_phase.sql` has `target_partners`
+        with the three count axes and no `max_phase_state`, and every query
+        naming that column fails outright on their database — not degrades,
+        fails. Shipping that as a release would break exactly the users who had
+        followed the previous release's schema.
+
+        Absent means the phase was never measured, so nothing may be admitted
+        on it — which is the same rule the column enforces when it is present,
+        and the safe direction: fewer candidates, never a partner passed off as
+        uncontested because a column was missing.
+        """
+        if self._partner_max_phase_present_cache is None:
+            if not self._partner_tier_is_present():
+                self._partner_max_phase_present_cache = False
+            else:
+                rows = self._execute_safe(
+                    "SELECT COUNT(*) AS n FROM information_schema.columns"
+                    " WHERE table_name = 'target_partners'"
+                    "   AND column_name = 'max_phase_state'"
+                )
+                self._partner_max_phase_present_cache = bool(
+                    rows and rows[0].get("n"))
+        return self._partner_max_phase_present_cache
 
     def _archive_is_present(self) -> bool:
         """Whether this deployment carries the `archive` schema at all.
@@ -501,15 +531,61 @@ class GraphQueries:
         statement about DATA, and B3's counting job mutates it as it runs — a
         cached copy would keep excluding partners that have since been counted,
         which decays silently and in the direction of looking correct.
+
+        ⚠️ `truncated` IS A MEASUREMENT, and treating it as "never fetched" was
+        a lie this function told about 41 partners. The rule that decides it is
+        v3's, and it is per-AXIS rather than global:
+
+            "A truncated axis may support presence claims.
+             It may never support absence claims."
+
+        A floor proves `>= threshold`; it can never prove `< threshold`. So:
+
+          patents, max_phase  -> feed `< 5` and `< 1`, which are ABSENCE
+                                 claims. A floor cannot support them. Exact
+                                 measurements only.
+          papers, compounds   -> feed nothing but rendering and a `>= 25`
+                                 caveat threshold, both PRESENCE claims. A
+                                 floor is sound, and is labelled as one in the
+                                 payload rather than rendered as a count.
+
+        Measured 2026-08-09, and the blast radius is smaller than it first
+        looks — 41 partners carry a truncated compounds floor, but only **2**
+        of them ever reached the `partners_uncounted` bucket. `_is_crowded()`
+        runs BEFORE this exclusion, so the other 39 fail the whitespace
+        predicate on patents or phase and were already being counted, correctly,
+        as crowded. The two that pass it are HSD17B10 (>=7,957 molecules, 4
+        patents, phase 0) and WDR77 (>=1,876, 1 patent, phase 0), and they were
+        reported as "activity counts never fetched" about genes whose counts had
+        in fact been fetched and found to be enormous.
+
+        Two genes is still worth fixing, because the whole point of B5 is that
+        "we could not look" and "we looked and it is taken" are the two answers
+        a reader most needs to tell apart, and this collapsed one into the
+        other. But the honest number is 2, not 41.
         """
         if not self._partner_tier_is_present():
             return set()
+        # On a schema without the clinical-phase columns (the pip package is
+        # BYO-database, and a user may be on the previous release's schema)
+        # the phase was never measured for ANY partner — so every partner is
+        # uncounted, which is what `TRUE` says here. Fewer candidates, never a
+        # partner passed off as uncontested because a column was missing.
+        max_phase_clause = (
+            "max_phase_state NOT IN ('measured', 'measured_zero')"
+            if self._partner_max_phase_present() else "TRUE")
         rows = self._execute_safe(
-            """
+            f"""
             SELECT symbol FROM target_partners
-            WHERE papers_state    NOT IN ('measured', 'measured_zero')
-               OR patents_state   NOT IN ('measured', 'measured_zero')
-               OR compounds_state NOT IN ('measured', 'measured_zero')
+            -- Absence-claim axes: exact only. A floor here would let
+            -- "at least 900 patents" satisfy "fewer than 5".
+            WHERE patents_state    NOT IN ('measured', 'measured_zero')
+               OR {max_phase_clause}
+            -- Presence-claim axes: a floor counts as counted.
+               OR papers_state     NOT IN ('measured', 'measured_zero',
+                                           'truncated')
+               OR compounds_state  NOT IN ('measured', 'measured_zero',
+                                           'truncated')
             """
         )
         return {r["symbol"] for r in rows}
@@ -3256,6 +3332,20 @@ class GraphQueries:
         has_coess_ext = _table_exists("target_coessentiality_ext")
         has_ppi_ext = _table_exists("target_interactions_ext")
 
+        # The clinical-phase columns are absent on any schema older than
+        # migrations/2026_08_09_partner_max_phase.sql — which includes every
+        # pip install still on the previous release's schema. NULL there means
+        # "never measured", and the admission clause below requires the value
+        # to be NOT NULL, so no partner is admitted on a phase nobody has. That
+        # is the safe direction and it needs no second code path.
+        partner_phase_sql = (
+            """(SELECT tp.max_phase FROM target_partners tp
+                     WHERE tp.symbol = pr.b
+                       AND tp.max_phase_state IN ('measured', 'measured_zero'))
+                     AS max_phase_b_partner,"""
+            if self._partner_max_phase_present()
+            else "NULL::numeric AS max_phase_b_partner,")
+
         # ---- PPI source: prefer richer extended table when present.
         # Extended table partners can be non-Mosaic genes (free strings);
         # both are fine here — non-Mosaic partners surface as whitespace.
@@ -3406,10 +3496,47 @@ class GraphQueries:
                      WHERE tp.symbol = pr.b
                        AND tp.patents_state IN ('measured', 'measured_zero'))
                      AS patents_b_partner,
+                   -- `truncated` IS admitted here, and only here, because of
+                   -- what this value is used for. v3's truncation rule:
+                   --
+                   --     "A truncated axis may support presence claims.
+                   --      It may never support absence claims."
+                   --
+                   -- A floor proves `>= threshold` and can never prove
+                   -- `< threshold`. `compounds_b_partner` feeds exactly two
+                   -- consumers — the rendered count, and the `>= 25` caveat
+                   -- threshold — and neither is an absence claim, so a floor
+                   -- is sound for both. `patents_b_partner` above feeds
+                   -- `< 5` and `max_phase_b_partner` below feeds `< 1`, which
+                   -- are absence claims, so those stay exact-only.
+                   --
+                   -- The floor must be LABELLED, not silently rendered as a
+                   -- count: `compound_count: 7957` reads as a measurement when
+                   -- the truth is "at least 7,957". See the flag below.
                    (SELECT tp.compounds_count FROM target_partners tp
                      WHERE tp.symbol = pr.b
-                       AND tp.compounds_state IN ('measured', 'measured_zero'))
+                       AND tp.compounds_state IN ('measured', 'measured_zero',
+                                                  'truncated'))
                      AS compounds_b_partner,
+                   (SELECT tp.compounds_state = 'truncated'
+                      FROM target_partners tp WHERE tp.symbol = pr.b)
+                     AS compounds_b_partner_is_floor,
+                   -- The clinical-phase half of the competition test, which the
+                   -- partner tier did not have. `patents_b_partner < 5` was the
+                   -- WHOLE admission rule for a partner, while a dossier target
+                   -- had to pass `patents_b < 5 AND max_phase_b < 1`.
+                   --
+                   -- Patents cannot carry this tier alone. EPO is searched as
+                   -- `ta="<SYMBOL>"` and patents name proteins, not genes —
+                   -- "histamine H2 receptor", never HRH2 — so the axis
+                   -- under-counts partners systematically. Measured once the
+                   -- compounds axis became trustworthy: 39 partners passed the
+                   -- patents-only clause carrying 100+ compounds each, HRH2
+                   -- among them with 2 patents and 3,200 compounds.
+                   --
+                   -- NULL when unmeasured, never 0 — an unmeasured phase must
+                   -- not read as "no drug develops this protein".
+                   {partner_phase_sql}
                    (EXISTS (SELECT 1 FROM target_partners tp
                              WHERE tp.symbol = pr.b)) AS b_is_partner
             FROM pairs pr
@@ -3421,6 +3548,7 @@ class GraphQueries:
         SELECT s.a, s.b, s.conf, s.sp, s.coess_r, s.patents_b, s.compounds_b,
                s.max_phase_b, s.validation_b, s.b_in_mosaic,
                s.b_is_partner, s.patents_b_partner, s.compounds_b_partner,
+               s.compounds_b_partner_is_floor, s.max_phase_b_partner,
                ta.name AS a_name, ta.target_class AS a_class,
                ta.druggability_tier AS a_tier,
                tb.name AS b_name, tb.target_class AS b_class,
@@ -3442,9 +3570,57 @@ class GraphQueries:
            -- uncounted one still arrives here (it is coupled, and that is a
            -- real measurement) but carries NULL counts, so B3's exclusion
            -- routes it to `coupled_unassessed` rather than to a candidate.
+           --
+           -- ⚠️ THIS CLAUSE USED TO BE PATENTS ONLY, and the dossier clause
+           -- above has always been two tests. A partner was therefore called
+           -- uncontested on a single axis that under-counts this tier by
+           -- construction. `max_phase_b_partner` restores the symmetry, and it
+           -- is required NOT NULL for the same reason `patents_b_partner` is:
+           -- an unmeasured phase is not a phase of zero, and defaulting it
+           -- would re-create `unmeasured_is_not_zero` in the clause added to
+           -- fix it.
            OR (s.b_is_partner AND s.patents_b_partner IS NOT NULL
-               AND s.patents_b_partner < 5)
-           OR (NOT s.b_in_mosaic)
+               AND s.patents_b_partner < 5
+               AND s.max_phase_b_partner IS NOT NULL
+               AND s.max_phase_b_partner < 1)
+           -- Everything else outside the dossier set comes through UNASSESSED.
+           -- The exclusion matters: without it this clause is `NOT b_in_mosaic`,
+           -- which is true for EVERY partner-tier gene (a partner has no row in
+           -- `targets` by construction), so it would blanket-admit counted
+           -- partners and make the clause above dead code — a partner with 500
+           -- patents would arrive as whitespace. Counted partners must be
+           -- judged by the clause above, on their own numbers, or not at all.
+           OR (NOT s.b_in_mosaic
+               AND NOT (s.b_is_partner AND s.patents_b_partner IS NOT NULL))
+           -- B5: crowded partners come through too, so Python can COUNT them.
+           -- Without this the three zeros are indistinguishable at the point of
+           -- reporting: a target whose neighbours were all assessed and found
+           -- crowded returns the same empty list as one whose neighbours were
+           -- never counted, and that conflation is the whole reason B5 exists.
+           -- They are counted, never ranked — see `crowded` below.
+           OR (s.b_in_mosaic AND NOT (s.patents_b < 5 AND s.max_phase_b < 1))
+           -- The mirror of the admission clause, so a partner that FAILS the
+           -- whitespace test on either axis is still counted as crowded rather
+           -- than vanishing. Previously only the patents half could put a
+           -- partner here, so a partner with an approved drug and two patents
+           -- was neither a candidate nor a counted crowded neighbour.
+           OR (s.b_is_partner AND s.patents_b_partner IS NOT NULL
+               AND (s.patents_b_partner >= 5
+                    OR (s.max_phase_b_partner IS NOT NULL
+                        AND s.max_phase_b_partner >= 1)))
+           -- A partner counted on patents but NOT on clinical phase matches
+           -- none of the clauses above: not whitespace (the admission clause
+           -- requires a measured phase), not crowded (it may be under both
+           -- thresholds), and not out-of-coverage (it has a patent count). It
+           -- would vanish from every list — counted nowhere, reported nowhere.
+           --
+           -- That silent disappearance is the failure B5 exists to prevent: a
+           -- partner that is missing is indistinguishable from a partner that
+           -- was assessed and found crowded. It arrives here instead, and
+           -- `_uncounted_partner_symbols` (which now also requires a measured
+           -- phase) routes it to `coupled_unassessed` with a stated reason.
+           OR (s.b_is_partner AND s.patents_b_partner IS NOT NULL
+               AND s.max_phase_b_partner IS NULL)
         """
         rows = self._execute_safe(sql, {"anchors": anchors})
 
@@ -3480,6 +3656,35 @@ class GraphQueries:
                 patents_b = int(partner_patents)
             else:
                 patents_b = int(r["patents_b"] or 0)
+            # Highest clinical phase reached against this partner, from
+            # whichever tier's measurement applies. NULL stays None: an
+            # unmeasured phase is not phase 0, and `_is_crowded` below tests it
+            # with `bool(phase and phase >= 1)`, so a None correctly declines to
+            # assert either way.
+            partner_phase = r.get("max_phase_b_partner")
+            if is_partner:
+                max_phase_b = (float(partner_phase)
+                               if partner_phase is not None else None)
+            else:
+                max_phase_b = (float(r["max_phase_b"])
+                               if r.get("max_phase_b") is not None else None)
+            # A partner's own compound count, for the clinical-absence caveat.
+            # `compounds_b` counts `compound_targets`, which is keyed to
+            # `targets`, so it is structurally 0 for every partner — the caveat
+            # could never fire on the tier where it matters most.
+            partner_compounds = r.get("compounds_b_partner")
+            compounds_for_caveat = (
+                int(partner_compounds)
+                if is_partner and partner_compounds is not None
+                else int(r["compounds_b"] or 0))
+            # A truncated compounds row carries a FLOOR — "at least N distinct
+            # molecules", because the scan budget ran out, not because the
+            # counting stopped at N. Rendering it under a key called
+            # `compound_count` states a measurement we do not have, so the
+            # floor travels with the number.
+            compounds_is_floor = bool(
+                is_partner and partner_compounds is not None
+                and r.get("compounds_b_partner_is_floor"))
             val_b = int(r["validation_b"] or 0)
             # "In the KG" now means either tier — but only a COUNTED partner
             # counts as assessable, because an uncounted one has no numbers to
@@ -3517,10 +3722,39 @@ class GraphQueries:
             # went from one anchor to five: every `coupled_unassessed` row
             # reported `shared_pathways = 0` while every other unknown on the
             # same row was correctly `null`. One field away from the fix.
-            sp = int(r["sp"] or 0) if in_kg else None
+            # ⚠️ THE GUARD KEYED ON THE WRONG FLAG, and the sweep caught it.
+            # `sp` counts `target_pathways` and `val_b` counts
+            # `paper_validations`, both keyed on `target_id` — so BOTH are
+            # structurally 0 for any gene without a row in `targets`, which is
+            # every partner by construction. Measured 2026-08-10:
+            # `paper_validations` and `target_pathways` hold **0 rows for any
+            # partner symbol at all**.
+            #
+            # The guard existed but tested `in_kg`, which B4 widened to include
+            # a COUNTED partner — so it stopped firing for exactly the tier it
+            # was written to protect, and every partner candidate rendered
+            # `shared_pathways: 0` and `validation_evidence: 0` as measured
+            # values. That is `unmeasured_is_not_zero`, surviving in two fields
+            # after being fixed in patents and compounds.
+            #
+            # `b_in_mosaic` is the right test: it means "has a row in
+            # `targets`", which is precisely what these two counts require.
+            has_targets_row = bool(r.get("b_in_mosaic"))
+            sp = int(r["sp"] or 0) if has_targets_row else None
             if basis != "ppi_pathway_proxy":
                 basis_out = basis            # real co-essentiality; sp irrelevant
-            elif not in_kg:
+            elif not has_targets_row:
+                # Was `not in_kg`, and the label inherited the same widening
+                # bug as the field: B4 made `in_kg` true for a COUNTED partner,
+                # so a partner fell through to `ppi_only` — "protein
+                # interaction alone, and we looked for shared pathways and
+                # found none". We could not look. `target_pathways` is keyed on
+                # `targets` and a partner has no row there, which is what the
+                # comment a few lines up has said all along.
+                #
+                # Caught by test_synthetic_lethal_whitespace_shape, which
+                # asserts `ppi_only` implies `shared_pathways == 0` — once the
+                # count correctly became None, the label had to move with it.
                 basis_out = "ppi_pathways_unassessed"
             elif sp:
                 basis_out = "ppi_pathway_proxy"
@@ -3545,18 +3779,56 @@ class GraphQueries:
                     # surface that distinction so the UI/agent can flag it.
                     "name": r["b_name"],
                     "target_class": r["b_class"],
-                    "in_mosaic_kg": bool(r.get("b_in_mosaic")),
+                    # B4 FIX 2026-08-09. This read `r["b_in_mosaic"]` directly
+                    # while the B4 change computed `in_kg` a few lines above and
+                    # then never used it here — so `assessable`, which filters on
+                    # THIS field, still excluded every partner no matter how
+                    # thoroughly it had been counted. The admission half of the
+                    # wiring was dead; only the B3 exclusion half worked.
+                    #
+                    # Caught by a known-good/known-bad pair rather than by
+                    # reading: a partner set to 0 patents (which MUST surface)
+                    # did not surface either, and it was that control failing —
+                    # not the crowded case passing — that exposed it. The
+                    # crowded probe alone would have "passed" and confirmed a
+                    # mechanism that was not running.
+                    "in_mosaic_kg": in_kg,
+                    "tier": ("dossier" if r.get("b_in_mosaic")
+                             else "partner" if is_partner else None),
                     # gap-fix 8: out-of-set partner counts are not whitespace —
                     # Mosaic doesn't cover the gene. Render "not assessed".
-                    "out_of_coverage": bool(not r.get("b_in_mosaic")),
+                    "out_of_coverage": not in_kg,
                     "not_assessed_reason": (
-                        None if r.get("b_in_mosaic") else OUT_OF_COVERAGE_REASON),
+                        None if in_kg else OUT_OF_COVERAGE_REASON),
                     # For a gene we do not cover these are not counts of zero,
                     # they are absent measurements. Emitting 0 is what let
                     # "no patents" be read off a gene nobody looked at.
                     "patent_count": patents_b if in_kg else None,
-                    "compound_count": int(r["compounds_b"] or 0) if in_kg else None,
-                    "validation_evidence": val_b if in_kg else None,
+                    "compound_count": (compounds_for_caveat if in_kg else None),
+                    # True => `compound_count` is a LOWER BOUND, not a count.
+                    # Present on every assessable row so a consumer can branch
+                    # on it rather than discover it; absent-vs-false is the
+                    # distinction that made `_is_crowded`'s max_phase test dead
+                    # for the life of that function.
+                    "compound_count_is_floor": (
+                        compounds_is_floor if in_kg else None),
+                    # ⚠️ THIS KEY WAS NEVER SET, AND `_is_crowded` HAS ALWAYS
+                    # READ IT. `wp.get("max_phase")` returned None on every row
+                    # ever produced, so the crowded test silently degenerated to
+                    # `patents >= 5` for BOTH tiers — a target with an approved
+                    # drug and few patents was never detected as crowded, and
+                    # stayed a whitespace candidate. The SQL admitted such rows
+                    # deliberately (B5, "counted, never ranked"); the Python
+                    # then failed to recognise them and ranked them anyway.
+                    "max_phase": max_phase_b if in_kg else None,
+                    # `has_targets_row`, not `in_kg` — see the note beside `sp`.
+                    # `paper_validations` is keyed on `target_id`, so this is
+                    # structurally 0 for every partner and was being published
+                    # as a measured zero. The SCORE keeps using 0, because
+                    # log1p(0) = 0 makes it the neutral element and a partner
+                    # should get no validation bonus it has not earned; only
+                    # the rendered value becomes null.
+                    "validation_evidence": val_b if has_targets_row else None,
                     # FINDING 6: `druggability_tier` is NULL on 100% of rows of
                     # `targets` (PRE-C3.3 §P3) and was rendered on every row of
                     # a paid tool. A key that is always null reads as "measured,
@@ -3573,14 +3845,31 @@ class GraphQueries:
                     # target with no clinical compound at all is a claim about
                     # our coverage as much as about the world, and the caller
                     # has to be told which.
+                    # Now fires for PARTNERS too. It read `compounds_b`, which
+                    # counts `compound_targets` and is structurally 0 for a
+                    # partner, so the one warning that covers "lots of
+                    # chemistry, none of it clinical" could never reach the
+                    # tier that needed it. Measured 2026-08-09: 22 partners
+                    # carry 100+ compounds at phase 0 — HSD17B10 has at least
+                    # 7,957 — and every one of them passes the whitespace test
+                    # legitimately while being obviously well-explored. That is
+                    # the GRIN1 case, at partner scale.
                     "clinical_absence_caveat": (
-                        (f"{int(r['compounds_b'] or 0)} compounds are linked to "
+                        (f"{'At least ' if compounds_is_floor else ''}"
+                         f"{compounds_for_caveat} compounds are linked to "
                          f"{r['b']} and none has reached phase 1. For a target "
                          f"with this much chemistry that more likely reflects "
                          f"an incomplete compound set than a genuine absence of "
                          f"clinical interest — verify before treating 'no "
-                         f"clinical compound' as a finding.")
-                        if in_kg and int(r["compounds_b"] or 0) >= 25 else None),
+                         f"clinical compound' as a finding."
+                         + (" The compound count is a floor: the scan budget "
+                            "was reached before the molecule list was "
+                            "exhausted." if compounds_is_floor else ""))
+                        # A floor >= 25 proves the true value is >= 25, so the
+                        # threshold test is sound on a lower bound. This is the
+                        # presence direction; the same number may never be used
+                        # to argue the gene has FEW compounds.
+                        if in_kg and compounds_for_caveat >= 25 else None),
                 },
                 "co_functionality_proxy": co_func,
                 "co_essentiality_r": coess_r if coess_r > 0 else None,
@@ -3637,6 +3926,37 @@ class GraphQueries:
         # own AXIS_VALUE_SQL reports patents=0 papers=0 compounds=0 for both,
         # because those tables are keyed on `target_id` and a partner has no row
         # in `targets`. NOS3 is eNOS. Those zeros are ignorance, not biology.
+        # B5 — separate the CROWDED partners before anything else. They were
+        # assessed and failed the whitespace predicate, which is a finding, not
+        # an absence of one. They must never rank as candidates, and they must
+        # be counted, because "we looked and they are all taken" is one of the
+        # three zeros and the only one that is a real answer.
+        def _is_crowded(c: dict) -> bool:
+            """⚠️ The `phase` half of this was DEAD for the life of the function.
+
+            `max_phase` was never a key on `whitespace_partner`, so
+            `wp.get("max_phase")` returned None on every row ever produced and
+            `bool(None and ...)` is False. The test therefore reduced to
+            `pats >= 5`, and a target with an approved drug but few patents was
+            never recognised as crowded — the SQL admitted it deliberately (B5:
+            "counted, never ranked") and this function then ranked it.
+
+            Nothing here changed to fix it. The payload now sets the key, which
+            is the whole repair: a check that reads a field nobody writes is
+            indistinguishable from a check that passes.
+            """
+            wp = c["whitespace_partner"]
+            if not wp.get("in_mosaic_kg"):
+                return False
+            pats = wp.get("patent_count")
+            phase = wp.get("max_phase")
+            if pats is None:
+                return False
+            return pats >= 5 or bool(phase and phase >= 1)
+
+        crowded = [c for c in cands if _is_crowded(c)]
+        cands = [c for c in cands if not _is_crowded(c)]
+
         uncounted = self._uncounted_partner_symbols()
         blocked = [c for c in cands
                    if c["whitespace_partner"].get("symbol") in uncounted]
@@ -3720,6 +4040,38 @@ class GraphQueries:
             # Useful as leads; not evidence of whitespace.
             "coupled_unassessed": unassessed[:limit],
             "coupled_unassessed_total": len(unassessed),
+            # ---------------------------------------------------------------
+            # B5 — WHICH ZERO. Required field, present on every response.
+            #
+            # v3: this tool returned `0 candidates` for three completely
+            # different situations, and "a tool that returns zero when blind is
+            # indistinguishable from a tool that returns zero when looking".
+            # A reader cannot act on the number without this field:
+            #
+            #   assessed_all_crowded — we assessed the neighbours and they are
+            #       all taken. A FINDING, and the only one of the three that is
+            #       a real answer about the biology.
+            #   partners_uncounted   — we know the neighbours and cannot judge
+            #       them. A coverage gap in us, not a fact about the target.
+            #   no_partner_edges     — we do not know this target's neighbours
+            #       at all. An edge gap.
+            #
+            # `null` when candidates were returned: there is no zero to explain.
+            # Deliberately NOT omitted in that case — an absent key is what a
+            # caller forgets to check, and the required-field property is the
+            # entire point.
+            "zero_reason": (
+                None if cands
+                else "no_partner_edges" if not (crowded or blocked or unassessed)
+                else "assessed_all_crowded" if crowded and not (blocked or unassessed)
+                else "partners_uncounted"
+            ),
+            "zero_reason_counts": {
+                "candidates": len(cands),
+                "assessed_and_crowded": len(crowded),
+                "uncounted_partners": len(blocked),
+                "outside_the_universe": len(unassessed) - len(blocked),
+            },
             "coverage_note": (
                 "`candidates` are partners Mosaic covers, so their patent and "
                 "compound counts are measured and a whitespace claim is "
@@ -4032,11 +4384,67 @@ class GraphQueries:
                 -x["drugability_gap_score"],
             )
         )
+        # ---------------------------------------------------------------
+        # B5 — WHICH ZERO. The plan requires this field on "every
+        # whitespace/bypass response", and it shipped on whitespace only, so
+        # this tool could return `total: 0` for three different situations and
+        # a reader could not act on the number. Same vocabulary as
+        # `find_synthetic_lethal_whitespace`, deliberately: inventing a second
+        # set of words for the same three ideas is how a system ends up with
+        # two names for one state and no way to join them.
+        #
+        # `null` when candidates were returned — NOT omitted. An absent key is
+        # what a caller forgets to check, and the required-field property is
+        # the whole point.
+        #
+        # ⚠️ `assessed_all_crowded` is currently UNREACHABLE here, and that is
+        # a statement about this tool rather than about the biology: unlike
+        # whitespace, bypass applies no competition filter — every co-mentioned
+        # candidate is returned and merely ranked. So `out` is empty if and
+        # only if there were no edges to begin with. The state is still listed
+        # and still computed, because the day a bar is added is the day it
+        # starts firing, and a vocabulary that quietly omits a case is how the
+        # three zeros got conflated in the first place.
+        assessable = [c for c in out
+                      if c["bypass_target"].get("in_mosaic_kg")]
+        crowded = [c for c in assessable
+                   if (c["bypass_target"].get("patent_count") or 0) >= 5
+                   or (c["bypass_target"].get("max_clinical_phase") or 0) >= 1]
+        unassessed = [c for c in out
+                      if not c["bypass_target"].get("in_mosaic_kg")]
         return {
             "target": t,
             "indication_filter": indication,
             "bypass_candidates": out,
             "total": len(out),
+            "zero_reason": (
+                None if out
+                else "no_partner_edges"
+            ),
+            # Reported even when non-empty, because the interesting number is
+            # not "how many came back" but "how much of what came back could
+            # actually be judged". Measured on EGFR 2026-08-10: 37 candidates,
+            # 29 of them outside the curated universe.
+            #
+            # `resistance_backed` is the one that stops the zero being MASKED.
+            # This tool falls back to STRING PPI partners when the resistance
+            # layer has nothing, so `total` is never 0 and `no_partner_edges`
+            # never fires — measured: FES has ZERO rows in
+            # `resistance_relations` and still returns 13 "resistance-bypass"
+            # candidates, every one of them a generic protein interaction. The
+            # `method` string discloses the fallback in general; only this
+            # count discloses that for THIS target the resistance evidence is
+            # empty. A tool that cannot return zero cannot explain one.
+            "zero_reason_counts": {
+                "candidates": len(out),
+                "assessed_and_crowded": len(crowded),
+                "outside_the_universe": len(unassessed),
+                "resistance_backed": sum(
+                    1 for c in out
+                    if c.get("evidence_source") == "resistance_relations"),
+                "ppi_fallback_only": sum(
+                    1 for c in out if c.get("evidence_source") == "string_ppi"),
+            },
             # The "not GLiREL" clause is load-bearing provenance, not filler:
             # these edges come from a deterministic keyword pass, because
             # GLiREL has no resistance relation type at all. It was dropped
@@ -4432,11 +4840,51 @@ class GraphQueries:
         Returns a `source_label` field resolved from papers/patents so agents
         don't have to surface raw `source_doc_id` strings. The raw ID is kept
         for downstream joins but should not be displayed to end users.
+
+        ⚠️ EVERY ROW ALSO CARRIES THE COVERAGE TIER OF BOTH ENDS, because
+        without it this returns the same shape for a gene we cover and one we
+        do not. Measured 2026-08-10 before the fix: `ABCB1` — absent from
+        `targets` — returned 100 relations in a payload byte-identical to
+        EGFR's, with nothing anywhere saying ABCB1 is outside the curated
+        universe. The facts in those rows are real extractions; what was wrong
+        was everything they implied about coverage.
+
+        `targets` holds only the 60 dossier subjects and the rest of the
+        universe lives in `archive.targets`, so most non-`targets` ends are
+        `archived` — a deliberate, recorded state, and per A5's own docstring
+        "a far more useful answer than 'never heard of it'". They are labelled,
+        never dropped: `semantic_relations` is a published artefact and these
+        are real edges about real genes.
+
+        Tier vocabulary is A5's, not a second one invented here — dossier /
+        partner / archived / unknown. On a deployment with no `archive` schema
+        the archived case is unreachable and those ends read `unknown`, which
+        means "not in the live universe", NOT "does not exist".
         """
-        return self._execute_safe("""
+        has_archive = bool(self._execute_safe(
+            "SELECT to_regclass('archive.targets') AS t")[0].get("t"))
+        # Built rather than parameterised because a missing schema is a
+        # different QUERY, not a different value. Interpolates no user input.
+        arch = ("WHEN EXISTS (SELECT 1 FROM archive.targets a WHERE a.id = {col})"
+                " THEN 'archived' " if has_archive else "")
+
+        def tier(col: str) -> str:
+            return f"""
+                   CASE WHEN sr.{col}_type <> 'target' THEN NULL
+                        WHEN EXISTS (SELECT 1 FROM targets t WHERE t.id = sr.{col}_id)
+                             THEN '{RESOLUTION_DOSSIER}'
+                        {arch.format(col=f'sr.{col}_id')}
+                        WHEN EXISTS (SELECT 1 FROM target_partners tp
+                                      WHERE tp.symbol = sr.{col}_id)
+                             THEN '{RESOLUTION_PARTNER}'
+                        ELSE '{RESOLUTION_UNKNOWN}' END AS {col}_coverage"""
+
+        return self._execute_safe(f"""
             SELECT sr.relation_type, sr.confidence,
                    sr.subject_id, sr.subject_type,
                    sr.object_id, sr.object_type,
+                   {tier('subject')},
+                   {tier('object')},
                    sr.evidence_text, sr.model_name,
                    sr.source_doc_id, sr.source_doc_type,
                    CASE
