@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.sourabhnk/mosaic-mcp",
   "title": "Mosaic Pre-Clinical Intelligence",
-  "description": "Pre-clinical drug discovery intelligence — targets, compounds, patents, trials, whitespace",
+  "description": "Pre-clinical drug-target intelligence as MCP tools. 60 deeply-curated oncology targets with compounds, patents, papers, structures, trials and pathways \u2014 plus 2,687 co-essentiality partner genes, counted on every axis, so synthetic-lethal whitespace rests on measurements rather than absent data.",
   "repository": {
     "url": "https://github.com/sourabhnk/mosaic-mcp",
     "source": "github"
@@ -21,13 +21,13 @@
       "environmentVariables": [
         {
           "name": "DATABASE_URL",
-          "description": "PostgreSQL/Neon connection string for the Mosaic knowledge graph (must end /mosaic_db)",
+          "description": "PostgreSQL/Neon connection string for YOUR Mosaic knowledge graph (must end /mosaic_db). Bring your own database \u2014 no shared instance is provided.",
           "isRequired": true,
           "isSecret": true
         },
         {
           "name": "MOSAIC_API_KEY",
-          "description": "API key that unlocks the 28 Pro tools (optional; free tier works without it)",
+          "description": "API key unlocking the 7 Pro tools (optional; the 5 free tools work without it)",
           "isRequired": false,
           "isSecret": true
         },
