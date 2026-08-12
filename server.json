@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.sourabhnk/mosaic-mcp",
   "title": "Mosaic Pre-Clinical Intelligence",
-  "description": "Pre-clinical drug-target intelligence as MCP tools. 60 deeply-curated oncology targets with compounds, patents, papers, structures, trials and pathways \u2014 plus 2,687 co-essentiality partner genes, counted on every axis, so synthetic-lethal whitespace rests on measurements rather than absent data.",
+  "description": "Pre-clinical drug-target intelligence: 60 curated targets, 2,687 counted partner genes, 12 tools",
   "repository": {
     "url": "https://github.com/sourabhnk/mosaic-mcp",
     "source": "github"
