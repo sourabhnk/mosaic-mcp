@@ -231,6 +231,14 @@ mcp = FastMCP(
 
 import re as _re
 
+# Where a user actually asks for coverage. This used to name
+# `mosaic_target_wishlist_add`, a tool that does not exist — C3.3 cut it and
+# the call to action survived in three messages, including the one every
+# archived gene returns. 704 genes are archived. The first replacement was
+# "getmosaic.dev/request", a 404 — the same defect in a new form. Curl it.
+REQUEST_URL = "https://getmosaic.dev"
+
+
 _ID_KEYS_TO_NAME_KEY: dict[str, str] = {
     "compound_id": "compound_name",
     "target_id": "target_name",
@@ -880,7 +888,7 @@ _CAPABILITY_GROUPS: list[dict] = [
     {"group": "Track & request",
      "answers": "Save targets/orgs to a watchlist, request a target we don't cover yet, or check KG scope.",
      "tools": ["mosaic_watchlist_create", "mosaic_watchlist_add_item", "mosaic_watchlist_get",
-               "mosaic_watchlist_list", "mosaic_target_wishlist_add", "mosaic_kg_stats"],
+               "mosaic_watchlist_list", "mosaic_kg_stats"],
      "example": "mosaic_kg_stats()"},
 ]
 
@@ -932,8 +940,9 @@ def mosaic_get_target_profile(params: GeneSymbolInput) -> str:
                 "resolved_target": canonical,
                 "resolution_status": res.status,
                 "wishlist_cta": (
-                    f"{canonical} can be restored to the covered set — request "
-                    "it via mosaic_target_wishlist_add."
+                    f"{canonical} can be restored to the covered set — request it at "
+                    f"{REQUEST_URL} and it enters the "
+                    "demand-driven expansion queue."
                 ),
             })
 
@@ -955,11 +964,10 @@ def mosaic_get_target_profile(params: GeneSymbolInput) -> str:
             "resolution_status": res.status,
             "archive_checked": res.archive_checked,
             "wishlist_cta": (
-                f"{symbol} is a well-characterised target — flag it via "
-                "mosaic_target_wishlist_add to prioritise coverage."
+                f"{symbol} is a well-characterised target — request coverage at "
+                f"{REQUEST_URL} to prioritise it."
                 if wellknown else
-                "Use mosaic_target_wishlist_add to request coverage for "
-                "this target."
+                f"Request coverage for this target at {REQUEST_URL}."
             ),
         })
 

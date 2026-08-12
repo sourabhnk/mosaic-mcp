@@ -19,6 +19,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+# Where a user actually asks for coverage. This used to name
+# `mosaic_target_wishlist_add`, a tool that does not exist — C3.3 cut it with
+# the other 33 and the call to action survived in three messages, including
+# the one every archived gene returns. 704 genes are archived.
+# VERIFIED 200, unlike the first attempt. This replaced a dead TOOL
+# reference (`mosaic_target_wishlist_add`) with "getmosaic.dev/request",
+# which is a 404 — the same defect in a new form, shipped because the
+# string changed and nobody checked the destination. Curl the URL.
+REQUEST_URL = "https://getmosaic.dev"
+
 logger = logging.getLogger(__name__)
 
 # High-traffic oncology targets where an empty data layer is surprising
@@ -105,8 +115,8 @@ def empty_scope_note(
             f"here most likely means this layer has not been ingested yet."
         )
         note["wishlist_cta"] = (
-            f"If you expected {what} for {entity}, flag it via "
-            f"mosaic_target_wishlist_add so coverage can be prioritised."
+            f"If you expected {what} for {entity}, request coverage at "
+            f"{REQUEST_URL} so it can be prioritised."
         )
     return note
 
@@ -440,7 +450,10 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
                 "papers": counts.get("paper_count", 0),
                 "organizations": counts.get("organization_count", 0),
                 "pathways": counts.get("pathway_count", 0),
+                # A floor, not a count, at the cap — see PPI_PER_TARGET_CAP.
                 "protein_interactions": counts.get("ppi_count", 0),
+                "protein_interactions_is_floor": (
+                    (counts.get("ppi_count") or 0) >= PPI_PER_TARGET_CAP),
                 "disease_associations": counts.get("indication_count", 0),
                 "validation_evidence": counts.get("validation_count", 0),
             },
@@ -685,6 +698,9 @@ def format_pathway_context(data: dict[str, Any]) -> dict[str, Any]:
         "summary": {
             "pathway_count": len(pathways),
             "ppi_count": len(ppis),
+            # `>= cap` means the true number is unknown and at least this. A
+            # presence claim is sound on it; "only N interactors" is not.
+            "ppi_count_is_floor": len(ppis) >= PPI_PER_TARGET_CAP,
             "co_pathway_targets": len(target_pathway_counts),
         },
     }
@@ -862,6 +878,18 @@ def format_compare_targets(results: list[dict]) -> dict[str, Any]:
 # so the formatter can say "at least N" rather than republishing a LIMIT as a
 # total. Keep in step with the LIMIT in queries.get_clinical_pipeline.
 CLINICAL_PIPELINE_ROSTER_CAP = 50
+
+# `enrich_string_ppi_v2 --limit-per-target` defaults to 50, so every target's
+# PPI set is capped at ingest. MEASURED on production 2026-08-11: ALL 60 of 60
+# targets hold EXACTLY 50 rows — not 49, not 51. That is a cap, not a
+# distribution, and it was being published as `data_coverage.
+# protein_interactions` and `pathway_context.summary.ppi_count` with nothing to
+# distinguish "50 because capped" from "50 because true".
+#
+# Same defect as `total_entries` reporting a LIMIT as a total, which is still a
+# KEEP_FIRING finding on clinical_pipeline. Found by the first sweep run
+# against post-cutover production.
+PPI_PER_TARGET_CAP = 50
 
 # CT.gov's own vocabulary. `NA` is observational — not-applicable, NOT phase 0.
 _CTGOV_PHASE_LABEL = {
