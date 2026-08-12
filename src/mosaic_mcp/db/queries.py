@@ -116,6 +116,27 @@ class TargetResolution:
 # The co-essentiality / PPI coupling signal itself stays (it is KG-derived).
 OUT_OF_COVERAGE_REASON = "gene outside Mosaic curated coverage"
 
+# How much chemistry makes a gene "already explored", for both the crowding
+# test and the clinical-absence caveat. ONE constant because those two used to
+# be one literal `25` in the caveat and NOTHING in the crowding test — the
+# payload would warn a reader that a gene had 1,876 molecules while the ranking
+# above it still called that gene whitespace.
+#
+# Operator-approved 2026-08-10. Measured before applying: 46 distinct candidate
+# partners across the 60 anchors carry >= 25 molecules, headed by HSD17B10
+# (>=7,957), CSNK2A2 (2,374), WDR77 (>=1,876), PKN2 (1,617) and PAK6 (1,205) —
+# every one of them ranked as unexplored, because `_is_crowded` tested patents
+# and clinical phase and never read the compounds axis at all. Issue #8 added
+# the phase half to that test; nobody added the chemistry half.
+#
+# Chosen at 25 rather than higher because that is the number the payload
+# already uses to caveat the same claim, and two thresholds for one idea is how
+# they drift. Gate B holds at 60/60 under this and every other threshold
+# tested (1 / 25 / 100 / 1000) — no anchor loses its whitespace entirely — so
+# this costs nothing on the graded number, which is why it could be applied at
+# all rather than reported and held.
+CROWDED_COMPOUNDS = 25
+
 # Org-level publication attribution is NOT available: the affiliation parser
 # stored the *department fragment* of each affiliation string as the
 # organization, so the paper-side "organizations" for any target are entries like
@@ -763,6 +784,34 @@ class GraphQueries:
             if len(entry["name_variants"]) < 2:
                 entry.pop("name_variants")  # only surface it where it merged
 
+        # D9 — `total_patents` was `len(patents)`, and `patents` is the result
+        # of a LEFT JOIN through `patent_organizations`. A patent with three
+        # assignees is three rows, so this counted **patent-assignee pairs and
+        # called them patents**. Measured 2026-08-10 on the branch:
+        #
+        #     EGFR   466 reported / 363 real   (+28%)
+        #     KRAS   565 reported / 416 real   (+36%)
+        #     ERBB2  621 reported / 500 real   (+24%)
+        #
+        # The inflation tracks how many co-assignees a target's patents happen
+        # to have, so it is neither constant nor proportional to anything a
+        # reader could correct for — and it is a headline number in a
+        # competitive-landscape payload, where "363 patents" and "466 patents"
+        # support different conclusions about how crowded a target is.
+        #
+        # The row list stays at pair grain: the organizations aggregation above
+        # needs one row per assignee, and de-duplicating it would drop the
+        # second and third assignee of every co-owned patent. The COUNT is what
+        # was wrong, not the rows.
+        # `.get`, not `[...]`: a row without a patent id cannot be deduplicated,
+        # and the honest count is then over the rows that CAN be. Silently
+        # falling back to `len(patents)` would restore the exact defect this
+        # replaces, under a key that now claims to be distinct.
+        ids = {p.get("patent_id") for p in patents}
+        ids.discard(None)
+        unidentified = sum(1 for p in patents if p.get("patent_id") is None)
+        distinct_patents = len(ids) + unidentified
+
         return {
             "target": target,
             "organizations": organizations,
@@ -770,7 +819,12 @@ class GraphQueries:
             "patents": patents,
             "total_orgs": len(org_map),
             "total_compounds": len(compounds),
-            "total_patents": len(patents),
+            "total_patents": distinct_patents,
+            # Kept visible rather than dropped: the gap between the two is the
+            # co-assignment rate, which is a real property of the landscape,
+            # and a silently-corrected number is indistinguishable from one
+            # that was always right.
+            "patent_assignee_pairs": len(patents),
             "paper_attribution_note": ORG_PAPER_ATTRIBUTION_NOTE,
         }
 
@@ -3869,7 +3923,8 @@ class GraphQueries:
                         # threshold test is sound on a lower bound. This is the
                         # presence direction; the same number may never be used
                         # to argue the gene has FEW compounds.
-                        if in_kg and compounds_for_caveat >= 25 else None),
+                        if in_kg and compounds_for_caveat >= CROWDED_COMPOUNDS
+                        else None),
                 },
                 "co_functionality_proxy": co_func,
                 "co_essentiality_r": coess_r if coess_r > 0 else None,
@@ -3944,15 +3999,48 @@ class GraphQueries:
             Nothing here changed to fix it. The payload now sets the key, which
             is the whole repair: a check that reads a field nobody writes is
             indistinguishable from a check that passes.
+
+            THE CHEMISTRY HALF, added 2026-08-10 (operator-approved).
+            The test read patents and phase and never the compounds axis, so a
+            gene with thousands of molecules and no clinical programme ranked
+            as unexplored: HSD17B10 at >=7,957 molecules, WDR77 at >=1,876,
+            PAK6 at 1,205 — 46 candidate partners over the 60 anchors at >= 25.
+            Issue #8 was that a partner could pass on patents alone; the fix
+            for it added phase, and left the same hole one axis over.
+
+            `compound_count` is verified WRITTEN before being read, because
+            that is the entire lesson of the paragraph above. It is set on
+            every assessable row from `compounds_for_caveat`, alongside
+            `compound_count_is_floor`.
+
+            A FLOOR CLEARS THIS TEST, and that is sound rather than convenient.
+            `truncated` means "at least N molecules", so a floor of >= 25
+            proves the true value is >= 25. This is the presence direction. The
+            same number may never be used to argue a gene has FEW compounds —
+            that is the absence direction, and a floor cannot support it.
+
+            AN UNMEASURED PARTNER CANNOT BE MADE CROWDED BY THIS.
+            `compounds_for_caveat` falls back to 0 when a partner's compounds
+            were never counted, and 0 < 25, so the test simply does not fire —
+            `unmeasured_is_not_zero` pushes in the safe direction here. Such a
+            partner is excluded a few lines below as uncounted anyway.
+
+            Each axis is now judged independently. The old body returned early
+            on `pats is None`, so a partner whose patents were unmeasured could
+            not be found crowded on phase or chemistry either — one axis's
+            silence suppressed the other two.
             """
             wp = c["whitespace_partner"]
             if not wp.get("in_mosaic_kg"):
                 return False
             pats = wp.get("patent_count")
             phase = wp.get("max_phase")
-            if pats is None:
-                return False
-            return pats >= 5 or bool(phase and phase >= 1)
+            cmpds = wp.get("compound_count")
+            return (
+                bool(pats is not None and pats >= 5)
+                or bool(phase is not None and phase >= 1)
+                or bool(cmpds is not None and cmpds >= CROWDED_COMPOUNDS)
+            )
 
         crowded = [c for c in cands if _is_crowded(c)]
         cands = [c for c in cands if not _is_crowded(c)]
@@ -4296,9 +4384,26 @@ class GraphQueries:
                     "out_of_coverage": bool(not r.get("b_in_mosaic")),  # gap-fix 8
                     "not_assessed_reason": (
                         None if r.get("b_in_mosaic") else OUT_OF_COVERAGE_REASON),
-                    "patent_count": patents_b,
-                    "compound_count": int(r["compounds_b"] or 0),
-                    "max_clinical_phase": int(r["max_phase_b"] or 0),
+                    # For a gene outside the curated universe these are not
+                    # counts of zero, they are absent measurements. The
+                    # whitespace tool was fixed for exactly this and this one
+                    # was not: it published `compound_count: 0` and
+                    # `patent_count: 0` for genes with no `targets` row at all,
+                    # which is `unmeasured_is_not_zero` on a paid payload.
+                    #
+                    # It stayed invisible because the old single ranked list
+                    # mixed assessed and unassessed rows, so the field varied
+                    # across the sample and the constant-field sweep had
+                    # nothing to catch. Splitting the lists (D9) made it
+                    # constant within `unassessed_candidates[]` and the sweep
+                    # reported it on the next run — a detector finding a defect
+                    # it had always been blind to, because the shape of the
+                    # payload changed rather than the data.
+                    "patent_count": patents_b if r.get("b_in_mosaic") else None,
+                    "compound_count": (int(r["compounds_b"] or 0)
+                                       if r.get("b_in_mosaic") else None),
+                    "max_clinical_phase": (int(r["max_phase_b"] or 0)
+                                           if r.get("b_in_mosaic") else None),
                 },
                 "evidence_source": "resistance_relations",
                 "resistance_evidence_papers": papers,
@@ -4378,6 +4483,30 @@ class GraphQueries:
         # Ordering by evidence class first makes that structural rather than
         # a property of two numbers that drifted apart.
         _SOURCE_RANK = {"resistance_relations": 0, "string_ppi": 1}
+        # D9 — the defect is the MERGE, and the fix is the split below, not a
+        # re-sort of this list.
+        #
+        # `drugability_gap_score` is built from patent and phase counts, and a
+        # candidate outside the curated universe has none of those, so it
+        # scores as maximally undrugged for the sole reason that nobody
+        # measured it — `unmeasured_is_not_zero` inside a ranking function.
+        # Measured on EGFR 2026-08-10: 37 candidates, 29 of them outside the
+        # universe.
+        #
+        # The obvious fix is to sort assessable rows first. That was tried, and
+        # `test_resistance_bypass_shape` caught it: it pins a contract this
+        # ordering would have broken — **a tool named for resistance evidence
+        # must never lead with a candidate that has none**. Assessability-first
+        # promotes an assessed PPI-only neighbour above an unassessed
+        # literature-backed one, which is a worse answer from a tool whose
+        # premise is the resistance layer. Two ordering contracts, and the
+        # older one is the more important; the check was right and the change
+        # was wrong.
+        #
+        # So evidence class stays primary, and the assessed/unassessed
+        # distinction is carried by the two named lists in the payload instead
+        # — which is what the plan asked for ("whitespace deliberately keeps
+        # two") and does not require an ordering to encode two things at once.
         out.sort(
             key=lambda x: (
                 _SOURCE_RANK.get(x["evidence_source"], 9),
@@ -4407,15 +4536,29 @@ class GraphQueries:
         # three zeros got conflated in the first place.
         assessable = [c for c in out
                       if c["bypass_target"].get("in_mosaic_kg")]
+        # Same three axes as `_is_crowded` in the whitespace tool, and the same
+        # threshold constant. The two tools deliberately share one vocabulary
+        # for the three zeros; sharing the words while disagreeing on what
+        # "crowded" counts would be worse than not sharing them, because the
+        # numbers would look comparable and would not be.
         crowded = [c for c in assessable
                    if (c["bypass_target"].get("patent_count") or 0) >= 5
-                   or (c["bypass_target"].get("max_clinical_phase") or 0) >= 1]
+                   or (c["bypass_target"].get("max_clinical_phase") or 0) >= 1
+                   or (c["bypass_target"].get("compound_count") or 0)
+                   >= CROWDED_COMPOUNDS]
         unassessed = [c for c in out
                       if not c["bypass_target"].get("in_mosaic_kg")]
         return {
             "target": t,
             "indication_filter": indication,
+            # Ordered by evidence class, then score — unchanged, and see the
+            # sort above for why an assessability-first ordering was reverted.
             "bypass_candidates": out,
+            # D9 — the two populations, named. Whitespace keeps them apart and
+            # this did not, so the same distinction had to be re-derived by
+            # every caller from a per-item flag most of them never read.
+            "assessed_candidates": assessable,
+            "unassessed_candidates": unassessed,
             "total": len(out),
             "zero_reason": (
                 None if out
