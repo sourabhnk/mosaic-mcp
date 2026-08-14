@@ -848,49 +848,10 @@ class RelationSearchInput(BaseModel):
 #      orientation fact for a pip user and the hosted text never says it, because
 #      for a hosted user it is not true.
 
-_CAPABILITY_GROUPS: list[dict] = [
-    {"group": "Start with one target",
-     "answers": "Everything known about a single gene — profile, scores, druggability, assay precedent.",
-     "tools": ["mosaic_search_targets", "mosaic_get_target_profile", "mosaic_target_scores",
-               "mosaic_assess_druggability", "mosaic_target_validation", "mosaic_get_target_structure"],
-     "example": "mosaic_get_target_profile(gene_symbol='EGFR')"},
-    {"group": "Compounds & chemistry",
-     "answers": "What binds a target, how selective it is, its analogs and polypharmacology.",
-     "tools": ["mosaic_get_target_compounds", "mosaic_compound_selectivity", "mosaic_compound_analogs",
-               "mosaic_compound_polypharmacology", "mosaic_modality_gaps", "mosaic_compare_drugs"],
-     "example": "mosaic_compound_selectivity(compound_id='CHEMBL941')"},
-    {"group": "Clinical & regulatory",
-     "answers": "Trials for a target's drugs, real ClinicalTrials.gov records, FDA status, repurposing.",
-     "tools": ["mosaic_clinical_pipeline", "mosaic_trial_results", "mosaic_regulatory_status",
-               "mosaic_drug_repurposing"],
-     "example": "mosaic_clinical_pipeline(gene_symbol='ERBB2')"},
-    {"group": "Competitive & IP",
-     "answers": "Who is working on a target — patents, organizations, KOLs, talent flow.",
-     "tools": ["mosaic_competitive_landscape", "mosaic_get_target_patents", "mosaic_org_portfolio",
-               "mosaic_kol_finder", "mosaic_talent_migration"],
-     "example": "mosaic_competitive_landscape(gene_symbol='KRAS')"},
-    {"group": "Discovery & white-space",
-     "answers": "Find targets: underexplored, undruggable, synthetic-lethal, resistance-bypass, emerging, similar.",
-     "tools": ["mosaic_find_opportunities", "mosaic_find_undruggable_targets",
-               "mosaic_synthetic_lethal_whitespace", "mosaic_resistance_bypass_map",
-               "mosaic_emerging_signals", "mosaic_find_similar_targets", "mosaic_compare_targets"],
-     "example": "mosaic_find_opportunities(therapy_area='oncology')"},
-    {"group": "Biology & evidence",
-     "answers": "Pathways, network neighborhood, mechanism of action, papers, and the raw evidence trail.",
-     "tools": ["mosaic_pathway_context", "mosaic_target_network", "mosaic_target_mechanisms",
-               "mosaic_evidence_map", "mosaic_relation_search", "mosaic_get_target_papers"],
-     "example": "mosaic_pathway_context(gene_symbol='BRAF')"},
-    {"group": "Indications",
-     "answers": "Targets and compounds for a disease, and fine-grained oncology sub-indications.",
-     "tools": ["mosaic_indication_landscape", "mosaic_list_indications",
-               "mosaic_list_subindications", "mosaic_subindication_breakdown"],
-     "example": "mosaic_indication_landscape(indication_name='non-small cell lung cancer')"},
-    {"group": "Track & request",
-     "answers": "Save targets/orgs to a watchlist, request a target we don't cover yet, or check KG scope.",
-     "tools": ["mosaic_watchlist_create", "mosaic_watchlist_add_item", "mosaic_watchlist_get",
-               "mosaic_watchlist_list", "mosaic_kg_stats"],
-     "example": "mosaic_kg_stats()"},
-]
+# `_CAPABILITY_GROUPS` lived here and was never read in this package. It
+# listed 33 tool names that exist only in the hosted server, so it was
+# dead code that described a different product. The hosted copy DOES
+# consume its version (src/mcp/server.py) and is correct there.
 
 
 @mcp.tool(
