@@ -959,7 +959,15 @@ def mosaic_get_target_compounds(params: GeneSymbolWithLimit) -> str:
     symbol = params.gene_symbol.strip().upper()
     limit = _enforce_limit("mosaic_get_target_compounds", params.limit)
     compounds = gq.get_target_compounds(symbol, limit)
-    return _json_result(_paged(compounds, "compounds", target=symbol))
+    # DATA_LICENCES 1.5 (2026-09-14): these rows are ChEMBL-derived, and ChEMBL
+    # is ShareAlike -- the notice travels with every payload that carries the
+    # rows, because a licence recorded only in a doc nobody fetches is the
+    # AlphaMissense label again.
+    return _json_result(_paged(
+        compounds, "compounds", target=symbol,
+        upstream_licence="ChEMBL data: CC BY-SA 3.0 -- adapted material must "
+                         "carry the same or a compatible licence",
+    ))
 
 
 # ---------------------------------------------------------------------------
