@@ -2,12 +2,12 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.sourabhnk/mosaic-mcp",
   "title": "Mosaic Pre-Clinical Intelligence",
-  "description": "Pre-clinical drug-target intelligence: 60 curated targets, 2,687 counted partner genes, 12 tools",
+  "description": "Pre-clinical drug-target intelligence: 60 curated targets, 1,969 counted partner genes, 12 tools",
   "repository": {
     "url": "https://github.com/sourabhnk/mosaic-mcp",
     "source": "github"
   },
-  "version": "1.7.1",
+  "version": "1.7.2",
   "packages": [
     {
       "registryType": "pypi",
