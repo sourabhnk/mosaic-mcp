@@ -131,9 +131,22 @@ _COVERAGE_MEANING = {
     "covered_but_unlinked": "the source holds records we did not link; the count understates",
     "not_in_universe": "the source's own manifest does not contain this target",
     "no_fetch_evidence": "we hold NO evidence a fetch ever ran — this is not a measurement",
+    # The source answered; the answer cannot be attributed to this target.
+    # Distinct from `not_applicable`, which is about the TARGET (CTLA4 has no
+    # pchembl activity because it is a biologic). This is about the NAME.
+    "source_not_addressable": (
+        "the source was asked and answered, but its answer cannot be "
+        "attributed to this target — the identifier is not discriminating "
+        "(e.g. a gene symbol that is also a common word). This is not a "
+        "measurement of the quantity"
+    ),
 }
 # Axes where a zero cannot be read as an absence claim.
-_NOT_ABSENCE = {"truncated", "no_fetch_evidence", "covered_but_unlinked"}
+# `source_not_addressable` is here for the same reason as the rest: we hold no
+# measurement of the quantity, so a zero cannot be read as "none exist". KIT's
+# patents cell holds zero edges and EPO reports 1,970 hits.
+_NOT_ABSENCE = {"truncated", "no_fetch_evidence", "covered_but_unlinked",
+                "source_not_addressable"}
 
 
 def _coverage_state_block(coverage: dict[str, Any]) -> dict[str, Any]:

@@ -93,21 +93,51 @@ TIER_DAILY_TARGET_LIMITS: dict[Tier, int | None] = {
 # user reads, so a stale name advertises a tool that would 404 on call. The
 # invariant in tests/test_tier_boundary.py is what catches it.
 # ---------------------------------------------------------------------------
+# D1 (2026-09-14, executed in 3.1 2026-09-22): patents left the public
+# surface — `mosaic_get_target_patents` removed here and from server.py.
+# The coverage grid is the new free front door for ANY human target (L2):
+# it demos the mechanism; the dossier is the product it sells.
 FREE_TOOLS = frozenset({
     "mosaic_get_target_profile",
     "mosaic_get_target_compounds",
-    "mosaic_get_target_patents",
     "mosaic_get_target_papers",
     "mosaic_get_target_structure",
+    "mosaic_get_coverage_grid",
 })
 
 # Per-tool result limits by tier
 TIER_RESULT_LIMITS: dict[str, dict[Tier, int]] = {
     "mosaic_get_target_compounds": {Tier.FREE: 10, Tier.PRO: 50, Tier.ENTERPRISE: 200},
-    "mosaic_get_target_patents":   {Tier.FREE: 10, Tier.PRO: 50, Tier.ENTERPRISE: 200},
     "mosaic_get_target_papers":    {Tier.FREE: 10, Tier.PRO: 50, Tier.ENTERPRISE: 200},
     "mosaic_compound_analogs":     {Tier.FREE: 5,  Tier.PRO: 20, Tier.ENTERPRISE: 50},
     "mosaic_relation_search":      {Tier.FREE: 10, Tier.PRO: 50, Tier.ENTERPRISE: 100},
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3.2 pricing (2026-09-22). Prices to TEST, not to defend (plan §3.2).
+# ONE home; the pricing page, Dodo products and the MCP upsell all read or
+# mirror these — a price that drifts between surfaces is fluent wrongness.
+# `Tier.ENTERPRISE` is DISPLAYED as "Team" (renaming the enum value would
+# orphan existing rows).
+# ---------------------------------------------------------------------------
+TIER_PRICES_USD_MONTHLY: dict[Tier, int] = {
+    Tier.FREE: 0,
+    Tier.PRO: 79,
+    Tier.ENTERPRISE: 490,     # displayed as "Team"; invoice available
+}
+TIER_DISPLAY_NAMES: dict[Tier, str] = {
+    Tier.FREE: "Free", Tier.PRO: "Pro", Tier.ENTERPRISE: "Team",
+    Tier.ADMIN: "Admin",
+}
+ONE_OFF_DOSSIER_PRICE_USD = 149    # the most important SKU for Phase 5
+
+# On-demand dossiers per month, by tier. The one-off SKU grants +1 outside
+# the subscription quota (tracked on the order, not here).
+TIER_DOSSIER_QUOTAS: dict[Tier, int | None] = {
+    Tier.FREE: 0,
+    Tier.PRO: 5,
+    Tier.ENTERPRISE: 30,
+    Tier.ADMIN: None,          # unlimited
 }
 
 # Max tokens in structured data per agent response
@@ -344,6 +374,18 @@ def update_user_tier(user_id: str, tier: Tier, **kwargs: Any) -> None:
 # ---------------------------------------------------------------------------
 # Usage tracking & quota enforcement
 # ---------------------------------------------------------------------------
+
+def touch_last_seen(user_id: str) -> None:
+    """3.3: stamp users.last_seen. Best-effort by contract — callers treat
+    metering as never-fatal, and this inherits that posture. A missing column
+    (pre-migration DB) is logged, not raised."""
+    try:
+        _db().execute(
+            "UPDATE users SET last_seen = now() WHERE id = %(id)s",
+            {"id": user_id})
+    except Exception as e:  # noqa: BLE001
+        logger.debug("touch_last_seen skipped for %s: %s", user_id, e)
+
 
 def record_usage(
     user_id: str,

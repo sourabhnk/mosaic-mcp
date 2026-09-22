@@ -1461,21 +1461,32 @@ class GraphQueries:
                     "dependency_fraction": float(row[0]["dependency_fraction"] or 0),
                     "n_models": int(row[0]["n_models"] or 0),
                 }
-        am = self._execute_safe(
-            "SELECT to_regclass('target_variant_pathogenicity') AS t"
-        )
-        if am and am[0].get("t"):
-            row = self._execute_safe(
-                """SELECT n_variants, pct_pathogenic, hotspot_residues
-                   FROM target_variant_pathogenicity WHERE target_id = %(t)s""",
-                {"t": target},
-            )
-            if row:
-                profile["alphamissense"] = {
-                    "n_missense_variants": int(row[0]["n_variants"] or 0),
-                    "pct_pathogenic": float(row[0]["pct_pathogenic"] or 0),
-                    "hotspot_residues": row[0]["hotspot_residues"] or [],
-                }
+        # ⛔ WITHHELD 2026-09-22 — the SECOND AlphaMissense serve path.
+        #
+        # The 2026-08-03 withhold (C1.3) replaced the block in
+        # get_target_validation_summary and its test drove ONLY that tool.
+        # THIS block kept serving pct_pathogenic + hotspot_residues through
+        # get_target_profile — a FREE tool — for seven weeks, and it is how
+        # the v3 dossier bundles (built 2026-08-21 via SECTION_TOOLS ->
+        # get_target_profile) carried the figures into published prose
+        # ("54% of missense variants pathogenic", EGFR.md).
+        #
+        # Same policy, same shape as the first fix: the marker is served so
+        # the absence is stated, never silent, and the 322 rows stay in the
+        # table (evidence of what was served; cheapest path back if the
+        # licence determination changes). AlphaMissense is CC BY-NC-SA 4.0;
+        # Mosaic is commercial. test_licence_withholding.py now drives BOTH
+        # tools — the gap that let this path leak was exactly that it drove
+        # one.
+        profile["alphamissense"] = {
+            "state": "withheld_licence",
+            "reason": "AlphaMissense is CC BY-NC-SA 4.0 (non-commercial, "
+                      "share-alike). Mosaic is a commercial product, so this "
+                      "evidence class is withheld rather than served.",
+            "source": "AlphaMissense (DeepMind, 2023)",
+            "upstream_licence": "CC-BY-NC-SA-4.0",
+            "withheld_since": "2026-08-03 (this serve path: 2026-09-22)",
+        }
         return profile
 
     # =====================================================================
@@ -1787,7 +1798,25 @@ class GraphQueries:
                 JOIN indications i ON i.id = ti.indication_id
                 WHERE ct.target_id = %(t)s
                   AND ti.association_score >= 0.3
-                ORDER BY c.max_phase DESC, ct.value ASC NULLS LAST, ti.association_score DESC
+                -- `NULLS LAST` is load-bearing. Postgres sorts NULLS FIRST on
+                -- DESC by default, so without it every compound whose phase is
+                -- unrecorded sorts ABOVE every approved drug and the LIMIT
+                -- below keeps the unknowns. This clause was the only one of the
+                -- five `ORDER BY c.max_phase DESC` in this file missing it.
+                --
+                -- Harmless while the column had no NULLs, and instantly not:
+                -- the 2026-08-14 cleanup replaced 16,742 coerced zeros with the
+                -- NULL ChEMBL actually returns, and KRAS's pipeline immediately
+                -- became 15 rows of one unnamed research compound while
+                -- SOTORASIB, ADAGRASIB, LONAFARNIB and DABRAFENIB — all phase 4,
+                -- all on this target — fell off the end. That is the same
+                -- payload the comment above describes shipping approved drugs
+                -- as preclinical, reached by a different route.
+                --
+                -- Caught by test_perturbing_compound_max_phase_moves_the_dossier_pipeline
+                -- on the first sweep that was able to start in eight days.
+                ORDER BY c.max_phase DESC NULLS LAST,
+                         ct.value ASC NULLS LAST, ti.association_score DESC
                 LIMIT 15
             """, {"t": target})
             seen = {(r["compound_name"], r["indication_name"]) for r in pipeline}
@@ -2570,7 +2599,22 @@ class GraphQueries:
                    p.country_code AS jurisdiction,
                    ARRAY_AGG(DISTINCT o.name) FILTER (WHERE o.name IS NOT NULL) AS assignees,
                    -- Counts GROUPS (distinct patents), evaluated before LIMIT.
-                   COUNT(*) OVER () AS total_available
+                   COUNT(*) OVER () AS total_available,
+                   -- Same floor disclosure the papers axis got on 2026-08-14,
+                   -- and on patents it now applies to EVERY target: since the
+                   -- grain fix (2026-08-15) all 60 patents cells are
+                   -- `truncated`, because EPO's CPC+date-filtered count is not
+                   -- a superset of the multi-source edge set we store and so
+                   -- can never establish completeness.
+                   -- Without this the payload reads "Showing 2 of 302", which
+                   -- states as a total a number that is only a floor.
+                   -- Keyed on the RESOLVED parameter, not `pmt.target_id`:
+                   -- this query has a GROUP BY and the column is ungrouped, so
+                   -- referencing it raises. Same value, no grouping dependency.
+                   (SELECT tc.state = 'truncated'
+                      FROM target_coverage tc
+                     WHERE tc.target_id = %(target)s
+                       AND tc.axis = 'patents') AS total_is_floor
             FROM patent_mentions_target pmt
             JOIN patents p ON p.id = pmt.patent_id
             LEFT JOIN patent_organizations po ON po.patent_id = p.id
@@ -2585,10 +2629,25 @@ class GraphQueries:
         self, target_symbol: str, limit: int = 20
     ) -> list[dict[str, Any]]:
         target = self._resolve_target(target_symbol)
+        # `total_available` counts the papers WE HOLD, and for 58 of the 60
+        # dossier targets that is itself a capped fetch, not the literature.
+        # The coverage model already knows this - the papers axis is
+        # `truncated` - but nothing carried it into the payload, so the tool
+        # rendered a floor as a total ("Showing 5 of 775") and a dossier built
+        # on that would state "775 papers mention EGFR" as a fact.
+        #
+        # Reset plan F2, hard rule 1: a truncated axis may support presence
+        # claims, never absence claims. This is the compounds axis's
+        # `compound_count_is_floor` applied to papers, which is where the
+        # pattern already existed and papers was simply never wired to it.
         return self._execute_safe("""
             SELECT p.id AS paper_id, p.title,
                    p.publication_date, p.journal, p.pmid, p.doi,
-                   COUNT(*) OVER () AS total_available
+                   COUNT(*) OVER () AS total_available,
+                   (SELECT tc.state = 'truncated'
+                      FROM target_coverage tc
+                     WHERE tc.target_id = pmt.target_id
+                       AND tc.axis = 'papers') AS total_is_floor
             FROM paper_mentions_target pmt
             JOIN papers p ON p.id = pmt.paper_id
             WHERE pmt.target_id = %(target)s
@@ -3262,6 +3321,29 @@ class GraphQueries:
             "SELECT to_regclass('target_coessentiality_ext') AS t"
         )
         if has_coess_ext and has_coess_ext[0].get("t"):
+            # ⚠️ POSITIVE CORRELATION ONLY, AND NEVER ABS(). E3, 2026-08-14.
+            #
+            # This ordered by ABS(correlation) DESC, so r = -0.28 outranked
+            # r = +0.21 and anti-correlated genes were rendered as a target's
+            # TOP co-essential partners. EGFR's own top-10 carried CDS2 at
+            # -0.334 in ninth place, above a genuine +0.319.
+            #
+            # The sign is not a nuance, it is the claim. Positive correlation
+            # in DepMap gene-effect means both genes are needed by the same
+            # cell lines — same pathway or complex, which is what
+            # "co-essential" asserts. Negative means the opposite: a buffering
+            # or compensatory relationship, nearer to synthetic lethality.
+            # ABS() did not blur the claim, it inverted it.
+            #
+            # Measured, not argued: the E3 audit labelled 50 of these rows and
+            # the split was perfect — positive r 31/31 true, negative r 0/19
+            # true. Precision 0.620 [0.482, 0.741], the worst of six classes,
+            # entirely explained by sign.
+            #
+            # Operator decision 2026-08-14: drop the negatives from this path.
+            # The ROWS ARE KEPT — 1,517 of 4,060 — because they are a real
+            # measurement of a different relationship and deleting them is the
+            # expensive, irreversible half of the fix.
             coess = self._execute_safe("""
                 SELECT ce.partner_symbol AS id,
                        COALESCE(t2.name, ce.partner_symbol) AS name,
@@ -3269,7 +3351,8 @@ class GraphQueries:
                 FROM target_coessentiality_ext ce
                 LEFT JOIN targets t2 ON t2.id = ce.partner_symbol
                 WHERE ce.target_id = %(t)s
-                ORDER BY ABS(ce.correlation) DESC
+                  AND ce.correlation > 0
+                ORDER BY ce.correlation DESC
                 LIMIT 10
             """, {"t": target})
             for c in coess:
@@ -3454,20 +3537,36 @@ class GraphQueries:
         # pair with different correlations, and plain UNION de-duplicates whole
         # ROWS, so two differing correlations would survive as two rows and
         # reach the FULL JOINs twice. Same reasoning as the PPI CTE above.
+        # ⚠️ `correlation > 0`, NOT `ABS(correlation)`. E3, 2026-08-14 — see the
+        # long note on the target-network query above for the measurement.
+        #
+        # `r` here feeds `coess_r` and the co-functionality proxy, so ABS() did
+        # not just mis-ORDER a list as it did there: it fed anti-correlation
+        # into the whitespace and synthetic-lethal scoring AS IF it were
+        # evidence of shared function. An anti-correlated pair is close to the
+        # OPPOSITE of a co-functional one, so the strongest wrong values were
+        # the most influential.
+        #
+        # The filter goes in each branch rather than once around the outside
+        # because the two tables are UNIONed and both carry negatives —
+        # `target_coessentiality_ext` 1,517 of 4,060, legacy
+        # `target_coessentiality` 104 of 524.
         if has_coess_ext and has_coess:
             coess_cte = """,
         coess AS (
             SELECT u.a, u.b, MAX(u.r) AS r
             FROM (
                 SELECT ce.target_id AS a, ce.partner_symbol AS b,
-                       ABS(ce.correlation) AS r
+                       ce.correlation AS r
                 FROM target_coessentiality_ext ce
                 JOIN anchors an ON an.a = ce.target_id
+                WHERE ce.correlation > 0
                 UNION ALL
                 SELECT ce.target_a_id AS a, ce.target_b_id AS b,
-                       ABS(ce.correlation) AS r
+                       ce.correlation AS r
                 FROM target_coessentiality ce
                 JOIN anchors an ON an.a = ce.target_a_id
+                WHERE ce.correlation > 0
             ) u
             GROUP BY 1, 2
         )"""
@@ -3475,17 +3574,19 @@ class GraphQueries:
             coess_cte = """,
         coess AS (
             SELECT ce.target_id AS a, ce.partner_symbol AS b,
-                   ABS(ce.correlation) AS r
+                   ce.correlation AS r
             FROM target_coessentiality_ext ce
             JOIN anchors an ON an.a = ce.target_id
+            WHERE ce.correlation > 0
         )"""
         elif has_coess:
             coess_cte = """,
         coess AS (
             SELECT ce.target_a_id AS a, ce.target_b_id AS b,
-                   ABS(ce.correlation) AS r
+                   ce.correlation AS r
             FROM target_coessentiality ce
             JOIN anchors an ON an.a = ce.target_a_id
+            WHERE ce.correlation > 0
         )"""
         else:
             coess_cte = ""
@@ -3526,7 +3627,22 @@ class GraphQueries:
                      WHERE target_id = pr.b) AS patents_b,
                    (SELECT COUNT(*) FROM compound_targets WHERE target_id = pr.b)
                      AS compounds_b,
-                   (SELECT COALESCE(MAX(c.max_phase), 0) FROM compound_targets ct
+                   -- NO COALESCE. `MAX` over zero measured rows is NULL, and
+                   -- defaulting that to 0 asserts "the most advanced compound
+                   -- against this gene reached phase 0" on the strength of
+                   -- having no compound, or none whose phase anyone recorded.
+                   -- This value feeds `< 1`, an ABSENCE claim, so a default is
+                   -- exactly the `unmeasured_is_not_zero` defect — and the
+                   -- partner branch beside it already refuses to do this, which
+                   -- is why the two paths disagreed on identical evidence.
+                   --
+                   -- Latent until 2026-08-14 and no longer: `compounds.max_phase`
+                   -- held 17,338 coerced zeros and now holds 16,742 NULLs, so
+                   -- MAX returns NULL wherever every compound on a gene is
+                   -- clinically unrecorded. Measured at the time of the change:
+                   -- 0 of the 60 qualify, so this corrects a defect that had
+                   -- not yet produced a wrong answer.
+                   (SELECT MAX(c.max_phase) FROM compound_targets ct
                      JOIN compounds c ON c.id = ct.compound_id
                      WHERE ct.target_id = pr.b) AS max_phase_b,
                    (SELECT COUNT(*) FROM paper_validations WHERE target_id = pr.b)
@@ -3619,7 +3735,14 @@ class GraphQueries:
         -- could carry pathway or co-essentiality data either, which is why the
         -- three-axis design collapsed to single-axis PPI on exactly the rows
         -- that survived. Split explicitly; the caller gets two lists.
-        WHERE (s.b_in_mosaic AND s.patents_b < 5 AND s.max_phase_b < 1)
+        -- `max_phase_b IS NOT NULL` is written out rather than left to SQL's
+        -- three-valued logic. `NULL < 1` is NULL and would exclude the row
+        -- anyway, but only by accident: the counting clause below is the
+        -- NEGATION of this one, and an accident that excludes here excludes
+        -- there too, which drops the row from BOTH lists. Stating the test
+        -- makes the two clauses exact complements over `b_in_mosaic`.
+        WHERE (s.b_in_mosaic AND s.patents_b < 5
+               AND s.max_phase_b IS NOT NULL AND s.max_phase_b < 1)
            -- B4: a COUNTED partner is assessable on its own numbers. An
            -- uncounted one still arrives here (it is coupled, and that is a
            -- real measurement) but carries NULL counts, so B3's exclusion
@@ -3652,7 +3775,18 @@ class GraphQueries:
            -- crowded returns the same empty list as one whose neighbours were
            -- never counted, and that conflation is the whole reason B5 exists.
            -- They are counted, never ranked — see `crowded` below.
-           OR (s.b_in_mosaic AND NOT (s.patents_b < 5 AND s.max_phase_b < 1))
+           --
+           -- The `IS NOT NULL` inside the negation is what keeps a gene with
+           -- an unmeasured phase from vanishing. Written as
+           -- `NOT (patents_b < 5 AND max_phase_b < 1)`, a NULL phase makes the
+           -- inner expression NULL and the negation NULL, so the row fails this
+           -- clause AND the admission clause above — neither a candidate nor a
+           -- counted neighbour, gone from a payload that reports three distinct
+           -- zeros. Folding the null test inside makes the inner expression
+           -- FALSE instead, so the row always arrives and Python classifies it.
+           OR (s.b_in_mosaic AND NOT (s.patents_b < 5
+                                      AND s.max_phase_b IS NOT NULL
+                                      AND s.max_phase_b < 1))
            -- The mirror of the admission clause, so a partner that FAILS the
            -- whitespace test on either axis is still counted as crowded rather
            -- than vanishing. Previously only the patents half could put a
@@ -4057,9 +4191,37 @@ class GraphQueries:
         cands = [c for c in cands
                  if c["whitespace_partner"].get("symbol") not in uncounted]
 
+        # The dossier-tier mirror of the exclusion above, and it exists for the
+        # same reason. Dropping the COALESCE on `max_phase_b` means a gene whose
+        # every compound is clinically unrecorded now arrives with `max_phase`
+        # None instead of a manufactured 0. The SQL correctly declines to admit
+        # it as a candidate, and the counting clause correctly still lets it
+        # through — but `_is_crowded` returns False for a None phase (rightly:
+        # it cannot assert crowding either), so without this the row would land
+        # in `cands` and be RANKED as whitespace on the one axis nobody
+        # measured. That is the absence claim the null was introduced to stop.
+        #
+        # Not folded into `_is_crowded`: crowded means "assessed and taken",
+        # which is a finding. This is "not assessed", which is the absence of
+        # one. Collapsing them re-conflates two of the three zeros.
+        unmeasured_phase = [
+            c for c in cands
+            if c["whitespace_partner"].get("tier") == "dossier"
+            and c["whitespace_partner"].get("max_phase") is None
+        ]
+        for c in unmeasured_phase:
+            c["not_assessed_reason"] = (
+                "dossier tier, no compound on this gene carries a recorded "
+                "clinical phase (state: unmeasured) — excluded from candidates "
+                "because an unmeasured phase is not a phase of zero"
+            )
+        _unmeasured_ids = {id(c) for c in unmeasured_phase}
+        cands = [c for c in cands if id(c) not in _unmeasured_ids]
+
         assessable = [c for c in cands if c["whitespace_partner"]["in_mosaic_kg"]]
         unassessed = [c for c in cands if not c["whitespace_partner"]["in_mosaic_kg"]]
         unassessed.extend(blocked)
+        unassessed.extend(unmeasured_phase)
         assessable.sort(key=lambda c: c["whitespace_score"], reverse=True)
         unassessed.sort(key=lambda c: c["coupling_strength"], reverse=True)
 
@@ -4158,7 +4320,16 @@ class GraphQueries:
                 "candidates": len(cands),
                 "assessed_and_crowded": len(crowded),
                 "uncounted_partners": len(blocked),
-                "outside_the_universe": len(unassessed) - len(blocked),
+                # Its own bucket, not folded into `outside_the_universe`. These
+                # genes ARE in the universe — the phase axis is what is missing,
+                # and reporting them as out-of-universe would say Mosaic does
+                # not cover a gene it has a full dossier row for. The
+                # subtraction below keeps the four buckets summing to the
+                # partner total.
+                "unmeasured_clinical_phase": len(unmeasured_phase),
+                "outside_the_universe": (
+                    len(unassessed) - len(blocked) - len(unmeasured_phase)
+                ),
             },
             "coverage_note": (
                 "`candidates` are partners Mosaic covers, so their patent and "

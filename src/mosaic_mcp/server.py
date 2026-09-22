@@ -40,7 +40,6 @@ from mosaic_mcp.users import (
 )
 from mosaic_mcp.responses import (
     format_target_dossier,
-    format_competitive_landscape,
     format_pathway_context,
     format_compound_selectivity,
     format_search_results,
@@ -136,7 +135,7 @@ def _check_tool_access(tool_name: str) -> None:
     if tool_name in FREE_TOOLS:
         return
     raise PaidTierRequired(
-        f"Tool '{tool_name}' requires a Pro plan ($49/mo). "
+        f"Tool '{tool_name}' requires a Pro plan ($79/mo). "
         f"Free tier includes: {', '.join(sorted(FREE_TOOLS))}. "
         f"Upgrade at https://getmosaic.dev/pricing"
     )
@@ -974,27 +973,99 @@ def mosaic_get_target_compounds(params: GeneSymbolWithLimit) -> str:
 # Tool 4: get_target_patents
 # ---------------------------------------------------------------------------
 
+# RETIRED - mosaic_get_target_patents (decision D1, 2026-09-14): patents left
+# the public surface. The data and query layer are KEPT. Positioning, not a
+# defect. Replaced in FREE_TOOLS by mosaic_get_coverage_grid below.
+
+
 @mcp.tool(
-    name="mosaic_get_target_patents",
+    name="mosaic_get_coverage_grid",
     annotations={
-        "title": "Get Target Patents",
+        "title": "Coverage Grid (any human target)",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
-        "openWorldHint": False,
+        "openWorldHint": True,
     },
 )
-@_with_db_error_handling
-def mosaic_get_target_patents(params: GeneSymbolWithLimit) -> str:
-    """Get patents mentioning a specific drug target.
-
-    Returns patent filings with titles, dates, and assignee organizations.
+def mosaic_get_coverage_grid(params: GeneSymbolInput) -> str:
+    """Coverage-honest grid for ANY human gene symbol - the live demo of
+    the mechanism. In this self-hosted package the grid resolves identity
+    (HGNC) and structure (AlphaFold DB) live; the remaining axes are marked
+    `queued` and are computed by the hosted service's dossier pipeline
+    (getmosaic.dev). Every count carries a state; nothing unfetched is a
+    zero.
     """
-    gq = _gq()
+    import requests as _rq
+
     symbol = params.gene_symbol.strip().upper()
-    limit = _enforce_limit("mosaic_get_target_patents", params.limit)
-    patents = gq.get_target_patents(symbol, limit)
-    return _json_result(_paged(patents, "patents", target=symbol))
+    rec = None
+    for field_name in ("symbol", "alias_symbol", "prev_symbol"):
+        try:
+            r = _rq.get(f"https://rest.genenames.org/fetch/{field_name}/{symbol}",
+                        headers={"Accept": "application/json"}, timeout=30)
+            r.raise_for_status()
+            docs = r.json().get("response", {}).get("docs", [])
+        except Exception as e:  # noqa: BLE001
+            return _json_result({"symbol_submitted": symbol,
+                                 "resolution": "lookup_failed",
+                                 "error": f"{type(e).__name__}: {e}"})
+        if docs:
+            d = docs[0]
+            rec = {"canonical": d["symbol"].upper(),
+                   "uniprot_accession": (d.get("uniprot_ids") or [None])[0],
+                   "ensembl_gene_id": d.get("ensembl_gene_id")}
+            break
+    if rec is None:
+        return _json_result({
+            "symbol_submitted": symbol, "resolution": "unknown_symbol",
+            "note": f"HGNC has no record for {symbol!r} as a current symbol, "
+                    f"alias or previous symbol. Not resolvable; not guessed."})
+
+    structure = {"count": None, "state": "queued"}
+    acc = rec["uniprot_accession"]
+    if acc:
+        try:
+            r = _rq.get(f"https://alphafold.ebi.ac.uk/api/prediction/{acc}",
+                        timeout=30)
+            if r.status_code == 404:
+                structure = {"count": None, "state": "fetch_failed",
+                             "note": "AFDB 404 on a resolved accession - a "
+                                     "lookup failure, never 'no structure'"}
+            else:
+                r.raise_for_status()
+                entries = r.json()
+                structure = {"count": len(entries), "state": "fetched_on_demand",
+                             "mean_plddt": (entries[0].get("globalMetricValue")
+                                            if entries else None)}
+        except Exception as e:  # noqa: BLE001
+            structure = {"count": None, "state": "fetch_failed",
+                         "error": f"{type(e).__name__}: {e}"[:160]}
+    else:
+        structure = {"count": None, "state": "not_applicable",
+                     "note": "no UniProt accession resolved"}
+
+    queued = {"count": None, "state": "queued",
+              "note": "computed by the hosted dossier pipeline"}
+    grid = {"papers": dict(queued), "compounds": dict(queued),
+            "trials": {**queued,
+                       "note": "PERMANENT FLOOR: never supports an absence "
+                               "claim"},
+            "ppi": dict(queued), "essentiality": dict(queued),
+            "coessentiality": dict(queued), "structure": structure,
+            "constraint_metrics": dict(queued),
+            "genetic_association": dict(queued)}
+    return _json_result({
+        "symbol_submitted": symbol,
+        "canonical": rec["canonical"],
+        "uniprot_accession": acc,
+        "ensembl_gene_id": rec["ensembl_gene_id"],
+        "grid": grid,
+        "how_to_read": "queued axes are fetched by the hosted pipeline when "
+                       "a dossier is requested; 'we have not fetched yet' "
+                       "and 'there is none' never share a value.",
+        "hosted": "https://getmosaic.dev - request a full dossier",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1084,29 +1155,8 @@ def mosaic_get_target_structure(params: GeneSymbolInput) -> str:
 # Tool 5b: assess_druggability
 # ---------------------------------------------------------------------------
 
-@mcp.tool(
-    name="mosaic_competitive_landscape",
-    annotations={
-        "title": "Competitive Landscape",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_competitive_landscape(params: GeneSymbolInput) -> str:
-    """Get the full competitive landscape for a drug target.
-
-    Multi-hop traversal: Target <- Compounds, Target <- Patents -> Organizations.
-    Shows which pharma/biotech companies are active on this target,
-    how many patents and compounds each has, and overall competitive intensity.
-    """
-    _check_tool_access("mosaic_competitive_landscape")
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    result = gq.get_competitive_landscape(symbol)
-    return _json_result(format_competitive_landscape(result))
+# RETIRED - mosaic_competitive_landscape (decision D1, 2026-09-14): built on
+# patent assignees, which left the public surface with them.
 
 
 # ---------------------------------------------------------------------------

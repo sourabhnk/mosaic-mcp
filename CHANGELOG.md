@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.0 — 2026-09-22
+
+Positioning, not a defect (decision D1): patent intelligence leaves the
+public surface.
+
+- REMOVED: `mosaic_get_target_patents` and `mosaic_competitive_landscape`.
+  The underlying data and query layer are unchanged; the tools are simply
+  no longer part of the product surface.
+- ADDED: `mosaic_get_coverage_grid` — a coverage-honest grid for ANY human
+  gene symbol (free). Identity (HGNC) and structure (AlphaFold DB) resolve
+  live; remaining axes are marked `queued` and are computed by the hosted
+  dossier pipeline. Nothing unfetched is ever rendered as zero.
+- On-demand dossiers (`mosaic_request_dossier` / `mosaic_get_dossier`) are
+  hosted-only tools at getmosaic.dev — they require the fetch/synthesis
+  queue and are not part of the self-hosted package.
+- Compounds payloads carry the ChEMBL CC BY-SA 3.0 notice (ShareAlike).
+- Pro price is now $79/mo.
+
+
 All notable user-facing changes to the `mosaic-mcp` package. This package
 bundles Mosaic's knowledge-graph query and rendering layer; it is
 bring-your-own-database. Dates are UTC.
