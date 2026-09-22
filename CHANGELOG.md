@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.1 — 2026-09-22
+
+- FIXED: the response cache never engaged. FastMCP invokes tools with
+  keyword arguments, and the caching wrapper read only positional
+  `args[0]` — so `params` was always None and every call skipped the
+  cache silently. The wrapper now also reads `kwargs["params"]`.
+  No behavioural change to tool results; repeated identical calls at
+  the same tier are now served from `tool_response_cache` (keyed on
+  `kg_version`, so data refreshes still invalidate).
+
 ## 2.0.0 — 2026-09-22
 
 Positioning, not a defect (decision D1): patent intelligence leaves the

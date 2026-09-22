@@ -542,7 +542,11 @@ def _with_db_error_handling(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        params = args[0] if args else None
+        # FastMCP invokes tools as fn(**validated_kwargs) — args is ALWAYS
+        # empty on the MCP path, so reading only args[0] left params None
+        # and silently disabled the response cache on every remote call.
+        # Every tool's sole argument is named `params`.
+        params = args[0] if args else kwargs.get("params")
         cache_params = None
         if (
             params is not None
