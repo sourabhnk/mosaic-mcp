@@ -16,7 +16,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
@@ -151,30 +151,41 @@ def _enforce_limit(tool_name: str, requested: int) -> int:
     return min(requested, max_allowed)
 
 
-def _paged(rows: list[dict], key: str, **extra) -> dict:
+def _paged(rows: list[dict], key: str, requested: int | None = None,
+           applied: int | None = None, **extra) -> dict:
     """Build a paged payload that tells the truth about what it withheld.
 
-    Hand-ported from the hosted server (board S7b). `sync_pip_package.py`
-    syncs the data layer but deliberately EXCLUDES server.py, and server.py is
-    what *calls* it -- so a query-layer change lands here only if a human
-    carries it. queries.py now emits `total_available` (COUNT(*) OVER (),
-    evaluated before LIMIT); without this function the pip package would leak
-    that column onto every row AND keep reporting the page size as `total`.
+    Hand-ported from the hosted server (board S7b; audit 2026-10-03).
+    `sync_pip_package.py` syncs the data layer but deliberately EXCLUDES
+    server.py, and server.py is what *calls* it -- so a query-layer change
+    lands here only if a human carries it. queries.py emits `total_available`
+    (COUNT(*) OVER (), evaluated before LIMIT) and, on the papers axis,
+    `total_is_floor`; both are transport columns stripped from the rows.
     """
     has_total = bool(rows) and "total_available" in rows[0]
     total = int(rows[0]["total_available"]) if has_total else len(rows)
-    clean = [{k: v for k, v in r.items() if k != "total_available"} for r in rows]
+    total_is_floor = bool(rows) and bool(rows[0].get("total_is_floor"))
+    transport = ("total_available", "total_is_floor")
+    clean = [{k: v for k, v in r.items() if k not in transport} for r in rows]
     payload = {**extra, key: clean, "returned": len(clean), "total": total}
+    if total_is_floor:
+        payload["total_is_floor"] = True
     if rows and not has_total:
         # The query layer drifted out from under this copy. Say so rather than
         # crashing OR silently republishing the page size as the total.
         payload["_total_is_page_size"] = True
     if total > len(clean):
         payload["truncated"] = True
-        payload["_note"] = (
-            f"Showing {len(clean)} of {total}. Raise `limit`, or upgrade if you "
-            f"are at your tier's cap — see https://getmosaic.dev/pricing"
-        )
+        of_total = f"at least {total}" if total_is_floor else str(total)
+        # Audit 2026-10-03 P1-4: name the tier cap when IT bound the page;
+        # "raise limit" cannot work when the cap, not the limit, applied.
+        if requested is not None and applied is not None and applied < requested:
+            how = (f"Capped at {applied} on the {_get_session_tier().value} tier "
+                   f"(you asked for {requested}) -- see https://getmosaic.dev/pricing")
+            payload["tier_cap_applied"] = applied
+        else:
+            how = "Raise `limit` to see more."
+        payload["_note"] = f"Showing {len(clean)} of {of_total}. {how}"
     return payload
 
 # ---------------------------------------------------------------------------
@@ -391,7 +402,8 @@ FRESHNESS_UNAVAILABLE = "unavailable"  # could not read it; as_of is null, NOT t
 # `if _PROV_CACHE["as_of"] and ...`, so once as_of stops being truthy every tool
 # re-queries on every call — a retry storm against a database that is, by
 # construction, already unhealthy. Unknown is cached too, briefly.
-_PROV_CACHE: dict[str, Any] = {"at": 0.0, "as_of": None, "freshness": None}
+_PROV_CACHE: dict[str, Any] = {"at": 0.0, "as_of": None, "freshness": None,
+                               "kg_version": None}
 _PROV_TTL_OK_S = 300.0
 _PROV_TTL_UNAVAILABLE_S = 45.0  # short: a recovered DB must not keep reporting unknown
 
@@ -413,15 +425,18 @@ def _provenance_freshness() -> tuple[str | None, str]:
             return _PROV_CACHE["as_of"], cached_state
 
     as_of: str | None = None
+    kg_version = None
     try:
         meta = _gq().get_kg_metadata()
+        if meta and meta.get("kg_version") is not None:
+            kg_version = int(meta["kg_version"])
         if meta and meta.get("last_refresh_at"):
             as_of = str(meta["last_refresh_at"])[:10]
     except Exception as e:
         logger.warning("provenance: kg_metadata unreadable, as_of=null: %s", e)
 
     freshness = FRESHNESS_KG_METADATA if as_of else FRESHNESS_UNAVAILABLE
-    _PROV_CACHE.update(at=now, as_of=as_of, freshness=freshness)
+    _PROV_CACHE.update(at=now, as_of=as_of, freshness=freshness, kg_version=kg_version)
     return as_of, freshness
 
 
@@ -469,10 +484,15 @@ def _json_result(data: Any) -> str:
                 # mean "this build does not stamp freshness", a different fact.
                 "as_of": _as_of,
                 "freshness": _freshness,
-                "confidence_summary": None,
+                # Audit 2026-10-03 P2: counts drift between refreshes; the
+                # version makes the drift explicable.
+                "kg_version": _PROV_CACHE.get("kg_version"),
             },
         }
-    return json.dumps(data, indent=2, default=str)
+    # Compact, not indent=2: a quarter of every payload was indentation the
+    # model had to read (audit 2026-10-03 P2 — the profile ran 37 kB pretty,
+    # 28 kB compact).
+    return json.dumps(data, default=str, separators=(",", ":"))
 
 
 def _json_error(message: str) -> str:
@@ -611,6 +631,16 @@ class GeneSymbolWithLimit(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     gene_symbol: str = Field(..., description="Gene symbol of the target (e.g. 'EGFR', 'BRAF')", min_length=1, max_length=30)
     limit: int = Field(default=20, description="Maximum number of results to return", ge=1, le=200)
+
+
+class TargetCompoundsInput(GeneSymbolWithLimit):
+    """Compounds on a target, potency-sorted or approved-first."""
+    sort: Literal["potency", "max_phase"] = Field(
+        default="potency",
+        description="'potency' (best activity first) or 'max_phase' (approved and "
+                    "clinical drugs first: phase, then ChEMBL mechanism, then earliest "
+                    "approval)",
+    )
 
 
 class CompoundIdInput(BaseModel):
@@ -953,21 +983,24 @@ def mosaic_get_target_profile(params: GeneSymbolInput) -> str:
     },
 )
 @_with_db_error_handling
-def mosaic_get_target_compounds(params: GeneSymbolWithLimit) -> str:
+def mosaic_get_target_compounds(params: TargetCompoundsInput) -> str:
     """Get compounds active against a specific drug target.
 
-    Returns compounds with activity data (IC50, Ki, etc.) sorted by potency.
+    Returns compounds with activity data (IC50, Ki, etc.), sorted by potency or,
+    with sort='max_phase', approved and clinical drugs first. Unnamed research
+    compounds read compound_name 'unnamed' with the ChEMBL id in chembl_id.
     """
     gq = _gq()
     symbol = params.gene_symbol.strip().upper()
     limit = _enforce_limit("mosaic_get_target_compounds", params.limit)
-    compounds = gq.get_target_compounds(symbol, limit)
+    compounds = gq.get_target_compounds(symbol, limit, sort=params.sort)
     # DATA_LICENCES 1.5 (2026-09-14): these rows are ChEMBL-derived, and ChEMBL
     # is ShareAlike -- the notice travels with every payload that carries the
     # rows, because a licence recorded only in a doc nobody fetches is the
     # AlphaMissense label again.
     return _json_result(_paged(
-        compounds, "compounds", target=symbol,
+        compounds, "compounds", requested=params.limit, applied=limit,
+        target=symbol, sort=params.sort,
         upstream_licence="ChEMBL data: CC BY-SA 3.0 -- adapted material must "
                          "carry the same or a compatible licence",
     ))
@@ -1088,15 +1121,22 @@ def mosaic_get_coverage_grid(params: GeneSymbolInput) -> str:
 )
 @_with_db_error_handling
 def mosaic_get_target_papers(params: GeneSymbolWithLimit) -> str:
-    """Get scientific papers mentioning a specific drug target.
+    """Get scientific papers about a specific drug target.
 
-    Returns publications from PubMed/OpenAlex with titles and dates.
+    Where the database carries PubTator3 gene annotations, only papers tagged
+    with the target's NCBI Gene ID are served (`membership_basis` says which
+    test applied), dated by the earliest of e-pub / issue / PubMed entry,
+    papers naming the target in the title first.
     """
     gq = _gq()
     symbol = params.gene_symbol.strip().upper()
     limit = _enforce_limit("mosaic_get_target_papers", params.limit)
     papers = gq.get_target_papers(symbol, limit)
-    return _json_result(_paged(papers, "papers", target=symbol))
+    return _json_result(_paged(
+        papers, "papers", requested=params.limit, applied=limit, target=symbol,
+        membership_basis=gq.paper_membership_basis(),
+        kg_cutoff=gq._kg_cutoff_date().isoformat(),
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1121,7 +1161,9 @@ def mosaic_get_target_structure(params: GeneSymbolInput) -> str:
     summary (mean pLDDT, fractions of residues at high / confident / low
     confidence, disordered fraction), and protein length. Useful for
     SBDD scoping, disorder/IDR risk, and confidence-aware target triage.
-    Pair with `mosaic_assess_druggability` for binding-pocket scoring.
+    Also returns the fpocket pockets with both rankings (fpocket score and
+    Druggability Score), which one selected the top pocket, and the pLDDT of
+    the residues lining each pocket.
     """
     gq = _gq()
     symbol = params.gene_symbol.strip().upper()

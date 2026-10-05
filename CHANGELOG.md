@@ -1,5 +1,60 @@
 # Changelog
 
+## 2.1.0 — 2026-10-05
+
+The fixes from a live audit of the hosted server (2026-10-03), carried into
+the package's data layer and stdio server. Bring-your-own-database note: every
+new source table is probed first; on a database without it the previous
+behaviour is served, and the payload says which basis applied.
+
+- FIXED: a fresh install could not start. `mcp` 2.0 (released 2026-07-28)
+  removed `mcp.server.fastmcp`, and this package accepted any `mcp>=1.0`, so
+  `pip install mosaic-mcp` resolved `mcp` 2.x and the server died on import
+  (2.0.0 and 2.0.1 included). The dependency is now `mcp[cli]>=1.2,<2`. If
+  you are pinned to an earlier release, `pip install "mcp<2"` restores it.
+- FIXED: papers were matched to a target by text, so a symbol that is also a
+  common word pulled in unrelated papers. When `paper_gene_annotations` is
+  present, papers are those PubTator3 tags with the target's NCBI Gene ID,
+  with a case-sensitive title match for PMIDs PubTator has no record of;
+  `membership_basis` says which. The paper list, the profile's paper count,
+  its publication trend and momentum all use the same set (on the hosted KG,
+  KIT went from 494 papers to 263).
+- FIXED: papers dated after the declared corpus cutoff were served and
+  trended. Nothing past the cutoff is served; the cutoff year is marked
+  `partial_year`. Momentum compares trailing windows ending at the cutoff,
+  with a ±20% band for "stable".
+- FIXED: disease associations mixed raw ClinicalTrials.gov condition strings
+  in with ontology diseases. Profiles rank Open Targets associations by Open
+  Targets' own score; trial evidence rides along as `trial_support`, or as
+  `trial_only_conditions` when no association matches (needs
+  `target_trial_conditions`).
+- FIXED: one company appeared as several organisations ("LILLY CO ELI" and
+  "Eli Lilly and Company"). Assignees merge on names without legal-form words,
+  completed acquisitions resolve to the parent, and raw spellings are kept as
+  `aliases`. `competitive_intensity` is now a percentile across targets.
+- FIXED: validation evidence counted review articles, and clinical-trial
+  papers could carry a non-human model system.
+- FIXED: `activity_type` could read "approved"; approval status comes from
+  max clinical phase only.
+- FIXED: the clinical pipeline could list compounds with no mechanism link and
+  weak potency (dabrafenib under KRAS). Entries need a ChEMBL mechanism or
+  pChEMBL >= 6; a `compounds` summary is added.
+- ADDED: `sort` on `mosaic_get_target_compounds` — `potency` (default) or
+  `max_phase` (approved and clinical drugs first). Salt forms collapse to the
+  parent compound, with the `forms` listed.
+- ADDED: an `approved_and_clinical` block on the profile, ahead of the
+  potency-ranked compounds.
+- ADDED: coverage cells carry `declared_query`, `alias_query`, `cutoff`,
+  `sample_precision` and `sample_n`.
+- ADDED: `kg_version` in every `_provenance`; paged results say when a tier
+  cap applied (`tier_cap_applied`).
+- CHANGED: payloads are compact JSON (the KIT profile went from 37 kB to
+  28 kB). GO terms are capped at 10, protein function at 400 characters, and
+  only the top pocket is shown, with its pLDDT annotation. Always-null fields
+  (`semantic_relations`, `confidence_summary`, `druggability_tier`,
+  `pathways.category`) and duplicate ids (`paper_id`, `compound_id`) are gone.
+- FIXED: `mosaic_mcp.__version__` reported 1.7.0.
+
 ## 2.0.1 — 2026-09-22
 
 - FIXED: the response cache never engaged. FastMCP invokes tools with

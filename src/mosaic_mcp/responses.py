@@ -149,7 +149,7 @@ _NOT_ABSENCE = {"truncated", "no_fetch_evidence", "covered_but_unlinked",
                 "source_not_addressable"}
 
 
-def _coverage_state_block(coverage: dict[str, Any]) -> dict[str, Any]:
+def _coverage_state_block(coverage: dict[str, Any], cutoff: str | None = None) -> dict[str, Any]:
     """Per-axis coverage state for the dossier (board S24 clause 2).
 
     Pure formatting over data the query layer already fetched — no DB access,
@@ -175,12 +175,23 @@ def _coverage_state_block(coverage: dict[str, Any]) -> dict[str, Any]:
         if state == "truncated" and isinstance(basis, str) and basis.startswith("derived:"):
             means = ("derived from an upstream fetch that is itself incomplete — "
                      "read this count as 'at least N', never as complete")
-        out[axis] = {
+        cell = {
             "state": state,
             "means": means,
             "basis": basis,
             "counts_as_measurement": state in ("measured", "measured_zero"),
         }
+        # Audit 2026-10-03 P1-10: which query, which cutoff, which alias
+        # override, and how precise the served sample measured — on the cell,
+        # so a count is never read without the question it answers.
+        for k, out_k in (("declared_query", "declared_query"), ("alias_query", "alias_query"),
+                         ("cutoff_date", "cutoff"), ("sample_precision", "sample_precision"),
+                         ("sample_n", "sample_n")):
+            if c.get(k) is not None:
+                cell[out_k] = c[k]
+        if axis == "papers" and "cutoff" not in cell and cutoff:
+            cell["cutoff"] = cutoff
+        out[axis] = cell
     unmeasured = sorted(a for a, c in coverage.items()
                         if c.get("state") in _NOT_ABSENCE)
     if unmeasured:
@@ -211,6 +222,59 @@ def _round_or_none(val: Any, digits: int = 3) -> float | None:
         return None
 
 
+# --- Audit 2026-10-03 payload helpers ---------------------------------------
+
+# P1-3: a compound ChEMBL never named. The id lives in `chembl_id`; restating it
+# as the name made KRAS's top ten read like ten named drugs.
+UNNAMED_COMPOUND = "unnamed"
+# P2: payload hygiene caps for the profile.
+FUNCTION_MAX_CHARS = 400
+GO_TERMS_MAX = 10
+_GO_ASPECT_ORDER = {"F": 0, "P": 1, "C": 2}   # molecular function first
+
+# P1-6: the adjective is read off a stated quartile of the curated set. Lower
+# quartiles carry no "uncrowded" word: organizations are counted on the patents
+# axis, a FLOOR, which supports "at least this crowded" and never "sparse".
+_CI_QUARTILE_LABEL = {
+    4: "crowded — top quartile of the curated targets",
+    3: "active — third quartile of the curated targets",
+    2: "second quartile — the patents axis is a floor, not evidence of white space",
+    1: "bottom quartile — the patents axis is a floor, not evidence of white space",
+}
+
+
+def _truncate(text: str | None, limit: int) -> str | None:
+    if not text or len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(",;:")
+    return cut + "…"
+
+
+def _top_go_terms(go_terms: list, limit: int) -> list:
+    """Up to `limit` GO terms, molecular function (F:) first, then process,
+    then component — stable within an aspect."""
+    def aspect(t):
+        term = t.get("term", "") if isinstance(t, dict) else str(t)
+        return _GO_ASPECT_ORDER.get(term[:1], 3)
+    return sorted(go_terms or [], key=aspect)[:limit]
+
+
+def _approval_status(max_phase: Any) -> str | None:
+    """Approval from ChEMBL max_phase ONLY (P1-2): 4 approved, 1-3 clinical,
+    0 preclinical, anything else (NULL, -1 'unknown') null — never guessed."""
+    try:
+        mp = float(max_phase)
+    except (TypeError, ValueError):
+        return None
+    if mp >= 4:
+        return "approved"
+    if mp >= 1:
+        return "clinical"
+    if mp >= 0:
+        return "preclinical"
+    return None
+
+
 def empty_scope_sentence(entity: str, what: str) -> str:
     """One-line honest phrasing for string-returning interpreters."""
     return (
@@ -229,21 +293,33 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
     sar = profile.get("sar_summary", {})
 
     # --- Biology section ---
+    # P2 (audit 2026-10-03): the full UniProt paragraph and 70+ GO terms were
+    # ~15 kB per call that a model then had to read. Function is cut at 400
+    # chars with the UniProt link; GO terms are capped at 10, molecular
+    # function first. `druggability_tier` lived here AND in `structure` (null
+    # here, set there) — it now has one home, `structure.druggability.tier`.
+    uniprot = profile.get("uniprot_id")
+    uniprot_url = f"https://www.uniprot.org/uniprotkb/{uniprot}/entry" if uniprot else None
+    function = profile.get("function_description")
+    go_all = profile.get("go_terms") or []
     biology = {
         "gene_symbol": symbol,
         "target_name": name,
         "target_class": profile.get("target_class"),
-        "protein_family": profile.get("protein_family"),
-        "uniprot_id": profile.get("uniprot_id"),
+        "uniprot_id": uniprot,
         "chembl_id": profile.get("chembl_id"),
         "entrez_id": profile.get("entrez_id"),
-        "druggability_tier": profile.get("druggability_tier"),
         "subcellular_location": profile.get("subcellular_location"),
         "protein_length_aa": profile.get("protein_length"),
-        "function": profile.get("function_description"),
+        "function": _truncate(function, FUNCTION_MAX_CHARS),
         "gene_names": profile.get("gene_names"),
-        "go_terms": profile.get("go_terms"),
+        "go_terms": _top_go_terms(go_all, GO_TERMS_MAX),
+        "go_terms_total": len(go_all),
     }
+    if function and len(function) > FUNCTION_MAX_CHARS:
+        biology["function_more"] = uniprot_url
+    if profile.get("protein_family"):
+        biology["protein_family"] = profile["protein_family"]
 
     # --- Scores section ---
     scores_section = None
@@ -255,7 +331,21 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
             filled = round(pct / 10)
             return f"{'█' * filled}{'░' * (10 - filled)} {pct}/100"
 
-        momentum_dir, arrow = _momentum_arrow(scores.get("momentum_direction"))
+        # P1-5: momentum is read off the trailing window the profile states,
+        # so the label cannot disagree with the delta beside it. The stored
+        # target_scores value is used only when the query layer did not compute
+        # one (a DB-free caller).
+        mom = profile.get("momentum") or {}
+        if mom:
+            mom_value, mom_dir_raw = mom.get("value"), mom.get("direction")
+        else:
+            mom_value, mom_dir_raw = scores.get("momentum"), scores.get("momentum_direction")
+        momentum_dir, arrow = _momentum_arrow(mom_dir_raw)
+
+        # P1-6: competitive intensity was NULL on every target while the key
+        # insight called both 504 and 63 organizations "crowded".
+        ci = profile.get("competitive_intensity") or {}
+        ci_value = ci.get("value", scores.get("competitive_intensity"))
 
         scores_section = {
             "target_attractiveness": {
@@ -274,15 +364,21 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
                 "description": "Likelihood of finding a drug-like modulator",
             },
             "competitive_intensity": {
-                "value": scores.get("competitive_intensity"),
-                "display": _bar(scores.get("competitive_intensity")),
+                "value": ci_value,
+                "display": _bar(ci_value),
+                "quartile": ci.get("quartile"),
+                "label": _CI_QUARTILE_LABEL.get(ci.get("quartile")),
                 "description": "How crowded the target space is (higher = more competition)",
+                "basis": ci.get("basis"),
             },
             "momentum": {
-                "value": scores.get("momentum"),
-                "display": _bar(scores.get("momentum")),
+                "value": mom_value,
+                "display": _bar(mom_value),
                 "direction": f"{momentum_dir} {arrow}",
-                "description": "Recent publication and patent filing trend",
+                "description": "Recent publication trend",
+                "window": mom.get("window"),
+                "recent_papers": mom.get("recent_papers"),
+                "prior_papers": mom.get("prior_papers"),
             },
         }
 
@@ -307,34 +403,81 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
             "interpretation": _interpret_sar(sar),
         }
 
+    # --- Approved & clinical (P1-3): the approved-first view, before potency.
+    approved_clinical = [
+        {
+            "compound_name": c.get("compound_name") or UNNAMED_COMPOUND,
+            "chembl_id": c.get("chembl_id"),
+            "max_phase": c.get("max_phase"),
+            "approval_status": c.get("approval_status"),
+            "evidence_basis": c.get("evidence_basis"),
+            "activity": _format_activity(c.get("activity_value")),
+            "activity_type": c.get("activity_type"),
+            **({"salt_forms": c["forms"]} if c.get("forms") else {}),
+        }
+        for c in (profile.get("approved_and_clinical") or [])[:10]
+    ]
+
     # --- Top compounds with units ---
+    # `activity_type` is the assay's own type, or null when only a mechanism
+    # links the compound. It used to default to "IC50" when missing and to
+    # carry "approved" on mechanism rows (P1-2); both were inventions.
     compounds = []
     for c in profile.get("top_compounds", []):
+        mp = c.get("max_phase")
         compounds.append({
-            "compound_name": c.get("compound_name"),
+            "compound_name": c.get("compound_name") or UNNAMED_COMPOUND,
             "chembl_id": c.get("chembl_id"),
             "activity": _format_activity(c.get("activity_value")),
-            "activity_type": c.get("activity_type", "IC50"),
+            "activity_type": c.get("activity_type"),
             "assay_type": c.get("assay_type"),
-            "clinical_phase": c.get("max_phase", 0),
+            "evidence_basis": c.get("evidence_basis"),
+            "clinical_phase": mp,
+            "approval_status": _approval_status(mp),
             "molecular_weight": c.get("molecular_weight"),
         })
 
-    # --- Disease associations ---
+    # --- Disease associations (P0-3) ---
     diseases = []
     for d in profile.get("disease_associations", []):
-        diseases.append({
+        row = {
             "disease": d.get("indication_name"),
+            "disease_id": d.get("disease_id"),
             "therapeutic_area": d.get("therapeutic_area"),
             "evidence_type": d.get("evidence_type"),
+            "basis": d.get("basis"),
             "association_score": d.get("association_score"),
-        })
+        }
+        if d.get("trial_support"):
+            ts = d["trial_support"]
+            row["trial_support"] = {"max_phase": ts.get("max_phase"),
+                                    "trial_count": ts.get("trial_count")}
+        diseases.append(row)
+    # Conditions where a drug whose ChEMBL mechanism is this target has been
+    # trialled, but Open Targets records no association. Floor-axis derivative:
+    # score <= 0.75, kept apart from the measured list above.
+    trial_only = [
+        {
+            "condition": t.get("indication_name"),
+            "disease_id": t.get("disease_id"),
+            "basis": t.get("basis"),
+            "association_score": t.get("association_score"),
+            "max_trial_phase": t.get("max_phase"),
+            "trial_count": t.get("trial_count"),
+            "example_nct_ids": t.get("example_nct_ids"),
+        }
+        for t in profile.get("trial_only_conditions", [])
+    ]
 
-    # --- Validation evidence ---
+    # --- Validation evidence (P0-4) ---
+    # Query-time re-classification, Reviews/Meta-Analyses excluded, and NO
+    # outcome: the stored positive/negative verdict graded KRYSTAL-1 negative.
     val = profile.get("validation_evidence", {})
+    by_type = val.get("by_type", {})
     validation = {
-        "summary": val.get("by_type", {}),
-        "total_evidence_count": sum(val.get("by_type", {}).values()) if val.get("by_type") else 0,
+        "summary": by_type,
+        "total_evidence_count": val.get("distinct_papers",
+                                        sum(by_type.values()) if by_type else 0),
         "top_papers": [
             {
                 "title": p.get("title"),
@@ -344,41 +487,49 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
                 "pmid": p.get("pmid"),
                 "validation_type": p.get("validation_type"),
                 "model_system": p.get("model_system"),
-                "outcome": p.get("outcome"),
+                "validation_types": p.get("validation_types"),
+                "target_in_title": p.get("target_in_title"),
             }
             for p in val.get("top_papers", [])
         ],
-        "interpretation": _interpret_validation(val.get("by_type", {})),
+        "method": ("re-classified per paper from title+abstract at query time; "
+                   "a paper may carry several types (summary counts are per type, "
+                   "total is distinct papers); Reviews and Meta-Analyses excluded; "
+                   "outcomes are NOT graded — read the papers"),
+        "interpretation": _interpret_validation(by_type, val.get("distinct_papers")),
     }
 
-    # --- Clinical pipeline ---
-    # `phase_basis` states the scope of `phase` rather than leaving the reader
-    # to assume it is per-indication. It is the compound's highest phase in any
-    # indication: ChEMBL's per-indication phase is not ingested, so an approved
-    # drug shows its approval phase on every indication row it appears under.
-    # Saying so is the difference between a caveat and an overclaim.
+    # --- Clinical pipeline (P0-2): one row per compound ---
+    # `max_phase_any_indication` is the compound's highest phase in ANY
+    # indication, named as exactly that. It is never presented as a phase for
+    # this target; `basis` says whether the link to this target is ChEMBL's
+    # drug MECHANISM or only a binding assay.
     pipeline = [
         {
-            "compound": p.get("compound_name"),
+            "compound": p.get("compound_name") or UNNAMED_COMPOUND,
             "chembl_id": p.get("chembl_id"),
-            "indication": p.get("indication_name"),
-            "phase": p.get("max_phase"),
-            "status": p.get("clinical_status"),
-            "phase_basis": p.get("phase_basis", "compound_max_any_indication"),
+            "basis": p.get("basis"),
+            "max_phase_any_indication": p.get("max_phase"),
+            "approval_status": p.get("clinical_status"),
+            "indications_any_target": (p.get("indications_any_target") or [])[:3],
+            "indication_count": p.get("indication_count"),
+            **({"salt_forms": p["forms"]} if p.get("forms") else {}),
         }
         for p in profile.get("clinical_pipeline", [])
     ]
 
-    # --- Competitive landscape ---
-    orgs = [
-        {
+    # --- Competitive landscape (P1-1: canonical organizations) ---
+    orgs = []
+    for o in profile.get("top_organizations", []):
+        row = {
             "organization": o.get("org_name"),
             "type": o.get("org_type"),
             "is_big_pharma": o.get("is_big_pharma"),
             "patent_count": o.get("patent_count"),
         }
-        for o in profile.get("top_organizations", [])
-    ]
+        if o.get("aliases"):
+            row["aliases"] = o["aliases"]
+        orgs.append(row)
     # Counted server-side over every org on the target. Deriving it from
     # `orgs` counts only the LIMIT 10 the dossier shows, so the value was
     # capped at 10 by construction while reading as a measurement — KRAS
@@ -388,12 +539,10 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
     big_pharma_count = counts.get("big_pharma_org_count", 0)
 
     # --- Pathways ---
+    # `category` is dropped: it was "other" on every row of every target, a
+    # constant rendered like data (P2).
     pathways = [
-        {
-            "pathway": p.get("pathway_name"),
-            "source": p.get("source"),
-            "category": p.get("category"),
-        }
+        {"pathway": p.get("pathway_name"), "source": p.get("source")}
         for p in profile.get("pathways", [])
     ]
 
@@ -425,14 +574,23 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
     ]
 
     # --- Publication trend ---
+    # Dated by the earliest of e-pub / issue / PubMed entry, nothing after the
+    # KG cutoff, and the cutoff year flagged partial (P0-5) — a partial year
+    # read against a full one is a trend nobody measured.
     trend = profile.get("publication_trend", [])
-    trend_formatted = [
-        {"year": t.get("year"), "papers": t.get("paper_count")}
-        for t in trend
-    ]
+    trend_formatted = []
+    for t in trend:
+        row = {"year": t.get("year"), "papers": t.get("paper_count")}
+        if t.get("partial_year"):
+            row["partial_year"] = True
+            row["through"] = t.get("through")
+        trend_formatted.append(row)
 
     # --- Structure (AlphaFold + druggability) ---
-    structure_section = format_structure_summary(profile.get("structure"))
+    # The dossier carries the TOP pocket only, with the ranking that chose it
+    # and the confidence of the residues lining it (P1-7); the five-pocket
+    # detail is `mosaic_get_target_structure`'s job.
+    structure_section = format_structure_summary(profile.get("structure"), all_pockets=False)
 
     # --- Semantic relations (if available) ---
     sem_rels = profile.get("semantic_relations")
@@ -445,18 +603,23 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
         }
 
     # --- Key insight ---
-    insight = _generate_insight(symbol, name, scores, sar, counts, big_pharma_count, validation)
+    insight = _generate_insight(symbol, name, scores, sar, counts, big_pharma_count,
+                                validation, profile.get("competitive_intensity"))
 
     return {
         "_meta": {
             "tool": "mosaic_get_target_profile",
             "description": f"Comprehensive intelligence dossier for {symbol} ({name})",
             "sections": [
-                "biology", "scores", "structure", "sar_summary", "top_compounds",
-                "disease_associations", "validation_evidence", "clinical_pipeline",
+                "biology", "scores", "structure", "sar_summary",
+                "approved_and_clinical", "top_compounds",
+                "disease_associations", "trial_only_conditions",
+                "validation_evidence", "clinical_pipeline",
                 "competitive_landscape", "pathways", "protein_interactions",
                 "publication_trend", "key_insight",
             ],
+            "kg_cutoff": profile.get("publication_cutoff"),
+            "paper_membership_basis": profile.get("paper_membership_basis"),
             "data_coverage": {
                 "compounds": counts.get("compound_count", 0),
                 "patents": counts.get("patent_count", 0),
@@ -468,6 +631,7 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
                 "protein_interactions_is_floor": (
                     (counts.get("ppi_count") or 0) >= PPI_PER_TARGET_CAP),
                 "disease_associations": counts.get("indication_count", 0),
+                "trial_only_conditions": counts.get("trial_only_condition_count", 0),
                 "validation_evidence": counts.get("validation_count", 0),
             },
             # Board S24 clause 2 — the per-target coverage STATE beside the
@@ -479,7 +643,8 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
             # entire reason that table exists.
             # Data comes from `profile["coverage"]` (fetched in the query
             # layer); nothing here touches the DB.
-            "coverage_state": _coverage_state_block(profile.get("coverage") or {}),
+            "coverage_state": _coverage_state_block(profile.get("coverage") or {},
+                                                    profile.get("publication_cutoff")),
             # The dossier is a capped sample of every axis, by design — it is
             # the free front door, and stating the cap is the difference
             # between a sample and an implied census: 10 of 209 organizations
@@ -554,8 +719,10 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
         "scores": scores_section,
         "structure": structure_section,
         "sar_summary": sar_section,
+        "approved_and_clinical": approved_clinical,
         "top_compounds": compounds,
         "disease_associations": diseases,
+        "trial_only_conditions": trial_only,
         "validation_evidence": validation,
         "clinical_pipeline": pipeline,
         "competitive_landscape": {
@@ -583,7 +750,9 @@ def format_target_dossier(profile: dict[str, Any]) -> dict[str, Any]:
         "pathways": pathways,
         "protein_interactions": ppis,
         "publication_trend": trend_formatted,
-        "semantic_relations": semantic_section,
+        # Present only when there is something in it: a null key beside
+        # filled sections reads as a bug (P2).
+        **({"semantic_relations": semantic_section} if semantic_section else {}),
         "key_insight": insight,
     }
 
@@ -973,6 +1142,9 @@ def format_clinical_pipeline(data: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "target": target,
+        # One row per compound (audit 2026-10-03 P0-2); `pipeline` below is
+        # the trial roster, where a drug appears once per trial by design.
+        "compounds": data.get("compounds", []),
         "pipeline": pipeline,
         "phase_distribution": by_phase,
         "returned": returned,
@@ -998,8 +1170,51 @@ _TIER_DESCRIPTIONS = {
 }
 
 
-def format_structure_summary(structure: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Wrap a target_structure row into an MCP-friendly summary."""
+def _top_pocket(pockets: list[dict] | None) -> dict[str, Any] | None:
+    """The pocket the summary calls "top", with the ranking that chose it.
+
+    Audit 2026-10-03 P1-7: EGFR's "top pocket" (druggability 0.814) is
+    fpocket's rank 93 of 94 by fpocket's own Score, 1,999 A^3 on a full-length
+    model with 22.8% disorder — likely an inter-domain void. It was presented
+    as "top" with no hint of either fact. It is still selected the same way
+    (highest Druggability Score), but now says so, shows fpocket's ranking
+    beside it, and flags pockets lined by low-pLDDT residues.
+    """
+    if not pockets:
+        return None
+    top = max(pockets, key=lambda p: p.get("druggability_score") or -1)
+    out = {
+        "selection_basis": ("highest fpocket Druggability Score; fpocket's own "
+                            "Score ranks pockets differently — both shown"),
+        "druggability_score": top.get("druggability_score"),
+        "druggability_rank": top.get("druggability_rank"),
+        "fpocket_score": top.get("score"),
+        "fpocket_rank": top.get("rank"),
+        "fpocket_rank_of": top.get("fpocket_rank_of"),
+        "volume_a3": top.get("volume"),
+        "n_residues": top.get("n_residues"),
+        "plddt_min_in_pocket": top.get("plddt_min"),
+        "plddt_mean_in_pocket": top.get("plddt_mean"),
+        "low_plddt_frac": top.get("low_plddt_frac"),
+        "spans_low_plddt": top.get("spans_low_plddt"),
+    }
+    if top.get("spans_low_plddt"):
+        out["caution"] = ("this pocket is lined by low-confidence residues "
+                          "(pLDDT < 50, or > 30% below 70) — it may be an artefact "
+                          "of disordered or inter-domain regions, not a binding site")
+    if top.get("plddt_min") is None:
+        out["plddt_note"] = ("pocket residues not annotated for this target — "
+                             "pocket confidence unknown, not high")
+    return out
+
+
+def format_structure_summary(structure: dict[str, Any] | None,
+                             all_pockets: bool = True) -> dict[str, Any] | None:
+    """Wrap a target_structure row into an MCP-friendly summary.
+
+    `all_pockets=False` (the profile) returns only the top pocket with its
+    selection basis; the structure tool returns all stored pockets.
+    """
     if not structure or not structure.get("uniprot_id"):
         return None
 
@@ -1043,7 +1258,8 @@ def format_structure_summary(structure: dict[str, Any] | None) -> dict[str, Any]
             "top_pocket_score": top_score,
             "top_pocket_volume_a3": structure.get("top_pocket_volume"),
             "pocket_count": pocket_count,
-            "pockets": structure.get("pockets"),
+            "top_pocket": _top_pocket(structure.get("pockets")),
+            **({"pockets": structure.get("pockets")} if all_pockets else {}),
         },
         "interpretation": _interpret_structure(structure),
     }
@@ -1075,6 +1291,18 @@ def _interpret_structure(s: dict[str, Any]) -> str:
             f"{pocket_count} pocket(s) detected; top druggability score "
             f"{top_score:.2f}"
         )
+        top = _top_pocket(s.get("pockets"))
+        if top and top.get("fpocket_rank") and top.get("fpocket_rank_of"):
+            parts.append(
+                f"that pocket is fpocket's rank {top['fpocket_rank']} of "
+                f"{top['fpocket_rank_of']} by its own score"
+            )
+        if top and top.get("spans_low_plddt"):
+            parts.append(
+                f"it is lined by low-confidence residues (min pLDDT "
+                f"{top.get('plddt_min_in_pocket')}), so treat the druggability "
+                "call with caution"
+            )
 
     if tier and tier != "unknown":
         parts.append(_TIER_DESCRIPTIONS.get(tier, tier))
@@ -1412,8 +1640,12 @@ def _interpret_sar(sar: dict) -> str:
     )
 
 
-def _interpret_validation(by_type: dict) -> str:
-    """Generate validation strength interpretation."""
+def _interpret_validation(by_type: dict, distinct: int | None = None) -> str:
+    """Generate validation strength interpretation.
+
+    `distinct` is the number of distinct papers; `by_type` counts are per type
+    and multi-label, so their sum over-counts a paper that used two methods.
+    """
     if not by_type:
         return (
             "No validation evidence in the current Mosaic KG — this "
@@ -1421,10 +1653,11 @@ def _interpret_validation(by_type: dict) -> str:
             "experimental validation."
         )
 
-    total = sum(by_type.values())
+    total = distinct if distinct is not None else sum(by_type.values())
     types_present = list(by_type.keys())
+    clinical = by_type.get("clinical_trial", by_type.get("clinical"))
 
-    if "clinical" in by_type and "genetic" in by_type:
+    if clinical and "genetic" in by_type:
         strength = "strong"
     elif len(types_present) >= 3:
         strength = "good"
@@ -1433,8 +1666,9 @@ def _interpret_validation(by_type: dict) -> str:
     else:
         strength = "limited"
 
-    parts = [f"{strength} validation ({total} evidence points)"]
-    for vtype in ["genetic", "in_vivo", "clinical", "pharmacological"]:
+    unit = "papers" if distinct is not None else "evidence points"
+    parts = [f"{strength} validation ({total} {unit})"]
+    for vtype in ["genetic", "in_vivo", "clinical_trial", "clinical", "pharmacological"]:
         if vtype in by_type:
             parts.append(f"{vtype}: {by_type[vtype]}")
 
@@ -1449,6 +1683,7 @@ def _generate_insight(
     counts: dict,
     big_pharma_count: int,
     validation: dict,
+    competitive_intensity: dict | None = None,
 ) -> str:
     """Generate a 2-3 sentence key insight about the target."""
     parts = []
@@ -1486,11 +1721,23 @@ def _generate_insight(
     # ("191 Big Pharma players active" on EGFR), so the claim moves to the
     # quantity that is actually measured: organization_count is a plain
     # COUNT DISTINCT over the patent join and is trustworthy now.
+    # Audit 2026-10-03 P1-6: "Crowded space" was asserted at >= 25
+    # organizations with no stated threshold — both 504 (KRAS) and 63 (KIT)
+    # got it. The adjective now comes from a stated quartile of the curated
+    # set, and only the upper quartiles get one: organizations are counted on
+    # the patents axis, a floor, which can support "at least this crowded" and
+    # never "uncrowded".
     org_count = counts.get("organization_count", 0)
-    if org_count >= 25:  # heuristic band, not a scored threshold
-        parts.append(f"Crowded space — {org_count} organizations hold patents on this target")
+    ci = competitive_intensity or {}
+    quartile = ci.get("quartile")
+    if org_count and quartile == 4:
+        parts.append(f"Crowded space — at least {org_count} organizations hold patents "
+                     f"(top quartile of {ci.get('reference_set_size')} curated targets)")
+    elif org_count and quartile == 3:
+        parts.append(f"Active space — at least {org_count} organizations hold patents "
+                     f"(third quartile of {ci.get('reference_set_size')} curated targets)")
     elif org_count >= 1:
-        parts.append(f"{org_count} organization(s) hold patents on this target")
+        parts.append(f"At least {org_count} organization(s) hold patents on this target")
     else:
         parts.append(
             "No patent-holding organizations recorded in the current Mosaic KG "
@@ -1506,6 +1753,6 @@ def _generate_insight(
     # Validation
     val_total = validation.get("total_evidence_count", 0)
     if val_total > 20:
-        parts.append(f"Well-validated with {val_total} evidence points from literature")
+        parts.append(f"Well-validated with {val_total} experimental papers in the literature")
 
     return ". ".join(parts[:3]) + "." if parts else f"Insufficient data to assess {symbol}."

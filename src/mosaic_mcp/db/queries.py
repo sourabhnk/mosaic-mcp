@@ -159,6 +159,65 @@ _ORG_NONALNUM_RE = re.compile(r"[^A-Z0-9]")
 _ORG_WS_RE = re.compile(r"\s+")
 
 
+# Words that name a legal form or an industry, never an identity. Dropping them
+# and SORTING what remains is what merges "Eli Lilly and Company" (17) with
+# "LILLY CO ELI [US]" (16) — EPO's inverted assignee form — which the old
+# punctuation-only key kept as two KRAS competitors (audit 2026-10-03 P1-1).
+_ORG_LEGAL_TOKENS = frozenset({
+    "INC", "INCORPORATED", "CO", "COMPANY", "CORP", "CORPORATION", "LTD", "LIMITED",
+    "LLC", "LLP", "LP", "PLC", "AG", "SA", "SAS", "SPA", "NV", "BV", "GMBH", "KG",
+    "KK", "AB", "ASA", "OY", "SE", "SRL", "PTY", "AND", "THE",
+    "PHARM", "PHARMA", "PHARMACEUTICAL", "PHARMACEUTICALS", "PHARMACEUTICA",
+})
+
+# Completed acquisitions, so a subsidiary's filings count toward the company
+# that owns them. Deliberately SHORT and explicit — an entity merge is the
+# low-autonomy case (CLAUDE.md 3.5): only well-documented, closed deals, each
+# matched on whole tokens. The raw strings survive as `aliases` on every merged
+# row, so the merge is visible rather than silent.
+_ORG_PARENTS: tuple[tuple[frozenset[str], str, str], ...] = (
+    (frozenset({"ARIAD"}), "TAKEDA", "Takeda"),            # 2017
+    (frozenset({"MILLENNIUM"}), "TAKEDA", "Takeda"),       # 2008
+    (frozenset({"SHIRE"}), "TAKEDA", "Takeda"),            # 2019
+    (frozenset({"TAKEDA"}), "TAKEDA", "Takeda"),
+    (frozenset({"GENENTECH"}), "ROCHE", "Roche"),          # 2009
+    (frozenset({"CHUGAI"}), "ROCHE", "Roche"),             # majority-owned
+    (frozenset({"HOFFMANN", "ROCHE"}), "ROCHE", "Roche"),
+    (frozenset({"ROCHE"}), "ROCHE", "Roche"),
+    (frozenset({"LILLY"}), "ELI LILLY", "Eli Lilly"),
+    (frozenset({"LOXO"}), "ELI LILLY", "Eli Lilly"),       # 2019
+    (frozenset({"CELGENE"}), "BRISTOL MYERS SQUIBB", "Bristol Myers Squibb"),  # 2019
+    (frozenset({"MIRATI"}), "BRISTOL MYERS SQUIBB", "Bristol Myers Squibb"),   # 2024
+    (frozenset({"BRISTOL", "MYERS", "SQUIBB"}), "BRISTOL MYERS SQUIBB", "Bristol Myers Squibb"),
+    (frozenset({"MEDIMMUNE"}), "ASTRAZENECA", "AstraZeneca"),
+    (frozenset({"ASTRAZENECA"}), "ASTRAZENECA", "AstraZeneca"),
+    (frozenset({"PHARMACYCLICS"}), "ABBVIE", "AbbVie"),    # 2015
+    (frozenset({"ARRAY", "BIOPHARMA"}), "PFIZER", "Pfizer"),  # 2019
+    (frozenset({"SEAGEN"}), "PFIZER", "Pfizer"),           # 2023
+    (frozenset({"SEATTLE", "GENETICS"}), "PFIZER", "Pfizer"),
+)
+
+
+def _org_tokens(name: str | None) -> list[str]:
+    stripped = _ORG_BRACKET_RE.sub(" ", name or "").upper().replace("&", " AND ")
+    return [t for t in _ORG_NONALNUM_RE.sub(" ", stripped).split()
+            if t and t not in _ORG_LEGAL_TOKENS]
+
+
+def _org_identity(name: str | None) -> tuple[str, str | None]:
+    """(merge key, parent display name or None) for an assignee string."""
+    tokens = _org_tokens(name)
+    if tokens:
+        token_set = set(tokens)
+        for child, parent_key, display in _ORG_PARENTS:
+            if child <= token_set:
+                return parent_key, display
+        return " ".join(sorted(token_set)), None
+    # No Latin identity tokens: CJK/Hangul names. See _org_merge_key.
+    stripped = _ORG_BRACKET_RE.sub(" ", name or "").strip()
+    return (_ORG_WS_RE.sub("", stripped).upper() or (name or "").strip()), None
+
+
 def _org_merge_key(name: str) -> str:
     """Normalise an assignee name so registration variants merge into one entity.
 
@@ -166,9 +225,12 @@ def _org_merge_key(name: str) -> str:
     ``JANSSEN BIOTECH INC [US]`` (6), ``JANSSEN BIOTECH INC`` (5) and
     ``JANSSEN BIOTECH, INC`` (4) as three separate "competitors", which inflates
     the org count and hides who actually owns the IP. Stripping bracketed country
-    qualifiers and non-alphanumerics collapses those to one key (~17 patents),
-    which is the truthful leaderboard. Distinct legal entities that differ by more
-    than punctuation (e.g. JANSSEN PHARMACEUTICA NV) stay separate, by design.
+    qualifiers, punctuation and legal-form words, then sorting the remaining
+    tokens, collapses those to one key — and also EPO's inverted form
+    ("LILLY CO ELI" == "Eli Lilly and Company"). Distinct legal entities that
+    differ by an identity word (JANSSEN BIOTECH vs JANSSEN PHARMACEUTICA) stay
+    separate, by design. Completed acquisitions resolve to the parent
+    (``_ORG_PARENTS``).
 
     Non-Latin names must survive this. A CJK/Hangul assignee ("苏州必扬医药科技有限公司",
     "경희대학교 산학협력단") contains no ``[A-Z0-9]`` at all, so the ASCII normalisation
@@ -177,11 +239,245 @@ def _org_merge_key(name: str) -> str:
     36-patent "competitor", outranking Janssen). When the ASCII key is empty we
     fall back to the whitespace-stripped original, keeping those orgs distinct.
     """
-    stripped = _ORG_BRACKET_RE.sub(" ", name or "").strip()
-    key = _ORG_NONALNUM_RE.sub("", stripped.upper())
-    if key:
-        return key
-    return _ORG_WS_RE.sub("", stripped).upper() or (name or "").strip()
+    if not name:
+        return ""
+    return _org_identity(name)[0]
+
+
+# =====================================================================
+# Audit 2026-10-03 P0-3 — disease associations, one row per disease
+# =====================================================================
+# MeSH top-level categories that name no disease. A trial whose only condition
+# is "Neoplasms" says nothing about WHICH disease the target is associated with.
+_GENERIC_DISEASE_NAMES = (
+    "neoplasm", "cancer", "carcinoma", "neoplasm metastasis", "tumor",
+    "solid tumor", "malignant neoplasm", "disease",
+)
+_DISEASE_STOP = frozenset({"of", "the", "and", "with", "in"})
+
+
+def _disease_key(name: str | None) -> str:
+    """Order-, case-, punctuation- and plural-insensitive disease name key:
+    "Leukemia, Myeloid, Acute" == "Acute myeloid leukemia",
+    "Gastrointestinal Stromal Tumors" == "Gastrointestinal stromal tumor"."""
+    words = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).split()
+    norm = []
+    for w in words:
+        if w in _DISEASE_STOP:
+            continue
+        if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        norm.append(w)
+    return " ".join(sorted(norm))
+
+
+# Normalised through the same key, or "Neoplasm Metastasis" sails past as
+# "metastasi neoplasm".
+_GENERIC_DISEASE_KEYS = frozenset(_disease_key(n) for n in _GENERIC_DISEASE_NAMES)
+
+
+def merge_disease_associations(
+    ot_rows: list[dict], trial_rows: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """(associations, trial_only) — one row per disease, every row ontology-keyed.
+
+    `associations` are Open Targets rows (disease_id is the OT/EFO-platform id:
+    MONDO_/EFO_/Orphanet_/HP_), deduplicated by id and by a normalised name, and
+    ranked by Open Targets' own score. Where our mechanism-gated trial table
+    covers the same disease, its support rides along as `trial_support` — it is
+    NOT combined into the score: Open Targets' clinical datatype already counts
+    drugs whose mechanism is this target, so adding ours would count that
+    evidence twice.
+
+    `trial_only` are MeSH conditions from `target_trial_conditions` that Open
+    Targets does not associate with the target at all. They are a floor-axis
+    derivative (score <= 0.75, never 1.0) and are kept OUT of the measured
+    list rather than ranked against it.
+    """
+    merged: dict[str, dict] = {}
+    by_id: dict[str, str] = {}
+    for r in ot_rows:
+        did = r.get("disease_id")
+        key = _disease_key(r.get("indication_name"))
+        if not did or not key or key in _GENERIC_DISEASE_KEYS:
+            continue
+        key = by_id.get(did, key)
+        cur = merged.get(key)
+        score = r.get("association_score")
+        if cur is None or (score or 0) > (cur["association_score"] or 0):
+            merged[key] = {
+                "indication_id": r.get("indication_id"),
+                "indication_name": r.get("indication_name"),
+                "disease_id": did,
+                "therapeutic_area": r.get("therapeutic_area"),
+                "evidence_type": r.get("evidence_type"),
+                "association_score": score,
+                "basis": "open_targets",
+                "trial_support": None,
+            }
+        by_id[did] = key
+    trial_only: dict[str, dict] = {}
+    for r in trial_rows:
+        key = _disease_key(r.get("mesh_term"))
+        if not key or key in _GENERIC_DISEASE_KEYS:
+            continue
+        support = {
+            "mesh_id": r.get("mesh_id"),
+            "max_phase": r.get("max_phase"),
+            "trial_count": r.get("trial_count"),
+            "example_nct_ids": list(r.get("example_nct_ids") or [])[:2],
+        }
+        if key in merged:
+            cur = merged[key]
+            if cur["trial_support"] is None or (support["max_phase"] or 0) > (cur["trial_support"]["max_phase"] or 0):
+                cur["trial_support"] = support
+            continue
+        prev = trial_only.get(key)
+        if prev is None or (r.get("association_score") or 0) > (prev["association_score"] or 0):
+            trial_only[key] = {
+                "indication_name": r.get("mesh_term"),
+                "disease_id": f"MESH:{r.get('mesh_id')}",
+                "evidence_type": "clinical_trial_mechanism",
+                "association_score": r.get("association_score"),
+                "basis": "derived:trial_compounds",
+                **{k: v for k, v in support.items() if k != "mesh_id"},
+            }
+    assoc = sorted(merged.values(),
+                   key=lambda r: (-(r["association_score"] or 0), r["indication_name"] or ""))
+    t_only = sorted(trial_only.values(),
+                    key=lambda r: (-(r["association_score"] or 0), -(r["trial_count"] or 0),
+                                   r["indication_name"] or ""))
+    return assoc, t_only
+
+
+# Salt / hydrate words. ChEMBL registers IMATINIB and IMATINIB MESYLATE as two
+# molecules; listing both made one drug appear twice in a pipeline that promises
+# one row per compound (audit 2026-10-03 P0-2).
+_SALT_WORDS = frozenset({
+    "MESYLATE", "DIMESYLATE", "MESILATE", "MALATE", "HYDROCHLORIDE",
+    "DIHYDROCHLORIDE", "HCL", "TOSYLATE", "DITOSYLATE", "ANHYDROUS", "HYDRATE",
+    "MONOHYDRATE", "DIHYDRATE", "TRIHYDRATE", "SODIUM", "DISODIUM", "POTASSIUM",
+    "CALCIUM", "MAGNESIUM", "PHOSPHATE", "MALEATE", "CITRATE", "SULFATE",
+    "BISULFATE", "FUMARATE", "SUCCINATE", "TARTRATE", "ACETATE", "BESYLATE",
+    "HYDROBROMIDE", "LACTATE", "MONOHYDROCHLORIDE", "TRIFLUOROACETATE",
+    "ETHANOLATE", "CAMSYLATE", "ESYLATE", "NAPSYLATE", "OXALATE",
+})
+
+
+def _parent_name(name: str | None) -> str | None:
+    if not name:
+        return None
+    words = name.upper().split()
+    while len(words) > 1 and words[-1] in _SALT_WORDS:
+        words.pop()
+    return " ".join(words)
+
+
+def _collapse_salt_forms(rows: list[dict]) -> list[dict]:
+    """One row per parent compound: max phase, mechanism if any form is, the
+    parent's own row (shortest name) as the representative; every ChEMBL id
+    kept in `forms`."""
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        key = _parent_name(r.get("compound_name")) or r.get("chembl_id") or r.get("compound_id")
+        groups.setdefault(key, []).append(r)
+    out = []
+    for key, grp in groups.items():
+        rep = dict(min(grp, key=lambda r: (len(r.get("compound_name") or "~" * 99),
+                                           r.get("evidence_basis") != "mechanism")))
+        rep["compound_name"] = key if rep.get("compound_name") else None
+        rep["max_phase"] = max((g.get("max_phase") or 0) for g in grp)
+        if any(g.get("evidence_basis") == "mechanism" for g in grp):
+            rep["evidence_basis"] = "mechanism"
+        if rep["max_phase"] >= 4:
+            rep["approval_status"] = "approved"
+        rep["first_approval"] = min((g.get("first_approval") for g in grp
+                                     if g.get("first_approval")), default=None)
+        vals = [g.get("activity_value") for g in grp if g.get("activity_value") is not None]
+        if vals:
+            best = min(grp, key=lambda g: g.get("activity_value")
+                       if g.get("activity_value") is not None else float("inf"))
+            rep["activity_value"], rep["activity_type"] = best["activity_value"], best.get("activity_type")
+        rep["form_ids"] = sorted({g.get("compound_id") for g in grp if g.get("compound_id")})
+        if len(grp) > 1:
+            rep["forms"] = sorted({g.get("chembl_id") for g in grp if g.get("chembl_id")})
+        out.append(rep)
+    return out
+
+
+# CT.gov phase vocabulary -> rank (EARLY_PHASE1 sits below PHASE1; NA is
+# observational, not a phase, and is left out rather than ranked as 0).
+_CTGOV_PHASE_RANK = {"PHASE4": 4, "PHASE3": 3, "PHASE2": 2, "PHASE1": 1,
+                     "EARLY_PHASE1": 0.5, "PHASE2/PHASE3": 2.5, "PHASE1/PHASE2": 1.5}
+
+
+def _merge_org_rows(pairs: list[dict]) -> list[dict]:
+    """(org_name, org_type, is_big_pharma, patent_id) rows -> one row per
+    canonical organization, distinct patents counted, raw names kept."""
+    merged: dict[str, dict] = {}
+    for r in pairs:
+        raw = r.get("org_name")
+        if not raw:
+            continue
+        key, parent = _org_identity(raw)
+        m = merged.setdefault(key, {"org_name": parent, "org_type": r.get("org_type"),
+                                    "is_big_pharma": False, "_patents": set(),
+                                    "_names": {}})
+        m["_patents"].add(r.get("patent_id"))
+        m["_names"][raw] = m["_names"].get(raw, 0) + 1
+        m["is_big_pharma"] = m["is_big_pharma"] or bool(r.get("is_big_pharma"))
+    out = []
+    for m in merged.values():
+        names = sorted(m["_names"], key=lambda n: (-m["_names"][n], n))
+        out.append({
+            # A parent group shows the parent; otherwise the most-used spelling.
+            "org_name": m["org_name"] or names[0],
+            "org_type": m["org_type"],
+            "is_big_pharma": m["is_big_pharma"],
+            "patent_count": len(m["_patents"] - {None}),
+            "aliases": names if len(names) > 1 or m["org_name"] else [],
+        })
+    out.sort(key=lambda o: (-o["patent_count"], o["org_name"]))
+    return out
+
+
+# --- Momentum (audit 2026-10-03 P1-5) ----------------------------------------
+# One definition, used by the profile at query time AND by scripts/compute_scores
+# (which imports it), so the stored label and the served window cannot drift.
+MOMENTUM_TRAILING_DAYS = 365
+MOMENTUM_MIN_PAPERS = 5
+MOM_ACCELERATING = "accelerating"
+MOM_DECELERATING = "decelerating"
+MOM_STABLE = "stable"
+MOM_NO_PAPERS = "no_papers"
+MOM_NONE_IN_WINDOW = "no_recent_publications"
+MOM_INSUFFICIENT = "insufficient_data"
+
+
+def classify_momentum(recent: int, older: int) -> tuple[float | None, str]:
+    """``(momentum, direction)`` from two equal windows; None when unmeasured.
+
+    Never 0.0 for "not measured" (S23e). The thresholds are a 20% band: the
+    label says "accelerating" only when the trailing window beats the one before
+    it by more than a fifth, so its sign always agrees with the stated delta.
+    """
+    total = recent + older
+    if total == 0:
+        return None, MOM_NO_PAPERS
+    if total < MOMENTUM_MIN_PAPERS:
+        return None, MOM_INSUFFICIENT
+    if older == 0:
+        return 1.0, MOM_ACCELERATING
+    if recent == 0:
+        return None, MOM_NONE_IN_WINDOW
+    ratio = recent / older
+    if ratio > 1.2:
+        direction = MOM_ACCELERATING
+    elif ratio < 0.8:
+        direction = MOM_DECELERATING
+    else:
+        direction = MOM_STABLE
+    return max(0.0, min(1.0, (ratio - 0.5) / 1.5)), direction
 
 
 # =====================================================================
@@ -1493,6 +1789,166 @@ class GraphQueries:
     # Deep Profile (comprehensive target dossier)
     # =====================================================================
 
+    # ------------------------------------------------------------------
+    # Audit 2026-10-03 helpers: paper membership (P0-1), dates (P0-5),
+    # momentum (P1-5), competitive intensity (P1-6)
+    # ------------------------------------------------------------------
+
+    def _kg_cutoff_date(self):
+        """The date nothing after which is served or trended.
+
+        The earliest of: today; the KG's last refresh; and the DECLARED corpus
+        cutoff (WO-01 A2 — "everything published after this date is out of
+        scope by declaration"), read from the hashed coverage cells that carry
+        it. The papers corpus was harvested under that window (2026-08-18,
+        2020-01-01..2026-06-30); what arrived later is a thin monthly-refresh
+        sample — measured 2026-10-03: ~45 KRAS papers/month through June, then
+        10, 5, 16 — so a trend or a momentum window running past the declared
+        cutoff compares a partial tail against full months. A database with no
+        stamped cutoff (BYO) falls back to the refresh date.
+        """
+        import datetime as _dt
+        import time as _t
+        cached = getattr(self, "_cutoff_cache", None)
+        if cached is not None and _t.time() - cached[0] < 3600:
+            return cached[1]
+        cut = _dt.date.today()
+        meta = self.get_kg_metadata() or {}
+        ts = meta.get("last_refresh_at")
+        if ts:
+            try:
+                d = ts.date() if hasattr(ts, "date") else _dt.date.fromisoformat(str(ts)[:10])
+                cut = min(cut, d)
+            except (TypeError, ValueError):
+                pass
+        if self._has_column("target_coverage", "cutoff_date"):
+            rows = self._execute_safe(
+                "SELECT MAX(cutoff_date) AS c FROM target_coverage WHERE cutoff_date IS NOT NULL")
+            if rows and rows[0].get("c"):
+                cut = min(cut, rows[0]["c"])
+        self._cutoff_cache = (_t.time(), cut)
+        return cut
+
+    def _paper_date_expr(self, alias: str = "p") -> str:
+        """SQL for a paper's date: the earliest of e-pub / issue / PubMed entry
+        when stored, else the legacy issue-date string. Typed `date` either way."""
+        if self._has_column("papers", "date_earliest"):
+            return (f"COALESCE({alias}.date_earliest, "
+                    f"CASE WHEN {alias}.publication_date ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}' "
+                    f"THEN left({alias}.publication_date, 10)::date END)")
+        return (f"(CASE WHEN {alias}.publication_date ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}' "
+                f"THEN left({alias}.publication_date, 10)::date END)")
+
+    def _paper_membership_present(self) -> bool:
+        if not hasattr(self, "_pm_present"):
+            r = self._execute_safe(
+                "SELECT to_regclass('paper_gene_annotations') IS NOT NULL "
+                "AND to_regclass('paper_annotation_log') IS NOT NULL AS ok")
+            self._pm_present = bool(r and r[0].get("ok"))
+        return self._pm_present
+
+    def _paper_membership_sql(self, pmt: str = "pmt", p: str = "p") -> str:
+        """AND-clause: is this stored paper->target edge about the TARGET GENE?
+
+        Audit 2026-10-03 P0-1. Edges were made by case-insensitive symbol
+        matching, so EGFR held eGFR (glomerular filtration rate) papers and KIT
+        held qPCR-*kit* papers, all counted as `measured`. Membership now is:
+
+          1. PubTator3 tagged the target's human NCBI Gene ID in the paper, or
+          2. PubTator3 has NO annotation record for the PMID (never asked, or
+             absent upstream), and the target's symbol appears CASE-SENSITIVELY
+             as a whole token in the title.
+
+        A PMID PubTator annotated WITHOUT the gene is out: that is a
+        measurement that the gene is not there, which no string match overrides.
+        Returns "" (legacy behaviour) on a database without the annotation
+        tables — the payload's `membership_basis` says which applied.
+        """
+        if not self._paper_membership_present():
+            return ""
+        return f"""
+          AND (
+            EXISTS (SELECT 1 FROM paper_gene_annotations pga
+                      JOIN targets tm ON tm.id = {pmt}.target_id
+                     WHERE pga.pmid = {p}.pmid AND pga.ncbi_gene_id = tm.entrez_id)
+            OR (NOT EXISTS (SELECT 1 FROM paper_annotation_log pal
+                             WHERE pal.pmid = {p}.pmid AND pal.status = 'annotated')
+                AND {p}.title ~ ('(^|[^A-Za-z0-9])' || {pmt}.target_id || '([^A-Za-z0-9]|$)'))
+          )"""
+
+    def paper_membership_basis(self) -> str:
+        return ("pubtator3_ncbi_gene_id+case_sensitive_title_fallback"
+                if self._paper_membership_present() else "legacy_symbol_string_match")
+
+    def _trailing_momentum(self, target: str, cutoff) -> dict[str, Any]:
+        """Trailing 12 months to the cutoff vs the 12 months before, dated by
+        PubMed entry (day-precise; issue dates impute Jan-01 / day-01)."""
+        import datetime as _dt
+        start_recent = cutoff - _dt.timedelta(days=MOMENTUM_TRAILING_DAYS)
+        start_older = start_recent - _dt.timedelta(days=MOMENTUM_TRAILING_DAYS)
+        if self._has_column("papers", "date_pubmed_entrez"):
+            dexpr = f"COALESCE(p.date_pubmed_entrez, {self._paper_date_expr('p')})"
+        else:
+            dexpr = self._paper_date_expr("p")
+        member = self._paper_membership_sql("pmt", "p")
+        rows = self._execute_safe(f"""
+            SELECT COUNT(*) FILTER (WHERE {dexpr} >  %(sr)s AND {dexpr} <= %(c)s) AS recent,
+                   COUNT(*) FILTER (WHERE {dexpr} >  %(so)s AND {dexpr} <= %(sr)s) AS older
+            FROM paper_mentions_target pmt
+            JOIN papers p ON p.id = pmt.paper_id
+            WHERE pmt.target_id = %(t)s {member}
+        """, {"t": target, "sr": start_recent, "so": start_older, "c": cutoff})
+        recent = int(rows[0]["recent"]) if rows else 0
+        older = int(rows[0]["older"]) if rows else 0
+        value, direction = classify_momentum(recent, older)
+        return {
+            "value": None if value is None else round(value, 4),
+            "direction": direction,
+            "recent_papers": recent,
+            "prior_papers": older,
+            "delta": recent - older,
+            "window": (f"papers entering PubMed in the 12 months to {cutoff.isoformat()} "
+                       f"(the declared corpus cutoff) vs the 12 months before; "
+                       f"'accelerating' > +20%, 'decelerating' < -20%"),
+        }
+
+    def canonical_org_counts(self) -> dict[str, int]:
+        """{target: canonical patent-assignee organizations} over every curated
+        target, 0 for a target with none. One definition for the profile's
+        competitive intensity and scripts/compute_scores."""
+        rows = self._execute_safe("""
+            SELECT DISTINCT pmt.target_id, o.name
+            FROM patent_mentions_target pmt
+            JOIN patent_organizations po ON po.patent_id = pmt.patent_id
+            JOIN organizations o ON o.id = po.org_id
+            JOIN targets t ON t.id = pmt.target_id
+        """)
+        per: dict[str, set[str]] = {}
+        for r in rows:
+            per.setdefault(r["target_id"], set()).add(_org_merge_key(r["name"]))
+        out = {r["id"]: 0 for r in self._execute_safe("SELECT id FROM targets")}
+        out.update({t: len(v) for t, v in per.items()})
+        return out
+
+    @staticmethod
+    def org_percentile(n: int, dist: list[int]) -> float | None:
+        """Mid-rank percentile of `n` in `dist` (ties count half)."""
+        if not dist:
+            return None
+        below = sum(1 for x in dist if x < n)
+        equal = sum(1 for x in dist if x == n)
+        return (below + 0.5 * equal) / len(dist)
+
+    def _org_count_distribution(self) -> list[int]:
+        """Canonical-organization counts for every curated target (cached 1 h)."""
+        import time as _t
+        cached = getattr(self, "_org_dist_cache", None)
+        if cached and _t.time() - cached[0] < 3600:
+            return cached[1]
+        dist = sorted(self.canonical_org_counts().values())
+        self._org_dist_cache = (_t.time(), dist)
+        return dist
+
     def get_target_deep_profile(self, target_symbol: str) -> dict[str, Any] | None:
         """Assemble a comprehensive intelligence dossier for a target.
 
@@ -1551,8 +2007,25 @@ class GraphQueries:
                 (SELECT COUNT(*) FROM paper_validations WHERE target_id = %(t)s) AS validation_count
         """, {"t": target})
 
-        if counts:
-            profile["counts"] = dict(counts[0])
+        profile["counts"] = dict(counts[0]) if counts else {}
+
+        # Papers counted under the membership test (audit P0-1), not as every
+        # stored string-match edge: KIT's 494 included ferroptosis, keratitis
+        # and qPCR-kit papers, and EGFR's 6,013 included eGFR renal papers.
+        # Same definition as mosaic_get_target_papers' total: members, dated
+        # on or before the declared cutoff (an undated paper is not excluded).
+        member = self._paper_membership_sql("pmt", "p")
+        if member:
+            dexpr = self._paper_date_expr("p")
+            pc = self._execute_safe(f"""
+                SELECT COUNT(*) AS n FROM paper_mentions_target pmt
+                JOIN papers p ON p.id = pmt.paper_id
+                WHERE pmt.target_id = %(t)s
+                  AND ({dexpr} IS NULL OR {dexpr} <= %(cutoff)s)
+                  {member}
+            """, {"t": target, "cutoff": self._kg_cutoff_date()})
+            profile["counts"]["paper_count"] = int(pc[0]["n"]) if pc else None
+        profile["paper_membership_basis"] = self.paper_membership_basis()
 
         # 2b. Coverage states for this target (board S24 clause 2, via S16 phase 3).
         #
@@ -1583,8 +2056,16 @@ class GraphQueries:
         )
         cov = []
         if has_coverage and has_coverage[0].get("t"):
-            cov = self._execute_safe("""
-                SELECT axis, state, value, source_available_count, basis, fetched_at
+            # Audit 2026-10-03 P1-10: the cell states the query behind its
+            # count. Optional columns, probed — a BYO database without them
+            # renders the same block minus those keys.
+            extra = [c for c in ("declared_query", "alias_query", "cutoff_date",
+                                 "sample_precision", "sample_n")
+                     if self._has_column("target_coverage", c)]
+            cols = ", ".join(["axis", "state", "value", "source_available_count",
+                              "basis", "fetched_at"] + extra)
+            cov = self._execute_safe(f"""
+                SELECT {cols}
                 FROM target_coverage
                 WHERE target_id = %(t)s
             """, {"t": target})
@@ -1595,6 +2076,9 @@ class GraphQueries:
                 "source_available_count": r["source_available_count"],
                 "basis": r["basis"],
                 "fetched_at": r["fetched_at"].isoformat() if r["fetched_at"] else None,
+                **{k: (r[k].isoformat() if hasattr(r[k], "isoformat") else r[k])
+                   for k in ("declared_query", "alias_query", "cutoff_date",
+                             "sample_precision", "sample_n") if k in r},
             }
             for r in (cov or [])
         }
@@ -1609,21 +2093,63 @@ class GraphQueries:
         """, {"t": target})
         profile["scores"] = dict(scores[0]) if scores else None
 
-        # 4. Top 10 compounds by potency
+        # 4. Top 10 compounds by potency.
+        #
+        # `compound_name` is the ChEMBL preferred name or NULL — never the
+        # ChEMBL id restated (KRAS's top ten were ten bare ids reading as names;
+        # audit 2026-10-03 P1-3). `evidence_basis` says whether ChEMBL's
+        # MECHANISM table names this target ('mechanism') or only an assay does.
+        # Approval is derived from max_phase alone; it no longer leaks into
+        # activity_type (P1-2).
         top_compounds = self._execute_safe("""
-            SELECT c.id AS compound_id, c.name AS compound_name,
+            SELECT c.id AS compound_id,
+                   NULLIF(COALESCE(c.pref_name, c.name), c.chembl_id) AS compound_name,
                    c.chembl_id, c.smiles, c.max_phase,
                    c.molecular_weight, c.pchembl_value AS compound_pchembl,
                    ct.value AS activity_value, ct.activity_type,
                    ct.unit, ct.pchembl_value AS activity_pchembl,
-                   ct.assay_type
+                   ct.assay_type,
+                   CASE WHEN ct.source = 'chembl_mechanism' THEN 'mechanism'
+                        ELSE 'assay' END AS evidence_basis
             FROM compound_targets ct
             JOIN compounds c ON c.id = ct.compound_id
             WHERE ct.target_id = %(target)s
+              AND ct.value IS NOT NULL
             ORDER BY ct.value ASC NULLS LAST
             LIMIT 10
         """, {"target": target})
         profile["top_compounds"] = top_compounds
+
+        # 4b. Approved and clinical compounds — the approved-first view, shown
+        # BEFORE the potency list. A potency sort buries sotorasib/adagrasib
+        # under research compounds; a reader asking "what is in the clinic"
+        # needs this list, one row per compound.
+        profile["approved_and_clinical"] = self._execute_safe("""
+            SELECT DISTINCT ON (c.id)
+                   c.id AS compound_id,
+                   NULLIF(COALESCE(c.pref_name, c.name), c.chembl_id) AS compound_name,
+                   c.chembl_id, c.max_phase, c.first_approval,
+                   CASE WHEN c.max_phase >= 4 THEN 'approved'
+                        WHEN c.max_phase >= 1 THEN 'clinical' END AS approval_status,
+                   CASE WHEN ct.source = 'chembl_mechanism' THEN 'mechanism'
+                        ELSE 'assay' END AS evidence_basis,
+                   ct.activity_type, ct.value AS activity_value
+            FROM compound_targets ct
+            JOIN compounds c ON c.id = ct.compound_id
+            WHERE ct.target_id = %(t)s AND c.max_phase >= 1
+              -- An assay-only link must be potent to count: a 5.9 uM IC50 is
+              -- how dabrafenib (a BRAF drug) landed on KRAS. Mechanism links
+              -- need no potency floor — ChEMBL curated them.
+              AND (ct.source = 'chembl_mechanism' OR ct.pchembl_value >= 6)
+            ORDER BY c.id
+        """, {"t": target})
+        profile["approved_and_clinical"] = _collapse_salt_forms(profile["approved_and_clinical"])
+        profile["approved_and_clinical"].sort(key=lambda r: (
+            -(r.get("max_phase") or 0),
+            r.get("evidence_basis") != "mechanism",
+            r.get("first_approval") or 9999,
+            r.get("activity_value") if r.get("activity_value") is not None else float("inf"),
+        ))
 
         # 5. SAR summary
         sar = self._execute_safe("""
@@ -1646,40 +2172,74 @@ class GraphQueries:
         """, {"t": target})
         profile["sar_summary"] = dict(sar[0]) if sar else {}
 
-        # 6. Disease associations (top 15)
-        diseases = self._execute_safe("""
+        # 6. Disease associations (top 15), audit 2026-10-03 P0-3.
+        #
+        # Only ontology-keyed evidence is served: Open Targets rows (whose id
+        # lives in `indications.mesh_id` — MONDO_/EFO_/Orphanet_/HP_ despite the
+        # column name) and the mechanism-gated, MeSH-normalised trial rows in
+        # `target_trial_conditions`. The legacy `clinical_trial_phase*` rows in
+        # `target_indications` are NOT read: they were raw CT.gov condition
+        # strings from a "{gene} inhibitor" text search ("High Risk of
+        # Recurrence", "KIT Gene Mutation"), scored phase/4 up to 1.0, with no
+        # NCT id kept. They stay in the table — dropping rows is an operator call.
+        ot_rows = self._execute_safe("""
             SELECT i.id AS indication_id, i.name AS indication_name,
-                   i.therapeutic_area,
+                   i.mesh_id AS disease_id, i.therapeutic_area,
                    ti.evidence_type, ti.association_score
             FROM target_indications ti
             JOIN indications i ON i.id = ti.indication_id
             WHERE ti.target_id = %(t)s
-            ORDER BY ti.association_score DESC NULLS LAST
-            LIMIT 15
+              AND ti.evidence_type LIKE 'open\\_targets%%'
+              AND i.mesh_id IS NOT NULL
         """, {"t": target})
-        profile["disease_associations"] = diseases
+        has_ttc = self._execute_safe("SELECT to_regclass('target_trial_conditions') AS t")
+        trial_rows = []
+        if has_ttc and has_ttc[0].get("t"):
+            trial_rows = self._execute_safe("""
+                SELECT mesh_id, mesh_term, max_phase, trial_count,
+                       example_nct_ids, association_score
+                FROM target_trial_conditions WHERE target_id = %(t)s
+            """, {"t": target})
+        diseases, trial_only = merge_disease_associations(ot_rows, trial_rows)
+        profile["disease_associations"] = diseases[:15]
+        profile["trial_only_conditions"] = trial_only[:5]
+        profile["counts"]["indication_count"] = len(diseases)
+        profile["counts"]["trial_only_condition_count"] = len(trial_only)
 
-        # 7. Validation evidence
-        val_by_type = self._execute_safe("""
-            SELECT validation_type, COUNT(*) AS evidence_count
-            FROM paper_validations
-            WHERE target_id = %(t)s
-            GROUP BY validation_type
-        """, {"t": target})
-        val_top_papers = self._execute_safe("""
-            SELECT p.title, p.journal, p.publication_date,
-                   p.citation_count, p.pmid,
-                   pv.validation_type, pv.model_system, pv.outcome
-            FROM paper_validations pv
-            JOIN papers p ON p.id = pv.paper_id
-            WHERE pv.target_id = %(t)s
-            ORDER BY p.citation_count DESC NULLS LAST
-            LIMIT 5
-        """, {"t": target})
+        # 7. Validation evidence — audit 2026-10-03 P0-4.
+        #
+        # This block used to serve `paper_validations` as stored: one regex
+        # label per paper and an auto-graded `outcome`, so adagrasib's KRYSTAL-1
+        # NEJM paper went out as `negative`, a review was graded `genetic`, and
+        # `clinical` rows carried `model_system: mouse` — while the Pro tool's
+        # own description says outcomes are NOT auto-graded. It now uses the
+        # same query-time re-classifier as `mosaic_target_validation`, drops
+        # Reviews / Meta-Analyses (a review is not experimental precedent), and
+        # carries no outcome at all.
+        precedent, _scanned = self._validation_precedent(target, profile["gene_symbol"])
+        by_type: dict[str, int] = {}
+        for row in precedent:
+            for vt in row["validation_types"]:
+                by_type[vt] = by_type.get(vt, 0) + 1
+        top = sorted(precedent, key=lambda r: (r["target_in_title"], r["_cite"], r["_year"]),
+                     reverse=True)[:5]
         profile["validation_evidence"] = {
-            "by_type": {r["validation_type"]: r["evidence_count"] for r in val_by_type},
-            "top_papers": val_top_papers,
+            "by_type": by_type,
+            "distinct_papers": len(precedent),
+            "top_papers": [
+                {
+                    "title": r["title"], "journal": r["journal"],
+                    "publication_date": r["publication_date"],
+                    "citation_count": r["_cite"], "pmid": r["pmid"],
+                    "validation_type": r["primary_type"],
+                    "model_system": r["primary_model"],
+                    "validation_types": r["validation_types"],
+                    "target_in_title": r["target_in_title"],
+                }
+                for r in top
+            ],
         }
+        profile.setdefault("counts", {})["validation_count"] = len(precedent)
 
         # 8. Top pathways (10)
         pathways = self._execute_safe("""
@@ -1722,124 +2282,135 @@ class GraphQueries:
             """, {"t": target})
         profile["protein_interactions"] = ppis
 
-        # 10. Top organizations (10)
-        orgs = self._execute_safe("""
-            SELECT o.name AS org_name, o.org_type, o.is_big_pharma,
-                   COUNT(DISTINCT po.patent_id) AS patent_count
+        # 10. Organizations — audit 2026-10-03 P1-1.
+        #
+        # Counted over CANONICAL organizations, not raw assignee strings: KRAS's
+        # top ten carried "Eli Lilly and Company" (17) and "LILLY CO ELI [US]"
+        # (16) as two competitors, and Ariad separately from Takeda, which owns
+        # it. `_org_identity` merges spelling variants and completed
+        # acquisitions; each merged row keeps its raw strings as `aliases`.
+        org_pairs = self._execute_safe("""
+            SELECT DISTINCT o.name AS org_name, o.org_type, o.is_big_pharma,
+                   po.patent_id
             FROM patent_mentions_target pmt
             JOIN patent_organizations po ON po.patent_id = pmt.patent_id
             JOIN organizations o ON o.id = po.org_id
             WHERE pmt.target_id = %(t)s
-            GROUP BY o.name, o.org_type, o.is_big_pharma
-            ORDER BY patent_count DESC
-            LIMIT 10
         """, {"t": target})
-        profile["top_organizations"] = orgs
+        merged_orgs = _merge_org_rows(org_pairs)
+        profile["top_organizations"] = merged_orgs[:10]
+        profile["counts"]["organization_count"] = len(merged_orgs)
+        profile["counts"]["big_pharma_org_count"] = sum(
+            1 for o in merged_orgs if o["is_big_pharma"])
 
-        # 11. Clinical pipeline (15) — compound_indications first, fallback to target_indications
+        # 10b. Competitive intensity — audit P1-6. `target_scores` has carried
+        # NULL here since S17e dropped it from the composite (the patents axis
+        # is a floor), while key_insight still asserted "Crowded space" at
+        # both 504 and 63 organizations with no threshold. The value is now the
+        # target's percentile among the curated set on canonical organizations,
+        # and the adjective is read off a stated quartile. Because the axis is
+        # a FLOOR, only the upper quartiles license a claim ("at least this
+        # crowded"); the lower ones are reported, never read as "uncrowded".
+        dist = self._org_count_distribution()
+        n_orgs = len(merged_orgs)
+        pct = self.org_percentile(n_orgs, dist)
+        if pct is not None:
+            quartile = min(4, int(pct * 4) + 1)
+            profile["competitive_intensity"] = {
+                "value": round(pct, 4),
+                "quartile": quartile,
+                "organizations": n_orgs,
+                "reference_set_size": len(dist),
+                "basis": ("percentile of canonical patent-assignee organizations "
+                          "among the curated targets; patents are a FLOOR axis, so "
+                          "only the upper quartiles support a crowding claim"),
+            }
+        else:
+            profile["competitive_intensity"] = None
+
+        # 11. Clinical pipeline — audit 2026-10-03 P0-2. ONE ROW PER COMPOUND.
         #
-        # Phase and status come from `compounds.max_phase`, NOT from
-        # `compound_indications.max_phase`/`clinical_status`. Those two columns
-        # are default-fill that ingestion never populated: measured 2026-07-19,
-        # all 15,786 rows carry max_phase = 0 and clinical_status =
-        # 'preclinical'. They have ONE distinct value each, so they cannot
-        # express a difference and are not data. Reading them made
-        # `CASE ci.max_phase WHEN 0 THEN 'Preclinical'` render every compound
-        # for every target as preclinical — SOTORASIB and ADAGRASIB, both
-        # approved, shipped as `phase: 0, "preclinical"` on the most-demoed
-        # target in the KG while `sar_summary.highest_clinical_phase` said 4
-        # off `compounds.max_phase` in the same payload.
-        #
-        # `phase_basis` is emitted because the honest scope of this number is
-        # the compound's highest phase in ANY indication — ChEMBL's true
-        # per-indication phase (`drug_indication.max_phase_for_ind`) is not
-        # ingested. Sotorasib is approved for NSCLC, not for every indication
-        # it is listed against; the field says so rather than implying it.
-        pipeline = self._execute_safe("""
-            SELECT c.name AS compound_name, c.chembl_id,
-                   i.name AS indication_name,
-                   c.max_phase,
-                   CASE
-                       WHEN c.max_phase IS NULL OR c.max_phase < 0 THEN 'unknown'
-                       WHEN c.max_phase >= 4 THEN 'approved'
-                       WHEN c.max_phase >= 1 THEN 'clinical'
-                       ELSE 'preclinical'
-                   END AS clinical_status,
-                   'compound_max_any_indication'::text AS phase_basis
-            FROM compound_targets ct
-            JOIN compound_indications ci ON ci.compound_id = ct.compound_id
-            JOIN compounds c ON c.id = ct.compound_id
-            JOIN indications i ON i.id = ci.indication_id
-            WHERE ct.target_id = %(t)s
-            ORDER BY c.max_phase DESC NULLS LAST
-            LIMIT 15
-        """, {"t": target})
-
-        if len(pipeline) < 3:
-            fallback = self._execute_safe("""
-                SELECT c.name AS compound_name, c.chembl_id,
-                       i.name AS indication_name,
-                       c.max_phase,
-                       -- ChEMBL uses max_phase = -1 for "unknown", which the
-                       -- previous `>= 1 THEN clinical ELSE preclinical` mapped
-                       -- to 'preclinical' — asserting a fact about 30 compounds
-                       -- whose phase was explicitly not known.
-                       CASE
-                           WHEN c.max_phase IS NULL OR c.max_phase < 0 THEN 'unknown'
-                           WHEN c.max_phase >= 4 THEN 'approved'
-                           WHEN c.max_phase >= 1 THEN 'clinical'
-                           ELSE 'preclinical'
-                       END AS clinical_status,
-                       'compound_max_any_indication'::text AS phase_basis,
-                       ti.association_score
-                FROM compound_targets ct
-                JOIN compounds c ON c.id = ct.compound_id
-                JOIN target_indications ti ON ti.target_id = ct.target_id
-                JOIN indications i ON i.id = ti.indication_id
-                WHERE ct.target_id = %(t)s
-                  AND ti.association_score >= 0.3
-                -- `NULLS LAST` is load-bearing. Postgres sorts NULLS FIRST on
-                -- DESC by default, so without it every compound whose phase is
-                -- unrecorded sorts ABOVE every approved drug and the LIMIT
-                -- below keeps the unknowns. This clause was the only one of the
-                -- five `ORDER BY c.max_phase DESC` in this file missing it.
-                --
-                -- Harmless while the column had no NULLs, and instantly not:
-                -- the 2026-08-14 cleanup replaced 16,742 coerced zeros with the
-                -- NULL ChEMBL actually returns, and KRAS's pipeline immediately
-                -- became 15 rows of one unnamed research compound while
-                -- SOTORASIB, ADAGRASIB, LONAFARNIB and DABRAFENIB — all phase 4,
-                -- all on this target — fell off the end. That is the same
-                -- payload the comment above describes shipping approved drugs
-                -- as preclinical, reached by a different route.
-                --
-                -- Caught by test_perturbing_compound_max_phase_moves_the_dossier_pipeline
-                -- on the first sweep that was able to start in eight days.
-                ORDER BY c.max_phase DESC NULLS LAST,
-                         ct.value ASC NULLS LAST, ti.association_score DESC
-                LIMIT 15
-            """, {"t": target})
-            seen = {(r["compound_name"], r["indication_name"]) for r in pipeline}
-            for row in fallback:
-                if (row["compound_name"], row["indication_name"]) not in seen:
-                    pipeline.append(dict(row))
-                    seen.add((row["compound_name"], row["indication_name"]))
-
+        # This was compound x indication, ordered by the compound's max phase
+        # and capped at 15 ROWS, so one approved multi-kinase drug exhausted the
+        # cap: KRAS rendered dabrafenib (a BRAF inhibitor, linked by a 5.9 uM
+        # assay) fifteen times; KIT rendered ponatinib x14 while imatinib,
+        # avapritinib and ripretinib were absent. Each row now is one compound,
+        # with:
+        #   basis     'mechanism' when ChEMBL's drug-mechanism table names THIS
+        #             target; 'binding_assay' when only an assay links it, and
+        #             then only at pChEMBL >= 6 (<= 1 uM).
+        #   max_phase the compound's highest phase in ANY indication, named as
+        #             such (`phase_basis`) — it is not a phase for this target.
+        #   indications_any_target  where the compound is developed, which is
+        #             not a claim about this target either.
+        # Order: max phase, then mechanism before assay, then earliest approval,
+        # then potency. Capped at 15 COMPOUNDS.
+        cand = profile["approved_and_clinical"][:15]
+        ind_by_cpd: dict[str, list[str]] = {}
+        if cand:
+            for r in self._execute_safe("""
+                SELECT ci.compound_id, i.name
+                  FROM compound_indications ci
+                  JOIN indications i ON i.id = ci.indication_id
+                 WHERE ci.compound_id = ANY(%(ids)s)
+                 ORDER BY ci.compound_id, i.name
+            """, {"ids": [f for c in cand for f in (c.get("form_ids") or [c["compound_id"]])]}):
+                ind_by_cpd.setdefault(r["compound_id"], []).append(r["name"])
+        pipeline = []
+        for c in cand:
+            mp = c.get("max_phase")
+            inds = sorted({i for f in (c.get("form_ids") or [c["compound_id"]])
+                           for i in ind_by_cpd.get(f, [])})
+            pipeline.append({
+                "compound_name": c.get("compound_name"),
+                "chembl_id": c.get("chembl_id"),
+                "forms": c.get("forms"),
+                "max_phase": mp,
+                "clinical_status": c.get("approval_status"),
+                "phase_basis": "compound_max_any_indication",
+                "basis": "mechanism" if c.get("evidence_basis") == "mechanism" else "binding_assay",
+                "indications_any_target": inds[:5],
+                "indication_count": len(inds),
+                # The first listed indication, for readers keyed on the old
+                # compound x indication row shape (web agent, mutation sweep).
+                "indication_name": inds[0] if inds else None,
+            })
         profile["clinical_pipeline"] = pipeline
 
-        # 12. Publication trend (last 5 years)
-        trend = self._execute_safe("""
-            SELECT EXTRACT(YEAR FROM p.publication_date::date)::int AS year,
+        # 12. Publication trend (last 5 years) — audit P0-5 / P1-5.
+        #
+        # Dated by the EARLIEST of e-pub / issue / PubMed-entry date, and
+        # nothing after the KG cutoff is counted: the issue date ran ahead of
+        # the calendar (papers "published" 2026-12-06 served on 2026-10-03, and
+        # a KRAS 2027 bucket), and momentum was computed on it. The cutoff year
+        # is flagged partial — a partial year read against a full one is how
+        # "accelerating" sat next to 352 < 465.
+        cutoff = self._kg_cutoff_date()
+        date_expr = self._paper_date_expr("p")
+        member = self._paper_membership_sql("pmt", "p")
+        trend = self._execute_safe(f"""
+            SELECT EXTRACT(YEAR FROM {date_expr})::int AS year,
                    COUNT(*) AS paper_count
             FROM paper_mentions_target pmt
             JOIN papers p ON p.id = pmt.paper_id
             WHERE pmt.target_id = %(t)s
-              AND p.publication_date IS NOT NULL
+              AND {date_expr} IS NOT NULL
+              AND {date_expr} <= %(cutoff)s
+              {member}
             GROUP BY year
             ORDER BY year DESC
             LIMIT 5
-        """, {"t": target})
+        """, {"t": target, "cutoff": cutoff})
+        for row in trend:
+            if row["year"] == cutoff.year:
+                row["partial_year"] = True
+                row["through"] = cutoff.isoformat()
         profile["publication_trend"] = trend
+        profile["publication_cutoff"] = cutoff.isoformat()
+
+        # 12b. Momentum on a trailing window — audit P1-5. The label is read off
+        # the same window it states, so it cannot contradict it.
+        profile["momentum"] = self._trailing_momentum(target, cutoff)
 
         # 13. Structural intelligence (AlphaFold + druggability)
         structure = self._execute_safe("""
@@ -2157,6 +2728,72 @@ class GraphQueries:
         """, {"t": target})
         return dict(rows[0]) if rows else None
 
+    def _validation_precedent(
+        self, target: str, symbol: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """(precedent rows, candidate papers) — the S22 query-time re-classifier.
+
+        Shared by the profile and `mosaic_target_validation` so the free and
+        paid surfaces can no longer disagree about the same papers.
+
+        Reviews and meta-analyses are excluded (audit 2026-10-03 P0-4): a review
+        summarises other people's experiments, so counting it as genetic or
+        clinical precedent double-counts the field. Exclusion reads PubMed's own
+        `publication_types`; on a database without that column nothing is
+        excluded, and nothing pretends otherwise.
+
+        `primary_type` / `primary_model` give a single, mutually consistent label
+        per paper: a clinical-trial paper's model is `human` by construction, so
+        `clinical` + `mouse` cannot be emitted.
+        """
+        has_types = self._has_column("papers", "publication_types")
+        review_filter = (
+            "AND NOT COALESCE(p.publication_types ?| ARRAY['Review','Meta-Analysis',"
+            "'Systematic Review'], false)" if has_types else ""
+        )
+        papers = self._execute_safe(f"""
+            SELECT p.id AS paper_id, p.title, p.abstract, p.journal,
+                   p.publication_date, p.pmid, p.citation_count
+            FROM paper_validations pv
+            JOIN papers p ON p.id = pv.paper_id
+            WHERE pv.target_id = %(t)s
+              {review_filter}
+        """, {"t": target})
+
+        precedent: list[dict[str, Any]] = []
+        for p in papers:
+            title = p.get("title") or ""
+            abstract = p.get("abstract") or ""
+            types, models = classify_validation(f"{abstract} {title}")
+            if not types:
+                continue  # no real validation cue -> not a precedent (drops noise)
+            year: int | None = None
+            if p.get("publication_date"):
+                try:
+                    year = int(str(p["publication_date"])[:4])
+                except (ValueError, TypeError):
+                    year = None
+            pmid = p.get("pmid")
+            primary = types[0]
+            precedent.append({
+                "title": title or None,
+                "journal": p.get("journal"),
+                "year": year,
+                "publication_date": p.get("publication_date"),
+                "pmid": pmid,
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None,
+                "validation_types": types,
+                "model_systems": models,  # [] = model unspecified
+                "primary_type": primary,
+                "primary_model": ("human" if primary == "clinical_trial"
+                                  else (models[0] if models else None)),
+                "target_in_title": symbol_in_title(symbol, title),
+                "evidence_snippet": _precedent_snippet(abstract, title),
+                "_cite": int(p.get("citation_count") or 0),
+                "_year": year or 0,
+            })
+        return precedent, papers
+
     def get_target_validation_summary(self, target_symbol: str) -> dict[str, Any]:
         """Assay-precedent summary: what has been tried against this target, in
         what model system — re-classified at query time (S22).
@@ -2175,42 +2812,12 @@ class GraphQueries:
         )
         symbol = (srow[0]["symbol"] if srow else str(target_symbol)).upper()
 
-        papers = self._execute_safe("""
-            SELECT p.id AS paper_id, p.title, p.abstract, p.journal,
-                   p.publication_date, p.pmid, p.citation_count
-            FROM paper_validations pv
-            JOIN papers p ON p.id = pv.paper_id
-            WHERE pv.target_id = %(t)s
-        """, {"t": target})
-
-        # Query-time multi-label re-classification (the S22 core).
-        precedent: list[dict[str, Any]] = []
-        for p in papers:
-            title = p.get("title") or ""
-            abstract = p.get("abstract") or ""
-            types, models = classify_validation(f"{abstract} {title}")
-            if not types:
-                continue  # no real validation cue -> not a precedent (drops noise)
-            year: int | None = None
-            if p.get("publication_date"):
-                try:
-                    year = int(str(p["publication_date"])[:4])
-                except (ValueError, TypeError):
-                    year = None
-            pmid = p.get("pmid")
-            precedent.append({
-                "title": title or None,
-                "journal": p.get("journal"),
-                "year": year,
-                "pmid": pmid,
-                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None,
-                "validation_types": types,
-                "model_systems": models,  # [] = model unspecified
-                "target_in_title": symbol_in_title(symbol, title),
-                "evidence_snippet": _precedent_snippet(abstract, title),
-                "_cite": int(p.get("citation_count") or 0),
-                "_year": year or 0,
-            })
+        precedent, papers = self._validation_precedent(target, symbol)
+        precedent = [
+            {k: v for k, v in r.items()
+             if k not in ("primary_type", "primary_model", "publication_date")}
+            for r in precedent
+        ]
 
         # "What's been tried, in what model" — distinct papers per (type, model).
         # Multi-label: a paper counts under each type it used and each model it
@@ -2411,11 +3018,18 @@ class GraphQueries:
                        AND ct.target_id = tt.target_id)      AS link_edge_grade
             FROM trials tr
             JOIN trial_targets tt ON tt.nct_id = tr.nct_id
-            LEFT JOIN trial_compounds tc ON tc.nct_id = tr.nct_id
+            -- Audit 2026-10-03 P0-2: an assay-only link must be potent
+            -- (pChEMBL >= 6, <= 1 uM) to attach a trial — a 5.9 uM IC50 is
+            -- how dabrafenib's BRAF trials became KRAS's pipeline. Mechanism
+            -- links need no floor; ChEMBL curated them. A trial with no
+            -- qualifying compound is not in this target's pipeline.
+            JOIN trial_compounds tc ON tc.nct_id = tr.nct_id
                  AND EXISTS (SELECT 1 FROM compound_targets ct
                               WHERE ct.compound_id = tc.compound_id
-                                AND ct.target_id = tt.target_id)
-            LEFT JOIN compounds c ON c.id = tc.compound_id
+                                AND ct.target_id = tt.target_id
+                                AND (ct.source = 'chembl_mechanism'
+                                     OR ct.pchembl_value >= 6))
+            JOIN compounds c ON c.id = tc.compound_id
             WHERE tt.target_id = %(t)s
             ORDER BY
                 -- Mechanism-grade links first: those are trials of drugs whose
@@ -2526,10 +3140,41 @@ class GraphQueries:
             """, {"t": target})
             combined = [dict(r) for r in basic]
 
+        # One row per compound over the roster (P0-2): the trial list repeats
+        # a drug once per trial by design, so "who is in the pipeline" is
+        # answered here, salt forms collapsed, mechanism links first.
+        by_cpd: dict[str, dict] = {}
+        for r in combined:
+            name = _parent_name(r.get("compound_name")) or r.get("chembl_id")
+            if not name:
+                continue
+            e = by_cpd.setdefault(name, {"compound_name": name, "chembl_ids": set(),
+                                         "link_edge_grade": r.get("link_edge_grade"),
+                                         "trial_count": 0, "max_trial_phase": None,
+                                         "compound_max_phase": r.get("compound_max_phase")})
+            if r.get("chembl_id"):
+                e["chembl_ids"].add(r["chembl_id"])
+            if r.get("link_edge_grade") == "mechanism":
+                e["link_edge_grade"] = "mechanism"
+            if r.get("nct_id"):
+                e["trial_count"] += 1
+            ph = _CTGOV_PHASE_RANK.get(str(r.get("phase") or "").upper())
+            if ph is not None and (e["max_trial_phase"] is None or ph > e["max_trial_phase"]):
+                e["max_trial_phase"] = ph
+            cmp_ = r.get("compound_max_phase")
+            if cmp_ is not None and (e["compound_max_phase"] is None or cmp_ > e["compound_max_phase"]):
+                e["compound_max_phase"] = cmp_
+        compounds = sorted(by_cpd.values(), key=lambda e: (
+            e["link_edge_grade"] != "mechanism", -(e["max_trial_phase"] or 0),
+            -(e["trial_count"]), e["compound_name"]))
+        for e in compounds:
+            e["chembl_ids"] = sorted(e["chembl_ids"])
+
         # Count how many are real trial entries vs synthesized
         real_count = sum(1 for r in combined if r.get("nct_id"))
         return {
             "target": target,
+            "compounds": compounds,
             "pipeline": combined,
             "total_entries": len(combined),
             "real_trials_count": real_count,
@@ -2568,13 +3213,37 @@ class GraphQueries:
             WHERE t.id = ANY(%(targets)s)
         """, {"targets": targets})
 
+    COMPOUND_SORTS = ("potency", "max_phase")
+
     def get_target_compounds(
-        self, target_symbol: str, limit: int = 20
+        self, target_symbol: str, limit: int = 20, sort: str = "potency"
     ) -> list[dict[str, Any]]:
+        """Compounds on a target, by potency (default) or approved-first.
+
+        Audit 2026-10-03 P1-2 / P1-3: `compound_name` is the ChEMBL preferred
+        name or the literal "unnamed" — never the ChEMBL id restated (the id
+        has its own field; `compound_id` was a duplicate of it and is gone).
+        `approval_status` comes from max_phase alone; `activity_type` is the
+        assay's own type and is null for a mechanism-only link.
+        `sort="max_phase"` is the approved-first view: phase, then ChEMBL
+        mechanism before assay-only, then earliest approval, then potency —
+        so sotorasib, not a research compound, leads KRAS.
+        """
+        if sort not in self.COMPOUND_SORTS:
+            raise ValueError(f"sort must be one of {self.COMPOUND_SORTS}")
         target = self._resolve_target(target_symbol)
-        return self._execute_safe("""
-            SELECT c.id AS compound_id, c.name AS compound_name,
+        order = ("ct.value ASC NULLS LAST" if sort == "potency" else
+                 "c.max_phase DESC NULLS LAST, (ct.source = 'chembl_mechanism') DESC, "
+                 "c.first_approval ASC NULLS LAST, ct.value ASC NULLS LAST")
+        return self._execute_safe(f"""
+            SELECT COALESCE(NULLIF(COALESCE(c.pref_name, c.name), c.chembl_id),
+                            'unnamed') AS compound_name,
                    c.chembl_id, c.smiles, c.max_phase,
+                   CASE WHEN c.max_phase >= 4 THEN 'approved'
+                        WHEN c.max_phase >= 1 THEN 'clinical'
+                        WHEN c.max_phase >= 0 THEN 'preclinical' END AS approval_status,
+                   CASE WHEN ct.source = 'chembl_mechanism' THEN 'mechanism'
+                        ELSE 'assay' END AS evidence_basis,
                    ct.activity_type, ct.value AS activity_value,
                    ct.unit, ct.pchembl_value,
                    -- Window runs BEFORE LIMIT, so this is the true total, not
@@ -2585,7 +3254,7 @@ class GraphQueries:
             FROM compound_targets ct
             JOIN compounds c ON c.id = ct.compound_id
             WHERE ct.target_id = %(target)s
-            ORDER BY ct.value ASC NULLS LAST
+            ORDER BY {order}
             LIMIT %(limit)s
         """, {"target": target, "limit": limit})
 
@@ -2640,9 +3309,21 @@ class GraphQueries:
         # claims, never absence claims. This is the compounds axis's
         # `compound_count_is_floor` applied to papers, which is where the
         # pattern already existed and papers was simply never wired to it.
-        return self._execute_safe("""
-            SELECT p.id AS paper_id, p.title,
-                   p.publication_date, p.journal, p.pmid, p.doi,
+        # Audit 2026-10-03: membership (P0-1) — only papers about the target
+        # GENE; dates (P0-5) — the earliest of e-pub / issue / PubMed entry,
+        # nothing after the KG cutoff; ordering (P2) — papers naming the target
+        # in the title first, then newest. `paper_id` is dropped: it equals
+        # `pmid`, and its presence made the label enricher add `paper_title`,
+        # a second copy of `title`.
+        member = self._paper_membership_sql("pmt", "p")
+        date_expr = self._paper_date_expr("p")
+        title_match = ("(p.title ~ ('(^|[^A-Za-z0-9])' || pmt.target_id || "
+                       "'([^A-Za-z0-9]|$)'))")
+        return self._execute_safe(f"""
+            SELECT p.pmid, p.title,
+                   {date_expr}::text AS publication_date,
+                   p.journal, p.doi,
+                   COALESCE({title_match}, false) AS title_match,
                    COUNT(*) OVER () AS total_available,
                    (SELECT tc.state = 'truncated'
                       FROM target_coverage tc
@@ -2651,9 +3332,12 @@ class GraphQueries:
             FROM paper_mentions_target pmt
             JOIN papers p ON p.id = pmt.paper_id
             WHERE pmt.target_id = %(target)s
-            ORDER BY COALESCE(p.publication_date, '') DESC
+              AND ({date_expr} IS NULL OR {date_expr} <= %(cutoff)s)
+              {member}
+            ORDER BY COALESCE({title_match}, false) DESC,
+                     {date_expr} DESC NULLS LAST
             LIMIT %(limit)s
-        """, {"target": target, "limit": limit})
+        """, {"target": target, "limit": limit, "cutoff": self._kg_cutoff_date()})
 
     def list_indications(self) -> list[dict[str, Any]]:
         """List indications with their linked target count.

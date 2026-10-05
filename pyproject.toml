@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mosaic-mcp"
-version = "2.0.1"
+version = "2.1.0"
 description = "Pre-clinical drug discovery intelligence — 12 MCP tools for drug targets: profiles, compounds, patents, papers, structures, competitive landscape, pathways, validation, clinical pipeline, and synthetic-lethal whitespace"
 readme = "README.md"
 license = "Apache-2.0"
@@ -29,7 +29,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
-    "mcp[cli]>=1.0",
+    "mcp[cli]>=1.2,<2",
     "psycopg[binary]>=3.1",
     "pydantic>=2.5",
     "httpx>=0.27",
