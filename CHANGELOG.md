@@ -10,6 +10,11 @@
   2.1.0. `main` is restored: stdio by default, and `--transport sse` exits
   with `NotImplementedError` (remote transport is the hosted endpoint), as
   this README has always said. `python -m mosaic_mcp.server` works too.
+- DOCS: the README described a package that no longer exists — 44 tools (16
+  free, 28 Pro), watchlists, `mosaic_kg_stats`, 760+ targets. It now lists the
+  11 tools this package registers (5 free, 6 Pro), re-counts the hosted
+  knowledge graph (60 oncology targets, 2026-10-07), and describes
+  `MOSAIC_TIER` / `MOSAIC_API_KEY` as they behave in stdio mode.
 
 ## 2.1.0 — 2026-10-05
 

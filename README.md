@@ -2,24 +2,28 @@
 
 <!-- mcp-name: io.github.sourabhnk/mosaic-mcp -->
 
-Pre-clinical drug discovery intelligence as an MCP server. Query 760+ drug targets, 70K+ compounds, 48K+ papers, 18K+ clinical trials, and 16K+ patents through 44 specialized tools — 16 free for discovery, 28 Pro for competitive landscapes, whitespace, and thesis-grade analysis.
+Pre-clinical drug-target intelligence as an MCP server: target profiles,
+compounds, literature, structure, clinical pipeline, validation precedent and
+whitespace analysis — 11 tools, 5 free and 6 Pro. Every count carries a
+coverage state, so "we did not look" never renders as zero.
 
 ## Which one do you want?
 
 **This package is bring-your-own-database.** It is the MCP tool layer only —
 it ships the queries, not the data. You point it at a PostgreSQL instance you
-control and it serves 44 tools over it. There is no public read-only
-credential for Mosaic's knowledge graph, and earlier versions of these docs
-implied otherwise.
+control, with the Mosaic schema, and it serves the tools over it. There is no
+public read-only credential for Mosaic's knowledge graph.
 
-**If you want Mosaic's actual curated KG** — 760+ targets, 70K+ compounds,
-48K+ papers, 18K+ trials, 16K+ patents, kept current by a monthly refresh —
-use the **hosted server** instead. It needs no database and no local install:
+**If you want Mosaic's curated knowledge graph** — 60 oncology targets,
+~128K compounds linked to them, 57,896 papers and 9,062 clinical trials
+(counted 2026-10-07), refreshed monthly — use the **hosted server**.
+It needs no database and no local install:
 
-- Remote MCP: `https://mcp.getmosaic.dev/sse`
-- Sign in / API keys: <https://getmosaic.dev>
+- Claude.ai connector (OAuth, Streamable HTTP): `https://mcp.getmosaic.dev/mcp`
+- Remote MCP with an API key (SSE): `https://mcp.getmosaic.dev/sse`
+- Sign in, API keys and on-demand dossiers for any human gene: <https://getmosaic.dev>
 
-## Quick Start (self-hosted)
+## Quick start (self-hosted)
 
 ```bash
 pip install mosaic-mcp
@@ -52,115 +56,55 @@ claude mcp add mosaic -- mosaic-mcp
 
 ```bash
 export DATABASE_URL="postgresql://..."   # your own Postgres
-export MOSAIC_API_KEY="msk_..."          # Optional — for Pro tools
 mosaic-mcp                               # stdio transport
 ```
 
-This package is **stdio-only**. `--transport sse` exits with
-`NotImplementedError`; remote transport is served by the hosted endpoint
-above, not by this package. The flag was previously documented as working.
+`uvx mosaic-mcp` and `python -m mosaic_mcp.server` work too. This package is
+**stdio-only**: `--transport sse` exits with `NotImplementedError`, because
+remote transport is the hosted server above.
 
 ## Tools
 
-### Free Tier (16 tools) — discovery + workspace
+### Free (5)
 
-| Tool | Description |
-|------|-------------|
-| `mosaic_search_targets` | Search drug targets by name, gene symbol, or keyword |
-| `mosaic_get_target_profile` | Comprehensive target dossier (biology, compounds, scores) |
-| `mosaic_get_target_compounds` | Compounds tested against a target with SAR data |
-| `mosaic_get_target_patents` | Patent landscape for a target |
-| `mosaic_get_target_papers` | Literature for a target |
-| `mosaic_get_target_structure` | 3D structure and ligandability summary for a target |
-| `mosaic_kg_stats` | Knowledge graph overview statistics |
-| `mosaic_list_indications` | Available disease indications |
-| `mosaic_list_subindications` | Sub-indications within an indication area |
-| `mosaic_subindication_breakdown` | Per-target activity across sub-indications |
-| `mosaic_target_scores` | Target attractiveness scoring |
-| `mosaic_target_wishlist_add` | Add a target to your personal wishlist |
-| `mosaic_watchlist_create` | Create a watchlist |
-| `mosaic_watchlist_add_item` | Add an item to a watchlist |
-| `mosaic_watchlist_get` | Retrieve a watchlist |
-| `mosaic_watchlist_list` | List your watchlists |
+| Tool | What it returns |
+|------|-----------------|
+| `mosaic_get_target_profile` | The target dossier: biology, approved and clinical drugs, disease associations ranked by Open Targets, validation evidence, organisations, scores — each axis with its coverage state |
+| `mosaic_get_target_compounds` | Compounds with measured activity on the target; `sort` by potency (default) or by max clinical phase |
+| `mosaic_get_target_papers` | Papers about the target, matched by NCBI Gene ID (PubTator3) where your database has the annotations, up to the declared corpus cutoff |
+| `mosaic_get_target_structure` | AlphaFold structural snapshot and pockets, with a caution when a pocket is lined by low-confidence residues |
+| `mosaic_get_coverage_grid` | A coverage grid for any human gene symbol: identity (HGNC) and structure (AlphaFold DB) resolve live; the other axes are marked `queued` |
 
-### Pro Tier (28 additional tools) — analysis + whitespace
+Free calls return up to 10 compounds or papers; Pro up to 50.
 
-The committed-verdict layer. Includes the whitespace and differentiation tools:
-`mosaic_synthetic_lethal_whitespace`, `mosaic_modality_gaps`,
-`mosaic_resistance_bypass_map`, `mosaic_find_undruggable_targets`,
-`mosaic_talent_migration`, `mosaic_emerging_signals`, and
-`mosaic_assess_druggability`.
+### Pro (6)
 
-Plus the full analysis set: competitive landscape, pathway context, compound
-selectivity, indication landscape, target validation, clinical pipeline,
-compound analogs, target comparison, similar-target search, opportunity
-finding, organization portfolio, target network, mechanism of action, evidence
-maps, relation search, polypharmacology, clinical trial results, FDA regulatory
-status, drug comparison, drug repurposing candidates, and KOL discovery.
+| Tool | What it returns |
+|------|-----------------|
+| `mosaic_clinical_pipeline` | Clinical trials for compounds acting on the target (a ChEMBL mechanism link or pChEMBL ≥ 6) |
+| `mosaic_target_validation` | Assay precedent: what has been tried, in what model system |
+| `mosaic_pathway_context` | The pathways the target sits in |
+| `mosaic_target_network` | The target's 1-hop neighbourhood: compounds, diseases, pathways, organisations, interacting proteins |
+| `mosaic_synthetic_lethal_whitespace` | Partners functionally coupled to the target with little drug activity — assessed candidates and unassessed partners kept apart |
+| `mosaic_resistance_bypass_map` | Candidate resistance-bypass and escape targets |
 
-## Data Coverage
-
-| Entity | Count |
-|--------|-------|
-| Drug Targets | 764 (oncology + neuroscience + cardiovascular) |
-| Compounds | 71,512 |
-| Clinical Trials | 18,580 |
-| Papers | 48,773 |
-| Patents | 16,189 |
-| Semantic Relations | 13,704 |
-| Indications | 24,949 |
-| Organizations | 36,691 |
-
-<sub>Counts as of 2026-07-18. The live figures are always
-`mosaic_kg_stats`; run it rather than trusting this table. Targets went 802 →
-764 when duplicate and malformed rows were merged, and organizations
-153,852 → 36,691 when affiliation parsing was corrected — both are the count
-getting more honest, not the corpus shrinking.</sub>
+`mosaic_request_dossier` and `mosaic_get_dossier` (on-demand dossiers) run only
+on the hosted server; they need its fetch and synthesis pipeline.
 
 ## Configuration
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `DATABASE_URL` | Yes | PostgreSQL connection string — your own instance |
-| `MOSAIC_API_KEY` | No | API key for Pro tool access |
-| `MOSAIC_TIER` | No | Override tier (`free`, `pro`, `enterprise`) |
+| `DATABASE_URL` | Yes | PostgreSQL connection string for your own instance; the path must name the database that holds the Mosaic schema. |
+| `MOSAIC_TIER` | No | `pro` (or `enterprise`) enables the Pro tools in a self-hosted install. |
+| `MOSAIC_API_KEY` | No | In stdio mode any value is treated as Pro; it is not checked locally. Keys are validated by the hosted server. |
 
 ## Changelog
 
-Full history in [CHANGELOG.md](CHANGELOG.md). Latest: **1.6.0** — adds
-`mosaic_start_here`, a free, ungated orientation tool that maps all 44 tools and
-states plainly that this package is bring-your-own-database. Selected older
-entries below.
-
-### 1.2.0 — breaking change to the watchlist tools
-
-**`owner_key` must now be `anon:<token>`.** It was previously free text
-documented as "user id, email, or `anon:<token>`", which meant one caller
-could name another and read their lists. A bare id or email is now refused.
-
-Generate a random token, keep it, and pass the same one every time — it is
-what proves a list is yours. Calls that pass an email or bare id now fail
-with a message telling you this; they do not silently return someone else's
-data, which is what the old behaviour risked.
-
-Also in 1.2.0:
-
-- Watchlist reads are owner-scoped **in the SQL**, so a watchlist UUID is no
-  longer sufficient for read or write access, and they are excluded from the
-  response cache (a cache hit would otherwise return before the ownership
-  check ran).
-- `mosaic_synthetic_lethal_whitespace` now returns `candidates` and
-  `coupled_unassessed` as two separate lists. Partners outside the curated
-  universe carry null counts instead of zeros — an unmeasured competitor
-  count previously read as "no competition."
-- Project metadata now points at `getmosaic.dev`. 1.1.0 and earlier pointed
-  at a domain that is not ours.
-- Query/response layer resynced to the hosted server. This includes the
-  protein-protein-interaction reader fix: 1.1.0 counted PPIs from the legacy
-  `target_interactions` table, while the hosted server had already moved to
-  the populated `target_interactions_ext` table. Driven against hosted on
-  2026-07-19, EGFR reports 50 interactions at confidence 0.999; the 1.1.0
-  reader does not read that table for the profile count.
+Full history in [CHANGELOG.md](CHANGELOG.md). Latest: **2.1.1** — the
+`mosaic-mcp` command starts again (it had failed with `ImportError` since
+1.7.0). **2.1.0** capped `mcp` below 2, without which a fresh install died on
+import, and carried the fixes from a live audit of the hosted server.
 
 ## License
 

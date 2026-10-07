@@ -1,7 +1,7 @@
 """
 Mosaic Pre-Clinical Intelligence MCP Server.
 
-Exposes the pharma knowledge graph through 44 MCP tools for use with
+Exposes the pharma knowledge graph through 11 MCP tools for use with
 Claude Desktop, Claude Code, or any MCP-compatible client.
 """
 
