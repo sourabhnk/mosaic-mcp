@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.1.1 — 2026-10-07
+
+- FIXED: the `mosaic-mcp` command did not start. `[project.scripts]` points at
+  `mosaic_mcp.server:main`, but that function was cut from `server.py` on
+  2026-08-07, so the documented launch (`"command": "mosaic-mcp"` in Claude
+  Desktop, `claude mcp add mosaic -- mosaic-mcp`, `uvx mosaic-mcp`) failed with
+  `ImportError: cannot import name 'main'` in every release from 1.7.0 to
+  2.1.0. `main` is restored: stdio by default, and `--transport sse` exits
+  with `NotImplementedError` (remote transport is the hosted endpoint), as
+  this README has always said. `python -m mosaic_mcp.server` works too.
+
 ## 2.1.0 — 2026-10-05
 
 The fixes from a live audit of the hosted server (2026-10-03), carried into

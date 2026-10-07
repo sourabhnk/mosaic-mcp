@@ -1504,3 +1504,32 @@ def mosaic_target_network(params: GeneSymbolInput) -> str:
     symbol = params.gene_symbol.strip().upper()
     result = gq.get_target_network(symbol)
     return _json_result(result)
+
+
+def main() -> None:
+    """Run the server over stdio. This is the `mosaic-mcp` console script.
+
+    The package is stdio-only: remote transport is the hosted endpoint
+    (https://mcp.getmosaic.dev/sse), not this package.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="mosaic-mcp",
+        description="Mosaic pre-clinical intelligence MCP server (stdio).",
+    )
+    parser.add_argument(
+        "--transport", choices=["stdio", "sse"], default="stdio",
+        help="stdio only; remote transport is the hosted endpoint",
+    )
+    args = parser.parse_args()
+    if args.transport != "stdio":
+        raise NotImplementedError(
+            "mosaic-mcp is stdio-only. Remote transport is served by the hosted "
+            "endpoint at https://mcp.getmosaic.dev/sse, not by this package."
+        )
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
