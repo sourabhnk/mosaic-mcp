@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.1.3 — 2026-10-14
+
+- FIXED: four tools answered a gene outside the knowledge graph with a bare
+  zero. `mosaic_get_target_compounds` and `mosaic_get_target_papers` returned
+  `"total": 0`, `mosaic_clinical_pipeline` said "0 compound-indication pairs
+  in clinical development", and `mosaic_target_network` said "not found" for
+  a gene the graph holds but has archived. Each now says which case applies,
+  in `_meta`: the gene is archived (outside the current dossier scope),
+  partner-tier (held only as a neighbour of covered targets), or not in the
+  graph at all. The other tools already did this.
+- CHANGED: in those payloads `total` (and the pipeline's `total_entries`) is
+  `null` rather than `0`, because there is no population behind the empty
+  list to count. `returned` is still `0`. **If you read `total` as an
+  integer, handle `null`.** A covered target with no rows is unchanged.
+- The lookup runs only when a result is empty, so a covered target with data
+  costs no extra query.
+
 ## 2.1.2 — 2026-10-14
 
 - FIXED: `mosaic_get_coverage_grid` crashed on a clean install with

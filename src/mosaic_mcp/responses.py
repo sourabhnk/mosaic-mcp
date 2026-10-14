@@ -121,6 +121,77 @@ def empty_scope_note(
     return note
 
 
+def uncovered_target_note(
+    resolution: Any,
+    what: str,
+    *,
+    as_of: str | None = None,
+) -> dict[str, Any] | None:
+    """The coverage statement for a symbol that is not a dossier target — S15b.
+
+    ``resolution`` is a ``TargetResolution`` from ``src.db.queries``, read by
+    attribute so this module keeps no database import. The status strings
+    below are that module's ``RESOLUTION_*`` values (a unit test pins them).
+
+    Returns None for a dossier target. An empty result THERE is a question for
+    the coverage model (``target_coverage``), not this function, so the
+    caller's payload is left exactly as it was.
+
+    Callers resolve only after an EMPTY result, so a covered target with rows
+    never pays for the lookup. Every sentence is about what Mosaic holds,
+    never about what the gene has: "archived", "partner" and "unknown" are
+    three different reasons for the same empty list, and a reader needs to
+    know which one applied before reading the zero.
+    """
+    status = getattr(resolution, "status", None)
+    if status == "dossier":
+        return None
+    query = resolution.query
+    canonical = resolution.symbol or query
+    named = f"'{query}' ({canonical})" if canonical != query else f"'{query}'"
+    as_of_clause = f", as of {as_of}" if as_of else ""
+    if status == "archived":
+        description = (
+            f"{named} is in the Mosaic KG but OUTSIDE the current dossier "
+            f"scope{as_of_clause}, so no {what} are served for it. This is a "
+            f"scope decision, not a measurement, and not a claim that "
+            f"{canonical} has no {what}."
+        )
+        cta = (f"{canonical} can be restored to the covered set — request it "
+               f"at {REQUEST_URL}.")
+    elif status == "partner":
+        description = (
+            f"{named} is a PARTNER-tier gene in the Mosaic KG{as_of_clause}: "
+            f"held only as a named neighbour of covered targets, with identity "
+            f"and activity counts, so no {what} are served for it. This is a "
+            f"coverage statement, not a claim that {canonical} has no {what}."
+        )
+        cta = f"Request {canonical} as a covered target at {REQUEST_URL}."
+    else:
+        # Unknown — or a status this module does not recognise, which gets
+        # the weakest sentence rather than a guess.
+        archive_clause = (
+            "" if getattr(resolution, "archive_checked", False)
+            else " This deployment cannot distinguish 'archived' from 'never "
+                 "ingested' — it carries no archive schema."
+        )
+        description = (
+            f"{named} is not in the current Mosaic KG (curated dossier target "
+            f"set{as_of_clause}). This is a coverage statement, not a claim "
+            f"that the gene does not exist or has no {what}.{archive_clause}"
+        )
+        cta = (f"Request coverage for {query} at {REQUEST_URL} — requests set "
+               f"the order of expansion.")
+    return {
+        "status": "not_covered",
+        "resolution_status": status,
+        "resolved_target": canonical if status in ("archived", "partner") else None,
+        "archive_checked": bool(getattr(resolution, "archive_checked", False)),
+        "description": description,
+        "wishlist_cta": cta,
+    }
+
+
 # What each coverage state licenses a reader to conclude. Board S16 phase 3
 # defines the states; this is the only place they are put into words for a
 # caller, so the wording is deliberately about EVIDENCE, never about biology.
@@ -1084,7 +1155,10 @@ _CTGOV_PHASE_LABEL = {
 }
 
 
-def format_clinical_pipeline(data: dict[str, Any]) -> dict[str, Any]:
+def format_clinical_pipeline(
+    data: dict[str, Any],
+    not_covered: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Wrap get_clinical_pipeline() output.
 
     ⚠️ FIXED 2026-08-07 (reset plan v3, A3). This read
@@ -1158,6 +1232,16 @@ def format_clinical_pipeline(data: dict[str, Any]) -> dict[str, Any]:
             f"{CLINICAL_PIPELINE_ROSTER_CAP}', not as the total. It cannot "
             "support a claim about what is ABSENT from the pipeline."
         )
+    if not_covered:
+        # S15b. The interpretation above would read "0 compound-indication
+        # pairs in clinical development" for a gene Mosaic does not cover —
+        # a zero standing in for "never looked". The caller passes the
+        # resolver's statement, and it replaces that sentence here, because
+        # this formatter re-renders `_meta` and drops anything the query
+        # layer said about coverage. `returned` stays: it counts this
+        # payload. `total_entries` does not: there is no population to count.
+        payload["_meta"] = {"tool": "mosaic_clinical_pipeline", **not_covered}
+        payload["total_entries"] = None
     return payload
 
 

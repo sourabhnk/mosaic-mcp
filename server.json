@@ -7,13 +7,13 @@
     "url": "https://github.com/sourabhnk/mosaic-mcp",
     "source": "github"
   },
-  "version": "2.1.2",
+  "version": "2.1.3",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "mosaic-mcp",
-      "version": "2.1.2",
+      "version": "2.1.3",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

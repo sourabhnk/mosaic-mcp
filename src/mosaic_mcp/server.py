@@ -51,6 +51,7 @@ from mosaic_mcp.responses import (
     format_druggability,
     format_undruggable_targets,
     empty_scope_note,
+    uncovered_target_note,
     WELL_KNOWN_TARGETS,
 )
 
@@ -149,6 +150,23 @@ def _enforce_limit(tool_name: str, requested: int) -> int:
         return requested
     max_allowed = limits.get(tier, limits.get(Tier.FREE, requested))
     return min(requested, max_allowed)
+
+
+def _with_coverage_statement(payload: dict, tool: str, resolution: Any,
+                             what: str) -> dict:
+    """Put the resolver's coverage statement on an EMPTY paged payload -- S15b.
+
+    Before this, an uncovered gene got `{"compounds": [], "total": 0}` with
+    nothing beside it: a zero that meant "never looked" in the shape of a
+    measurement. Every shape key stays; `returned` keeps counting this
+    payload, and `total` becomes null because there is no population behind
+    it to count. A dossier target is returned unchanged -- its empty result
+    is the coverage model's to explain.
+    """
+    note = uncovered_target_note(resolution, what, as_of=_provenance_as_of())
+    if not note:
+        return payload
+    return {"_meta": {"tool": tool, **note}, **payload, "total": None}
 
 
 def _paged(rows: list[dict], key: str, requested: int | None = None,
@@ -998,12 +1016,17 @@ def mosaic_get_target_compounds(params: TargetCompoundsInput) -> str:
     # is ShareAlike -- the notice travels with every payload that carries the
     # rows, because a licence recorded only in a doc nobody fetches is the
     # AlphaMissense label again.
-    return _json_result(_paged(
+    payload = _paged(
         compounds, "compounds", requested=params.limit, applied=limit,
         target=symbol, sort=params.sort,
         upstream_licence="ChEMBL data: CC BY-SA 3.0 -- adapted material must "
                          "carry the same or a compatible licence",
-    ))
+    )
+    if not compounds:
+        payload = _with_coverage_statement(
+            payload, "mosaic_get_target_compounds",
+            gq.resolve_target_status(symbol), "compounds")
+    return _json_result(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1132,11 +1155,16 @@ def mosaic_get_target_papers(params: GeneSymbolWithLimit) -> str:
     symbol = params.gene_symbol.strip().upper()
     limit = _enforce_limit("mosaic_get_target_papers", params.limit)
     papers = gq.get_target_papers(symbol, limit)
-    return _json_result(_paged(
+    payload = _paged(
         papers, "papers", requested=params.limit, applied=limit, target=symbol,
         membership_basis=gq.paper_membership_basis(),
         kg_cutoff=gq._kg_cutoff_date().isoformat(),
-    ))
+    )
+    if not papers:
+        payload = _with_coverage_statement(
+            payload, "mosaic_get_target_papers",
+            gq.resolve_target_status(symbol), "papers")
+    return _json_result(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1293,7 +1321,13 @@ def mosaic_clinical_pipeline(params: GeneSymbolInput) -> str:
     gq = _gq()
     symbol = params.gene_symbol.strip().upper()
     result = gq.get_clinical_pipeline(symbol)
-    return _json_result(format_clinical_pipeline(result))
+    not_covered = None
+    if not result.get("pipeline"):
+        # S15b: resolve only on an empty roster; the formatter renders it.
+        not_covered = uncovered_target_note(
+            gq.resolve_target_status(symbol), "clinical-pipeline entries",
+            as_of=_provenance_as_of())
+    return _json_result(format_clinical_pipeline(result, not_covered=not_covered))
 
 
 # ---------------------------------------------------------------------------
@@ -1503,6 +1537,18 @@ def mosaic_target_network(params: GeneSymbolInput) -> str:
     gq = _gq()
     symbol = params.gene_symbol.strip().upper()
     result = gq.get_target_network(symbol)
+    if "error" in result:
+        # S15b: this read "Target 'TTN' not found" for a gene the KG holds
+        # (archived), and for every partner-tier gene. Say which it is.
+        note = uncovered_target_note(
+            gq.resolve_target_status(symbol), "network neighbours",
+            as_of=_provenance_as_of())
+        if note:
+            result = {
+                "_meta": {"tool": "mosaic_target_network", **note},
+                "center": symbol, "nodes": [], "edges": [],
+                "node_count": 0, "edge_count": 0, "node_types": {},
+            }
     return _json_result(result)
 
 
