@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.2 — 2026-10-14
+
+- FIXED: `mosaic_get_coverage_grid` crashed on a clean install with
+  `ModuleNotFoundError: No module named 'requests'`. The grid resolves
+  identity (HGNC) and structure (AlphaFold DB) live with `requests`, which was
+  never a declared dependency, so it worked only where something else had
+  installed it. `requests>=2.31` is now declared. The grid is one of the five
+  free tools.
+
 ## 2.1.1 — 2026-10-07
 
 - FIXED: the `mosaic-mcp` command did not start. `[project.scripts]` points at
