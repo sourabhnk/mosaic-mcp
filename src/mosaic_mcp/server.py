@@ -1095,9 +1095,16 @@ def mosaic_get_coverage_grid(params: GeneSymbolInput) -> str:
             else:
                 r.raise_for_status()
                 entries = r.json()
+                e0 = entries[0] if entries else {}
+                ver = e0.get("latestVersion")
+                # The count is AlphaFold DB models held for the accession, not
+                # structures in general: say so, and say where it came from.
                 structure = {"count": len(entries), "state": "fetched_on_demand",
-                             "mean_plddt": (entries[0].get("globalMetricValue")
-                                            if entries else None)}
+                             "unit": "AlphaFold DB models for this UniProt accession",
+                             "source": " ".join(filter(None, (
+                                 "AlphaFold DB", e0.get("entryId"),
+                                 f"v{ver}" if ver else None))) + ", fetched live",
+                             "mean_plddt": e0.get("globalMetricValue")}
         except Exception as e:  # noqa: BLE001
             structure = {"count": None, "state": "fetch_failed",
                          "error": f"{type(e).__name__}: {e}"[:160]}
