@@ -755,6 +755,35 @@ class GraphQueries:
             )
         return None
 
+    def get_translational_axes(self, symbol: str) -> dict[str, Any] | None:
+        """Stage 2 (plan v3 §C1/C2): the stored species-gap and tool-compound
+        liability rows for a curated target, keyed {"species_gap": row|None,
+        "tool_compound_liabilities": row|None}.
+
+        None when this database has neither table (a BYO or older database):
+        that is a deployment shape, and the caller renders no block at all. A
+        present table with no row for the target returns None for that key;
+        the caller states it as not yet measured, never as zero.
+        """
+        probe = self._execute_safe(
+            "SELECT to_regclass('target_species_gap') IS NOT NULL AS sg, "
+            "to_regclass('target_tool_compound_liabilities') IS NOT NULL AS tl")
+        if not probe or not (probe[0]["sg"] or probe[0]["tl"]):
+            return None
+        out: dict[str, Any] = {"species_gap": None, "tool_compound_liabilities": None}
+        if probe[0]["sg"]:
+            rows = self._execute_safe("""
+                SELECT g.* FROM target_species_gap g JOIN targets t ON t.id = g.target_id
+                WHERE upper(t.symbol) = %(s)s""", {"s": symbol.strip().upper()})
+            out["species_gap"] = rows[0] if rows else None
+        if probe[0]["tl"]:
+            rows = self._execute_safe("""
+                SELECT l.* FROM target_tool_compound_liabilities l
+                JOIN targets t ON t.id = l.target_id
+                WHERE upper(t.symbol) = %(s)s""", {"s": symbol.strip().upper()})
+            out["tool_compound_liabilities"] = rows[0] if rows else None
+        return out
+
     def resolve_target_status(self, symbol: str) -> TargetResolution:
         """Resolve a symbol to one of four states — reset plan v3, A5.
 
@@ -5216,7 +5245,10 @@ class GraphQueries:
                      WHERE target_id = byp.b) AS patents_b,
                    (SELECT COUNT(*) FROM compound_targets WHERE target_id = byp.b)
                      AS compounds_b,
-                   (SELECT COALESCE(MAX(c.max_phase),0) FROM compound_targets ct
+                   -- No COALESCE (Stage 1.5): a target whose compounds carry
+                   -- no phase, or that has none, has an UNKNOWN highest phase,
+                   -- not phase 0 — the whitespace tool refused this default.
+                   (SELECT MAX(c.max_phase) FROM compound_targets ct
                      JOIN compounds c ON c.id = ct.compound_id
                      WHERE ct.target_id = byp.b) AS max_phase_b
             FROM byp
@@ -5257,8 +5289,10 @@ class GraphQueries:
                     "patent_count": patents_b if r.get("b_in_mosaic") else None,
                     "compound_count": (int(r["compounds_b"] or 0)
                                        if r.get("b_in_mosaic") else None),
-                    "max_clinical_phase": (int(r["max_phase_b"] or 0)
-                                           if r.get("b_in_mosaic") else None),
+                    "max_clinical_phase": (int(r["max_phase_b"])
+                                           if r.get("b_in_mosaic")
+                                           and r["max_phase_b"] is not None
+                                           else None),
                 },
                 "evidence_source": "resistance_relations",
                 "resistance_evidence_papers": papers,
@@ -5314,8 +5348,14 @@ class GraphQueries:
                         "out_of_coverage": bool(not r.get("partner_in_mosaic")),  # gap-fix 8
                         "not_assessed_reason": (
                             None if r.get("partner_in_mosaic") else OUT_OF_COVERAGE_REASON),
-                        "patent_count": patents_b,
-                        "compound_count": int(r["compounds_b"] or 0),
+                        # Stage 1.5: None, not 0, outside the curated
+                        # universe — both counts read tables keyed on
+                        # `targets`, so for these genes 0 was structural.
+                        # The literature branch above already did this.
+                        "patent_count": (patents_b if r.get("partner_in_mosaic")
+                                         else None),
+                        "compound_count": (int(r["compounds_b"] or 0)
+                                           if r.get("partner_in_mosaic") else None),
                     },
                     "evidence_source": "string_ppi",
                     "resistance_evidence_papers": 0,
@@ -5455,173 +5495,6 @@ class GraphQueries:
                 + (" + STRING PPI extended partners"
                    if has_ppi_ext and has_ppi_ext[0].get("t") else "")
             ),
-        }
-
-    def find_talent_migration(
-        self,
-        target: str,
-        lookback_years: int = 5,
-    ) -> dict[str, Any]:
-        """Researchers active on a target, recency-weighted, plus the
-        *other* targets they work on — a talent-flow signal (Move 2
-        Task 2.4.R.4).
-
-        Author identity uses the pre-resolved `persons` table (ORCID +
-        name); ~80% recall is accepted per the corrections doc — full
-        disambiguation is out of scope. Now reads both paper authorship
-        AND patent inventorship (patent_inventors backfilled 2026-05-26).
-        """
-        t = self._resolve_target(target)
-        import datetime
-        cur_year = datetime.date.today().year
-        min_year = cur_year - max(1, lookback_years)
-
-        people = self._execute_safe(
-            """
-            WITH tp AS (
-                SELECT pmt.paper_id,
-                       substring(p.publication_date, 1, 4)::int AS yr
-                FROM paper_mentions_target pmt
-                JOIN papers p ON p.id = pmt.paper_id
-                WHERE pmt.target_id = %(t)s
-                  AND p.publication_date ~ '^[0-9]{4}'
-                  AND substring(p.publication_date, 1, 4)::int >= %(minyr)s
-            ),
-            paper_signal AS (
-                SELECT pa.person_id,
-                       COUNT(DISTINCT tp.paper_id) AS n_papers,
-                       MAX(tp.yr) AS last_paper_yr,
-                       MIN(tp.yr) AS first_paper_yr,
-                       SUM(tp.yr - %(minyr)s + 1) AS paper_weight
-                FROM tp
-                JOIN paper_authors pa ON pa.paper_id = tp.paper_id
-                GROUP BY pa.person_id
-            ),
-            tpat AS (
-                -- Patents where this target is mentioned, with a year.
-                SELECT pmt.patent_id,
-                       substring(pt.filing_date, 1, 4)::int AS yr
-                FROM patent_mentions_target pmt
-                JOIN patents pt ON pt.id = pmt.patent_id
-                WHERE pmt.target_id = %(t)s
-                  AND pt.filing_date ~ '^[0-9]{4}'
-                  AND substring(pt.filing_date, 1, 4)::int >= %(minyr)s
-            ),
-            patent_signal AS (
-                SELECT pinv.person_id,
-                       COUNT(DISTINCT tpat.patent_id) AS n_patents,
-                       MAX(tpat.yr) AS last_patent_yr,
-                       MIN(tpat.yr) AS first_patent_yr,
-                       SUM(tpat.yr - %(minyr)s + 1) AS patent_weight
-                FROM tpat
-                JOIN patent_inventors pinv ON pinv.patent_id = tpat.patent_id
-                GROUP BY pinv.person_id
-            )
-            SELECT
-              COALESCE(ps.person_id, pat.person_id) AS person_id,
-              COALESCE(ps.n_papers, 0)              AS n_papers,
-              COALESCE(pat.n_patents, 0)            AS n_patents,
-              -- Combined first/last year across both signals.
-              LEAST(ps.first_paper_yr, pat.first_patent_yr) AS first_year,
-              GREATEST(ps.last_paper_yr, pat.last_patent_yr) AS last_year,
-              -- Recency weight: equal weight to papers + patents so a person
-              -- active in both surfaces above someone in only one.
-              COALESCE(ps.paper_weight, 0)
-                + COALESCE(pat.patent_weight, 0)    AS recency_weight
-            FROM paper_signal ps
-            FULL OUTER JOIN patent_signal pat ON pat.person_id = ps.person_id
-            ORDER BY recency_weight DESC, n_papers + n_patents DESC
-            LIMIT 25
-            """,
-            {"t": t, "minyr": min_year},
-        )
-        if not people:
-            return {"target": t, "lookback_years": lookback_years,
-                    "researchers": [], "total": 0}
-
-        ids = [p["person_id"] for p in people]
-        meta = {
-            r["id"]: r for r in self._execute_safe(
-                "SELECT id, name, orcid, affiliation FROM persons "
-                "WHERE id = ANY(%(ids)s)",
-                {"ids": ids},
-            )
-        }
-        # Each person's OTHER targets over time (the migration signal).
-        # Now combines paper-authorship signal AND patent-inventor signal,
-        # taking the most recent year across both.
-        others: dict[Any, list] = {}
-        for r in self._execute_safe(
-            """
-            WITH paper_others AS (
-                SELECT pa.person_id, pmt.target_id,
-                       MAX(substring(p.publication_date, 1, 4)::int) AS last_year,
-                       COUNT(DISTINCT pmt.paper_id) AS n_papers,
-                       0 AS n_patents
-                FROM paper_authors pa
-                JOIN paper_mentions_target pmt ON pmt.paper_id = pa.paper_id
-                JOIN papers p ON p.id = pmt.paper_id
-                WHERE pa.person_id = ANY(%(ids)s)
-                  AND pmt.target_id <> %(t)s
-                  AND p.publication_date ~ '^[0-9]{4}'
-                GROUP BY pa.person_id, pmt.target_id
-            ),
-            patent_others AS (
-                SELECT pinv.person_id, pmt.target_id,
-                       MAX(substring(pt.filing_date, 1, 4)::int) AS last_year,
-                       0 AS n_papers,
-                       COUNT(DISTINCT pmt.patent_id) AS n_patents
-                FROM patent_inventors pinv
-                JOIN patent_mentions_target pmt ON pmt.patent_id = pinv.patent_id
-                JOIN patents pt ON pt.id = pmt.patent_id
-                WHERE pinv.person_id = ANY(%(ids)s)
-                  AND pmt.target_id <> %(t)s
-                  AND pt.filing_date ~ '^[0-9]{4}'
-                GROUP BY pinv.person_id, pmt.target_id
-            ),
-            merged AS (
-                SELECT * FROM paper_others
-                UNION ALL
-                SELECT * FROM patent_others
-            )
-            SELECT person_id, target_id,
-                   MAX(last_year) AS last_year,
-                   SUM(n_papers)  AS n_papers,
-                   SUM(n_patents) AS n_patents
-            FROM merged
-            GROUP BY person_id, target_id
-            ORDER BY MAX(last_year) DESC
-            """,
-            {"ids": ids, "t": t},
-        ):
-            others.setdefault(r["person_id"], [])
-            if len(others[r["person_id"]]) < 8:
-                others[r["person_id"]].append({
-                    "target": r["target_id"],
-                    "last_year": r["last_year"],
-                    "papers": int(r.get("n_papers") or 0),
-                    "patents": int(r.get("n_patents") or 0),
-                })
-
-        researchers = []
-        for p in people:
-            m = meta.get(p["person_id"], {})
-            researchers.append({
-                "name": m.get("name"),
-                "orcid": m.get("orcid"),
-                "affiliation": m.get("affiliation"),
-                "papers_on_target": int(p["n_papers"] or 0),
-                "patents_on_target": int(p["n_patents"] or 0),
-                "first_year": p["first_year"],
-                "last_year": p["last_year"],
-                "recency_weight": p["recency_weight"],
-                "also_works_on": others.get(p["person_id"], []),
-            })
-        return {
-            "target": t,
-            "lookback_years": lookback_years,
-            "researchers": researchers,
-            "total": len(researchers),
         }
 
     def find_emerging_signals(

@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.2.0 — 2026-10-16
+
+- NEW, opt-in: set `ENABLE_V2_SPECIES_AND_ADMET=true` and `mosaic_get_target_profile`,
+  `mosaic_get_target_compounds` and `mosaic_get_coverage_grid` append two blocks,
+  `species_gap` and `tool_compound_liabilities`. They read tables created by the
+  monorepo migrations `2026_10_16a` / `2026_10_16b`; a database without them gets no
+  block at all. With the flag off (the default) every response is unchanged.
+- `species_gap` compares human and mouse potency LIKE FOR LIKE only: compounds
+  measured cell-free (single-protein format, no cellular assay) with the same
+  standard type in both species. ChEMBL's "binding" assay type is not cell-free, and
+  comparing mouse cell assays with human enzyme assays manufactures "species gaps"
+  of up to ~150x. Below 8 such compounds there is no verdict
+  (`insufficient_shared_compounds`); a matched-cellular shift is shown only as
+  secondary context.
+- `tool_compound_liabilities` counts PAINS/Brenk alerts, off-target promiscuity,
+  hERG and ADME-assay coverage over each target's 50 most potent compounds. The
+  counts are floors: an unflagged compound is unprofiled, not clean.
+- CHANGED: `mosaic_pathway_context` returns the 50 highest-confidence interactions
+  plus a summary of all of them (EGFR: 182 KB -> ~10 KB); `ppi_count` still counts
+  every interaction held.
+- CHANGED: the coverage grid's structure cell states its unit (AlphaFold DB models
+  for the UniProt accession) and its source.
+- FIXED: an unknown approval phase is no longer coalesced to 0, so an unphased
+  compound is not reported as preclinical.
+- Free-tier quota stays 50 calls a month; `ENFORCE_V2_QUOTA_10` (off) is the switch
+  for a future change.
+
 ## 2.1.3 — 2026-10-14
 
 - FIXED: four tools answered a gene outside the knowledge graph with a bare

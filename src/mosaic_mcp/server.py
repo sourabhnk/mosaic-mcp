@@ -50,12 +50,34 @@ from mosaic_mcp.responses import (
     format_structure_summary,
     format_druggability,
     format_undruggable_targets,
+    format_translational_blocks,
     empty_scope_note,
     uncovered_target_note,
     WELL_KNOWN_TARGETS,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Rollout flag (plan v3 §0.2 / Stage 2), off when unset. When on, the profile,
+# compounds and grid tools append `species_gap` and `tool_compound_liabilities`
+# blocks; when off their payloads are byte-identical to 2.1.3. A database
+# without the Stage 2 tables (any BYO database that has not run
+# 2026_10_16a/b) gets no block at all. Hand-ported from the hosted server.
+ENABLE_V2_SPECIES_AND_ADMET = os.getenv("ENABLE_V2_SPECIES_AND_ADMET", "").strip().lower()     in {"1", "true", "yes", "on"}
+
+
+def _translational_blocks(symbol: str, *, missing: str = "no_fetch_evidence") -> dict:
+    if not ENABLE_V2_SPECIES_AND_ADMET:
+        return {}
+    blocks = format_translational_blocks(_gq().get_translational_axes(symbol))
+    if missing == "queued":
+        for k, b in blocks.items():
+            if b.get("state") == "no_fetch_evidence":
+                blocks[k] = {"state": "queued",
+                             "note": "computed when a dossier is requested on the "
+                                     "hosted pipeline; not measured yet"}
+    return blocks
 
 # ---------------------------------------------------------------------------
 # Confidence thresholds for MCP output
@@ -983,7 +1005,8 @@ def mosaic_get_target_profile(params: GeneSymbolInput) -> str:
             ),
         })
 
-    return _json_result(format_target_dossier(profile))
+    return _json_result({**format_target_dossier(profile),
+                         **_translational_blocks(symbol)})
 
 
 # ---------------------------------------------------------------------------
@@ -1026,7 +1049,7 @@ def mosaic_get_target_compounds(params: TargetCompoundsInput) -> str:
         payload = _with_coverage_statement(
             payload, "mosaic_get_target_compounds",
             gq.resolve_target_status(symbol), "compounds")
-    return _json_result(payload)
+    return _json_result({**payload, **_translational_blocks(symbol)})
 
 
 # ---------------------------------------------------------------------------
@@ -1132,6 +1155,7 @@ def mosaic_get_coverage_grid(params: GeneSymbolInput) -> str:
                        "a dossier is requested; 'we have not fetched yet' "
                        "and 'there is none' never share a value.",
         "hosted": "https://getmosaic.dev - request a full dossier",
+        **_translational_blocks(rec["canonical"], missing="queued"),
     })
 
 

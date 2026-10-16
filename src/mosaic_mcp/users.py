@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import secrets
 import uuid as _uuid
 from datetime import datetime, timezone
@@ -43,9 +44,27 @@ class Tier(str, Enum):
 
 TIER_HIERARCHY = {Tier.FREE: 0, Tier.PRO: 1, Tier.ENTERPRISE: 2, Tier.ADMIN: 3}
 
-# Monthly query limits (tool calls)
+
+def free_monthly_query_limit(env: dict[str, str] | None = None) -> int:
+    """Free-tier monthly calls: 50, or 10 once ENFORCE_V2_QUOTA_10 is set.
+
+    Rollout flag (MOSAIC_OPUS_EXECUTION_PLAN-v3 §0.2, §B5). It is meant to
+    flip in the same release as the Stage 3 pricing copy, which still says
+    50 everywhere. Flipping it mid-month blocks any Free user already past
+    10 calls on their next call — there is no grandfathering here.
+
+    Read with os.getenv rather than a shared flags module: this file is
+    synced byte-for-byte into the pip package (scripts/sync_pip_package.py),
+    which has no `src.config`.
+    """
+    raw = (os.environ if env is None else env).get("ENFORCE_V2_QUOTA_10", "")
+    return 10 if raw.strip().lower() in {"1", "true", "yes", "on"} else 50
+
+
+# Monthly query limits (tool calls). Read once at import; Railway restarts
+# the container on any variable change.
 TIER_QUERY_LIMITS: dict[Tier, int | None] = {
-    Tier.FREE: 50,
+    Tier.FREE: free_monthly_query_limit(),
     Tier.PRO: 500,
     Tier.ENTERPRISE: None,  # unlimited
     Tier.ADMIN: None,
@@ -589,6 +608,28 @@ def webhook_mark_failed(event_id: str, error: str) -> None:
         "UPDATE webhook_events SET status='failed', error_message=%s WHERE event_id=%s",
         (error[:1000], event_id),
     )
+
+
+def webhook_reclaim_failed(event_id: str) -> bool:
+    """Take over a FAILED event for a retry; True if this caller now owns it.
+
+    Without this, a delivery that failed could never be processed again: the
+    row exists, so `webhook_record_received` reports a duplicate and the retry
+    is dropped as "in flight". The paid-dossier path answers 500 on a failure
+    precisely so Dodo retries, and that retry must be able to run. Race-safe:
+    only one concurrent retry flips 'failed' back to 'received'.
+    """
+    if not event_id:
+        return False
+    rows = _db().execute(
+        """
+        UPDATE webhook_events SET status='received', error_message=NULL
+        WHERE event_id = %s AND status = 'failed'
+        RETURNING event_id
+        """,
+        (event_id,),
+    )
+    return bool(rows)
 
 
 # ---------------------------------------------------------------------------

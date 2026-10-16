@@ -888,6 +888,32 @@ def format_competitive_landscape(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Stage 1.5 (operator ruling 2026-10-15): the interaction list is capped in the
+# RESPONSE, not in what we hold. EGFR's payload was ~197 KB — 1,527 STRING rows
+# a client model had to read whole. The top rows by confidence come back, the
+# rest are summarised (bands, sources), and the counts stay counts of holdings.
+PATHWAY_CONTEXT_PPI_RETURN = 50
+
+
+def _ppi_neighbour_summary(ppis: list[dict]) -> dict[str, Any]:
+    bands = {"900_plus": 0, "700_899": 0, "below_700": 0, "unscored": 0}
+    sources: dict[str, int] = {}
+    for p in ppis:
+        c = p.get("confidence")
+        key = ("unscored" if c is None else "900_plus" if c >= 900
+               else "700_899" if c >= 700 else "below_700")
+        bands[key] += 1
+        src = p.get("source_db") or "unknown"
+        sources[src] = sources.get(src, 0) + 1
+    # STRING scores every edge, so under the one source we hold `unscored` is
+    # 0 for every target — a constant that reads like a measurement (sweep,
+    # 2026-10-15). Stated only when some row has no score; the bands still
+    # sum to the interactions held.
+    if not bands["unscored"]:
+        del bands["unscored"]
+    return {"by_confidence": bands, "by_source": sources}
+
+
 def format_pathway_context(data: dict[str, Any]) -> dict[str, Any]:
     """Wrap get_pathway_context() output."""
     target = data.get("target", "?")
@@ -934,6 +960,10 @@ def format_pathway_context(data: dict[str, Any]) -> dict[str, Any]:
         reverse=True,
     )[:15]
 
+    # Highest STRING confidence first; unscored rows last, never ranked as 0.
+    shown = sorted(ppis, key=lambda p: (p.get("confidence") is None,
+                                        -(p.get("confidence") or 0)))[:PATHWAY_CONTEXT_PPI_RETURN]
+
     return {
         "_meta": {
             "tool": "mosaic_pathway_context",
@@ -946,7 +976,12 @@ def format_pathway_context(data: dict[str, Any]) -> dict[str, Any]:
         },
         "target": target,
         "pathways": pathways,
-        "protein_interactions": ppis,
+        "protein_interactions": shown,
+        "protein_interactions_note": (
+            f"Showing the {len(shown)} highest-confidence of {len(ppis)} interactions "
+            f"held; `protein_interaction_summary` covers all {len(ppis)}."
+            if len(shown) < len(ppis) else None),
+        "protein_interaction_summary": _ppi_neighbour_summary(ppis),
         "functionally_related_targets": functionally_related,
         "summary": {
             "pathway_count": len(pathways),
@@ -1840,3 +1875,142 @@ def _generate_insight(
         parts.append(f"Well-validated with {val_total} experimental papers in the literature")
 
     return ". ".join(parts[:3]) + "." if parts else f"Insufficient data to assess {symbol}."
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 translational blocks (plan v3 §C1/C2), appended by the profile,
+# compounds and grid tools ONLY when ENABLE_V2_SPECIES_AND_ADMET is on. Every
+# value travels with its state and the query behind it; a target with no row
+# reads `no_fetch_evidence`, never "no gap" or "no liabilities".
+# ---------------------------------------------------------------------------
+
+_NOT_YET = {"state": "no_fetch_evidence",
+            "note": "not yet measured for this target; read as unknown, never as none"}
+
+
+def _tnum(v: Any, digits: int = 3) -> float | None:
+    return None if v is None else round(float(v), digits)
+
+
+def _ts(v: Any) -> str | None:
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+def format_species_gap(row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return dict(_NOT_YET)
+    return {
+        "state": row.get("mouse_compounds_state"),
+        "mouse_ortholog": {
+            "symbol": row.get("mouse_ortholog_symbol"), "mgi_id": row.get("mgi_id"),
+            "uniprot_id": row.get("mouse_uniprot_id"),
+            "chembl_target_id": row.get("mouse_chembl_target_id"),
+            "tax_id": row.get("mouse_tax_id"), "source": row.get("ortholog_source"),
+        },
+        "sequence_identity": {
+            "full_length_pct": _tnum(row.get("full_length_identity_pct"), 2),
+            "binding_site_pct": _tnum(row.get("pocket_sequence_identity_pct"), 2),
+            "binding_site_residues": row.get("pocket_residue_count"),
+            "binding_site_definition": row.get("pocket_definition"),
+        },
+        "mouse_chemistry": {
+            "compounds": row.get("mouse_compounds_count"),
+            "activities": row.get("mouse_activities_count"),
+            "state": row.get("mouse_compounds_state"),
+            "declared_query": row.get("mouse_compounds_query"),
+            "fetched_at": _ts(row.get("mouse_compounds_fetched_at")),
+        },
+        "potency_comparison": {
+            "human_activities": row.get("human_activities_count"),
+            "shared_compounds": row.get("shared_human_mouse_compounds_count"),
+            "median_human_pchembl": _tnum(row.get("median_human_pchembl")),
+            "median_mouse_pchembl": _tnum(row.get("median_mouse_pchembl")),
+            "delta_pchembl": _tnum(row.get("delta_pchembl")),
+            "species_potency_shift_ratio": _tnum(row.get("species_potency_shift_ratio")),
+            "ratio_meaning": "median human nM / median mouse nM over the shared compounds "
+                             "(>1: human needs more drug)",
+            "has_species_potency_gap": row.get("has_species_potency_gap"),
+            "verdict": row.get("species_gap_verdict"),
+            # Gate 2 ruling: a shift supports a headline only over >= 8 shared
+            # compounds; fewer is reported with its n, not generalised from.
+            "headline_eligible": (row.get("shared_human_mouse_compounds_count") or 0) >= 8,
+            "basis": row.get("comparison_basis"),
+            "gap_rule": "|delta pChEMBL| >= 0.7 (a 5x concentration shift) over compounds "
+                        "measured cell-free with the same standard type, or no mouse "
+                        "chemistry under the declared query while human chemistry exists",
+        },
+        # Gate 2 validation (2026-10-16): only the like-for-like comparison
+        # above is a species comparison. These two are context, never a gap.
+        "mouse_cell_free_data": {
+            "compounds": row.get("mouse_cellfree_compounds_count"),
+            "state": row.get("mouse_cellfree_state"),
+            "note": "measured_zero means the mouse ChEMBL data for this target are only "
+                    "cellular or otherwise non-cell-free; no species comparison can be made",
+        },
+        "cellular_comparison_secondary": {
+            "shared_compounds": row.get("cellular_shared_compounds_count"),
+            "delta_pchembl": _tnum(row.get("cellular_delta_pchembl")),
+            "shift_ratio": _tnum(row.get("cellular_shift_ratio")),
+            "note": "secondary only: 'mouse' cell assays are often engineered murine lines "
+                    "(e.g. Ba/F3) expressing a transgene, so this is not a species comparison",
+        },
+        "all_format_audit": {
+            "shared_compounds": row.get("naive_shared_compounds_count"),
+            "delta_pchembl": _tnum(row.get("naive_delta_pchembl")),
+            "note": "NOT a species comparison: mixes cell-free and cellular formats and "
+                    "standard types; kept so the correction is auditable",
+        },
+        "reason": row.get("species_gap_reason"),
+        "most_divergent_shared_compounds": (row.get("shared_compounds") or [])[:10],
+        "computed_at": _ts(row.get("computed_at")),
+    }
+
+
+def format_tool_compound_liabilities(row: dict[str, Any] | None) -> dict[str, Any]:
+    if row is None:
+        return dict(_NOT_YET)
+    return {
+        "state": row.get("liabilities_state"),
+        "assessed_set": {
+            "compounds_assessed": row.get("compounds_assessed"),
+            "compounds_active_total": row.get("compounds_active_total"),
+            "declared_query": row.get("assessed_set_query"),
+        },
+        "structural_alerts": {
+            "pains_flagged_compounds": row.get("pains_flagged_compounds_count"),
+            "brenk_flagged_compounds": row.get("brenk_flagged_compounds_count"),
+            "source": "ChEMBL compound_structural_alert (PAINS set; Brenk = ChEMBL's "
+                      "'Dundee' set)",
+        },
+        "promiscuity": {
+            "promiscuous_compounds": row.get("promiscuous_compounds_count"),
+            "promiscuous_tool_compounds": row.get("promiscuous_tool_compounds_count"),
+            "median_off_target_count": _tnum(row.get("median_off_target_count"), 1),
+            "rule": "more than 5 human SINGLE PROTEIN targets besides this one hit at "
+                    "pChEMBL >= 6; 'tool' = not an approved drug (max_phase < 4)",
+            "floor": "counts what ChEMBL RECORDS: a compound not flagged was not shown to "
+                     "hit more than 5 targets, which is not the same as selective — many "
+                     "were never profiled beyond their own target. Off-targets include "
+                     "paralogues (a CA9 inhibitor hitting CA1/CA2 counts).",
+        },
+        "herg_tested_compounds": row.get("herg_tested_compounds_count"),
+        "admet_assay_coverage": {
+            "activities": row.get("admet_activities_count"),
+            "state": row.get("admet_state"),
+            "declared_query": row.get("admet_declared_query"),
+            "fetched_at": _ts(row.get("admet_fetched_at")),
+        },
+        "highest_liability_compounds": (row.get("top_liabilities") or [])[:10],
+        "error": row.get("error"),
+        "computed_at": _ts(row.get("computed_at")),
+    }
+
+
+def format_translational_blocks(axes: dict[str, Any] | None) -> dict[str, Any]:
+    """{} when the database has neither table (no block at all); otherwise
+    both blocks, each with its own state."""
+    if axes is None:
+        return {}
+    return {"species_gap": format_species_gap(axes.get("species_gap")),
+            "tool_compound_liabilities": format_tool_compound_liabilities(
+                axes.get("tool_compound_liabilities"))}
