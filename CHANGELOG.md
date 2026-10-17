@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.2.1 — 2026-10-17
+
+- NEW (flag on): every compound listed in the `species_gap` and
+  `tool_compound_liabilities` blocks carries `pref_name`, the knowledge graph's name for
+  that ChEMBL ID. It is null when the graph holds none; a name equal to the ID, or a PDB
+  ligand code such as "0UN", counts as none. Each block says so in `compound_names`. A
+  connected model then has no reason to name a compound from memory. A dossier renderer
+  given only IDs labelled CHEMBL554 as gefitinib; it is lapatinib.
+- With a database whose liability rows list every assessed compound (monorepo
+  `backfill_tool_liabilities --resummarise`), `highest_liability_compounds` is still the
+  first 10. With the flag off (the default) every response is unchanged.
+
 ## 2.2.0 — 2026-10-16
 
 - NEW, opt-in: set `ENABLE_V2_SPECIES_AND_ADMET=true` and `mosaic_get_target_profile`,

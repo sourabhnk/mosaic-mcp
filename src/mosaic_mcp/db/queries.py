@@ -782,7 +782,40 @@ class GraphQueries:
                 JOIN targets t ON t.id = l.target_id
                 WHERE upper(t.symbol) = %(s)s""", {"s": symbol.strip().upper()})
             out["tool_compound_liabilities"] = rows[0] if rows else None
+        self._name_translational_compounds(out)
         return out
+
+    # The lists in the two Stage 2 records whose entries are compounds.
+    _TRANSLATIONAL_COMPOUND_LISTS = {
+        "species_gap": ("shared_compounds", "cellular_shared_compounds"),
+        "tool_compound_liabilities": ("top_liabilities",),
+    }
+    # A PDB chemical-component code (1-3 characters, e.g. "0UN" for
+    # CHEMBL1229592) is what some compounds rows hold as `name`: a ligand
+    # label, not a compound name.
+    _PDB_LIGAND_CODE = re.compile(r"^[0-9A-Z]{1,3}$")
+
+    def _name_translational_compounds(self, out: dict[str, Any]) -> None:
+        """Set `pref_name` on every compound the Stage 2 records list: the KG's
+        name for that ChEMBL ID, None when it holds none (a name equal to the
+        ID, or a PDB ligand code, is none). Whoever reads the record — the
+        dossier renderer or a connected model — then never names a compound
+        from memory: EGFR's first flag-on rendering (2026-10-16) labelled
+        CHEMBL554 gefitinib; it is lapatinib."""
+        lists = [(rec, f) for key, fields in self._TRANSLATIONAL_COMPOUND_LISTS.items()
+                 if (rec := out.get(key)) for f in fields
+                 if isinstance(rec.get(f), list)]
+        ids = sorted({r["molecule_chembl_id"] for rec, f in lists for r in rec[f]
+                      if isinstance(r, dict) and r.get("molecule_chembl_id")})
+        rows = self._execute_safe(
+            "SELECT chembl_id, name FROM compounds WHERE chembl_id = ANY(%(ids)s)",
+            {"ids": ids}) if ids else []
+        names = {r["chembl_id"]: r["name"].strip() for r in rows
+                 if r.get("name") and r["name"].strip().upper() != r["chembl_id"].upper()
+                 and not self._PDB_LIGAND_CODE.match(r["name"].strip())}
+        for rec, f in lists:
+            rec[f] = [{**r, "pref_name": names.get(r.get("molecule_chembl_id"))}
+                      if isinstance(r, dict) else r for r in rec[f]]
 
     def resolve_target_status(self, symbol: str) -> TargetResolution:
         """Resolve a symbol to one of four states — reset plan v3, A5.

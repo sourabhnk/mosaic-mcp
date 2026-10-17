@@ -1896,6 +1896,12 @@ def _ts(v: Any) -> str | None:
     return v.isoformat() if hasattr(v, "isoformat") else v
 
 
+# Each listed compound carries `pref_name` (queries._name_translational_compounds).
+_COMPOUND_NAMES_NOTE = ("pref_name is the knowledge graph's name for the ChEMBL ID; null "
+                        "means it holds none: refer to that compound by its ChEMBL ID, "
+                        "never by a name from elsewhere")
+
+
 def format_species_gap(row: dict[str, Any] | None) -> dict[str, Any]:
     if row is None:
         return dict(_NOT_YET)
@@ -1962,6 +1968,7 @@ def format_species_gap(row: dict[str, Any] | None) -> dict[str, Any]:
         },
         "reason": row.get("species_gap_reason"),
         "most_divergent_shared_compounds": (row.get("shared_compounds") or [])[:10],
+        "compound_names": _COMPOUND_NAMES_NOTE,
         "computed_at": _ts(row.get("computed_at")),
     }
 
@@ -2001,6 +2008,7 @@ def format_tool_compound_liabilities(row: dict[str, Any] | None) -> dict[str, An
             "fetched_at": _ts(row.get("admet_fetched_at")),
         },
         "highest_liability_compounds": (row.get("top_liabilities") or [])[:10],
+        "compound_names": _COMPOUND_NAMES_NOTE,
         "error": row.get("error"),
         "computed_at": _ts(row.get("computed_at")),
     }
