@@ -27,7 +27,7 @@
         },
         {
           "name": "MOSAIC_API_KEY",
-          "description": "API key unlocking the 7 Pro tools (optional; the 5 free tools work without it)",
+          "description": "API key unlocking the 6 Pro tools (optional; the 5 free tools work without it)",
           "isRequired": false,
           "isSecret": true
         },
