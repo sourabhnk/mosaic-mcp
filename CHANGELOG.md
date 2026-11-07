@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.0.0 — 2026-11-07
+
+A deliberate, versioned break (plan v3 §3.1). mosaic-mcp is now a **thin client to the
+hosted Mosaic service**: it serves Mosaic's five MCP tools over stdio and forwards each
+call to `https://mcp.getmosaic.dev/mcp` with `MOSAIC_API_KEY` as a Bearer token.
+
+- The five tools: `mosaic_get_coverage_grid` (free), `mosaic_verify_claim` (free,
+  rate-limited, at most 10 s), `mosaic_audit_claims` (paid, async), `mosaic_request_dossier`
+  (paid, async) and `mosaic_get_result` (free). Their names, descriptions and argument
+  models are a byte-copy of the hosted server's (`mosaic_mcp/tool_inputs.py`).
+- **Deprecated and removed: the bring-your-own-database mode.** `DATABASE_URL` is
+  ignored, and the query layer, response formatters, cache and tier table are gone. The
+  eleven 2.x tools answer an old client by name with what replaced each. Pin
+  `mosaic-mcp<3` to keep running 2.2.1.
+- A call the hosted service could not answer (no key, a rejected key, unreachable, a
+  timeout) is an error saying so, never an empty or zero result. Tiers, prices and
+  refusals are the hosted service's, passed through as it sent them.
+- Dependencies: `mcp>=1.10,<2` and `pydantic>=2.5` only.
+
 ## 2.2.1 — 2026-10-17
 
 - NEW (flag on): every compound listed in the `species_gap` and

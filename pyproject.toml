@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mosaic-mcp"
-version = "2.2.1"
-description = "Coverage-honest pre-clinical drug-target intelligence over MCP — 11 tools (5 free, 6 Pro): target profiles, compounds, papers, structures, the coverage grid, pathways, validation, clinical pipeline, target network, synthetic-lethal whitespace and resistance-bypass leads"
+version = "3.0.0"
+description = "Thin MCP client to the hosted Mosaic service: the five tools (coverage grid for any human target, verify one claim, audit a document's claims, request a dossier, read a result) over stdio. The 2.x bring-your-own-database mode is deprecated (pin mosaic-mcp<3)."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
@@ -29,12 +29,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
-    "mcp[cli]>=1.2,<2",
-    "psycopg[binary]>=3.1",
+    # 3.0.0: a thin client. The MCP SDK (stdio server + Streamable-HTTP client)
+    # and pydantic only; the 2.x database stack (psycopg, requests, dotenv)
+    # left with the bring-your-own-database mode.
+    "mcp>=1.10,<2",
     "pydantic>=2.5",
-    "httpx>=0.27",
-    "requests>=2.31",
-    "python-dotenv>=1.0",
 ]
 
 [project.urls]

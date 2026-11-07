@@ -2,38 +2,32 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.sourabhnk/mosaic-mcp",
   "title": "Mosaic Pre-Clinical Intelligence",
-  "description": "Pre-clinical drug-target intelligence: 60 curated targets, 1,969 counted partner genes, 11 tools",
+  "description": "Coverage-honest target intelligence: coverage grid, claim checks and audits, dossiers (5 tools)",
   "repository": {
     "url": "https://github.com/sourabhnk/mosaic-mcp",
     "source": "github"
   },
-  "version": "2.2.1",
+  "version": "3.0.0",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "mosaic-mcp",
-      "version": "2.2.1",
+      "version": "3.0.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
-          "name": "DATABASE_URL",
-          "description": "PostgreSQL/Neon connection string for YOUR Mosaic knowledge graph (must end /mosaic_db). Bring your own database \u2014 no shared instance is provided.",
+          "name": "MOSAIC_API_KEY",
+          "description": "Your Mosaic API key (mk_live_…). Every call is forwarded to the hosted service with it; the free tools need a key too",
           "isRequired": true,
           "isSecret": true
         },
         {
-          "name": "MOSAIC_API_KEY",
-          "description": "API key unlocking the 6 Pro tools (optional; the 5 free tools work without it)",
-          "isRequired": false,
-          "isSecret": true
-        },
-        {
-          "name": "MOSAIC_TIER",
-          "description": "Override tier for local dev: free (default), pro, or enterprise",
+          "name": "MOSAIC_MCP_URL",
+          "description": "Optional: the hosted MCP endpoint (default https://mcp.getmosaic.dev/mcp)",
           "isRequired": false,
           "isSecret": false
         }

@@ -1,1611 +1,214 @@
-"""
-Mosaic Pre-Clinical Intelligence MCP Server.
+"""mosaic-mcp 3.0: a thin MCP client to the hosted Mosaic service.
 
-Exposes the pharma knowledge graph through 11 MCP tools for use with
-Claude Desktop, Claude Code, or any MCP-compatible client.
+Mosaic's MCP surface is five tools (plan v3 §3.1, 2026-11-07):
+
+    mosaic_get_coverage_grid   free   any human target, every axis with its state
+    mosaic_verify_claim        free   one claim checked against Mosaic's own count, <= 10 s
+    mosaic_audit_claims        paid   every claim in a document, as an audited report ($390)
+    mosaic_request_dossier     paid   a verified dossier for any human target ($149)
+    mosaic_get_result          free   the status and result of a request you made
+
+This package serves those five over stdio and forwards every call to the hosted
+service (https://mcp.getmosaic.dev/mcp), which answers, meters and decides what
+a caller may do. It holds no database and no query layer, and it decides no
+tier: the answer, or the refusal, is the hosted service's, passed through as
+it came.
+
+    MOSAIC_API_KEY   a Mosaic API key (mk_live_...), sent as a Bearer token
+    MOSAIC_MCP_URL   optional; the hosted MCP endpoint (default above)
+
+The 2.x mode, which ran Mosaic's query layer over a PostgreSQL database you
+provided, is DEPRECATED and is not in 3.0. Its tools answer an old client with
+what replaced them. To keep running it, pin `mosaic-mcp<3`.
+
+The five tools' names, descriptions and input models are not written here:
+`mosaic_mcp/tool_inputs.py` is a byte-copy of the hosted service's own
+(`mosaic/src/mcp/tool_inputs.py`, kept in step by
+`scripts/sync_pip_package.py`), so the two doors cannot describe one tool
+differently or accept different arguments.
 """
 
 # NOTE: do NOT add `from __future__ import annotations` here. The mcp SDK
-# (>=1.x) inspects raw `param.annotation` in Tool.from_function; PEP 563
-# stringized annotations make it call issubclass(<str>, Context) and crash.
+# inspects raw `param.annotation` in Tool.from_function; PEP 563 stringized
+# annotations break its argument model.
 
-import json
-import logging
+import argparse
 import os
 import sys
-import time
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any, Literal
+from datetime import timedelta
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, ConfigDict, Field
+from mcp.server.fastmcp.exceptions import ToolError
 
-# ---------------------------------------------------------------------------
-# Ensure src imports resolve when running as standalone script
-# ---------------------------------------------------------------------------
-_project_root = Path(__file__).resolve().parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-
-from mosaic_mcp.db.connection import ConnectionManager, get_read_pool
-from mosaic_mcp.db.queries import (
-    GraphQueries,
-    RESOLUTION_ARCHIVED,
-)
-from mosaic_mcp.users import (
-    FREE_TOOLS,
-    TIER_RESULT_LIMITS,
-    Tier,
-)
-from mosaic_mcp.responses import (
-    format_target_dossier,
-    format_pathway_context,
-    format_compound_selectivity,
-    format_search_results,
-    format_indication_landscape,
-    format_compare_targets,
-    format_clinical_pipeline,
-    format_validation_summary,
-    format_structure_summary,
-    format_druggability,
-    format_undruggable_targets,
-    format_translational_blocks,
-    empty_scope_note,
-    uncovered_target_note,
-    WELL_KNOWN_TARGETS,
+from mosaic_mcp import __version__
+from mosaic_mcp.tool_inputs import (
+    FIVE_TOOLS,
+    RETIRED,
+    TOOLS,
+    AuditClaimsInput,
+    CoverageGridInput,
+    DossierRequestInput,
+    ResultInput,
+    VerifyClaimInput,
 )
 
-logger = logging.getLogger(__name__)
+HOSTED_MCP_URL = "https://mcp.getmosaic.dev/mcp"
+# The hosted tools bound themselves (the grid answers in seconds, verify_claim
+# in at most 10 s, the async tools return a request id at once); this is the
+# most the client waits for any one answer before saying it got none.
+CALL_TIMEOUT_S = 120.0
+CONNECT_TIMEOUT_S = 30.0
+
+NO_KEY = (
+    "mosaic-mcp 3.0 forwards every call to the hosted Mosaic service, and MOSAIC_API_KEY "
+    "is not set. Set it to your Mosaic API key (mk_live_...). Or connect your MCP client "
+    "straight to https://mcp.getmosaic.dev/mcp, which signs you in by email (OAuth) and "
+    "needs no key. Nothing was sent.")
 
 
-# Rollout flag (plan v3 §0.2 / Stage 2), off when unset. When on, the profile,
-# compounds and grid tools append `species_gap` and `tool_compound_liabilities`
-# blocks; when off their payloads are byte-identical to 2.1.3. A database
-# without the Stage 2 tables (any BYO database that has not run
-# 2026_10_16a/b) gets no block at all. Hand-ported from the hosted server.
-ENABLE_V2_SPECIES_AND_ADMET = os.getenv("ENABLE_V2_SPECIES_AND_ADMET", "").strip().lower()     in {"1", "true", "yes", "on"}
+def _endpoint() -> str:
+    return (os.environ.get("MOSAIC_MCP_URL") or "").strip() or HOSTED_MCP_URL
 
 
-def _translational_blocks(symbol: str, *, missing: str = "no_fetch_evidence") -> dict:
-    if not ENABLE_V2_SPECIES_AND_ADMET:
-        return {}
-    blocks = format_translational_blocks(_gq().get_translational_axes(symbol))
-    if missing == "queued":
-        for k, b in blocks.items():
-            if b.get("state") == "no_fetch_evidence":
-                blocks[k] = {"state": "queued",
-                             "note": "computed when a dossier is requested on the "
-                                     "hosted pipeline; not measured yet"}
-    return blocks
-
-# ---------------------------------------------------------------------------
-# Confidence thresholds for MCP output
-# ---------------------------------------------------------------------------
-
-CONFIDENCE_DISPLAY_THRESHOLD = 0.1     # Minimum confidence to show a relation
-CONFIDENCE_HIGH_THRESHOLD = 0.3        # "high confidence" badge threshold
-
-def _confidence_badge(confidence: float | None) -> str:
-    """Return a confidence badge string based on thresholds."""
-    if confidence is None:
-        return "unknown"
-    if confidence >= CONFIDENCE_HIGH_THRESHOLD:
-        return "high"
-    if confidence >= CONFIDENCE_DISPLAY_THRESHOLD:
-        return "moderate"
-    return "low"
-
-def _filter_by_confidence(items: list[dict], key: str = "confidence") -> list[dict]:
-    """Filter items below the display threshold and add confidence badges."""
-    filtered = []
-    for item in items:
-        conf = item.get(key)
-        if conf is not None and conf < CONFIDENCE_DISPLAY_THRESHOLD:
-            continue
-        item["confidence_badge"] = _confidence_badge(conf)
-        filtered.append(item)
-    return filtered
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status inside a transport failure, if there is one (the MCP
+    client raises from a task group, so it may sit inside an ExceptionGroup)."""
+    seen: list[BaseException] = [exc]
+    while seen:
+        e = seen.pop()
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return status
+        seen.extend(getattr(e, "exceptions", ()) or ())
+        for nxt in (e.__cause__, e.__context__):
+            if nxt is not None:
+                seen.append(nxt)
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Tool tier gating
-# ---------------------------------------------------------------------------
+async def _forward(name: str, params: Any) -> str:
+    """Call `name` on the hosted service with these arguments and return its
+    answer verbatim. A hosted refusal is raised as the hosted text; a failure
+    to reach it is raised saying so. Never an empty or invented answer."""
+    key = (os.environ.get("MOSAIC_API_KEY") or "").strip()
+    if not key:
+        raise ToolError(NO_KEY)
+    url = _endpoint()
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
 
-# Current user tier for MCP session (set via env var or API key validation)
-_session_tier: Tier = Tier.FREE
-
-
-def _get_session_tier() -> Tier:
-    """Resolve the tier for the current request.
-
-    Remote (SSE/HTTP) requests carry an authenticated principal whose
-    tier comes from the resolved API key (ADR docs/decisions/mcp-auth.md).
-    The MOSAIC_TIER / MOSAIC_API_KEY env path is retained only for local
-    stdio dev where there is no per-request auth.
-    """
-    from mosaic_mcp.auth import principal_tier
-
-    resolved = principal_tier()
-    if resolved is not None:
-        return resolved
-
-    tier_env = os.getenv("MOSAIC_TIER", "").lower()
-    if tier_env in ("pro", "enterprise", "admin"):
-        return Tier(tier_env)
-    api_key = os.getenv("MOSAIC_API_KEY", "")
-    if api_key:
-        # stdio dev only: a valid env key implies Pro access.
-        return Tier.PRO
-    return Tier.FREE
-
-
-class PaidTierRequired(Exception):
-    """Raised when a free-tier session calls a Pro-only tool.
-
-    Raising (rather than returning a JSON string) makes FastMCP mark the
-    tool response with `isError: true`, so Claude Desktop / any MCP client
-    knows the call failed and can surface the upgrade prompt cleanly
-    instead of treating the error payload as a valid tool result.
-    """
-
-
-def _check_tool_access(tool_name: str) -> None:
-    """Enforce tier gating for a tool. Raises PaidTierRequired on denial."""
-    tier = _get_session_tier()
-    if tier in (Tier.PRO, Tier.ENTERPRISE, Tier.ADMIN):
-        return
-    if tool_name in FREE_TOOLS:
-        return
-    raise PaidTierRequired(
-        f"Tool '{tool_name}' requires a Pro plan ($79/mo). "
-        f"Free tier includes: {', '.join(sorted(FREE_TOOLS))}. "
-        f"Upgrade at https://getmosaic.dev/pricing"
-    )
+    arguments = {"params": params.model_dump(mode="json", exclude_none=True)}
+    headers = {"Authorization": f"Bearer {key}", "User-Agent": f"mosaic-mcp/{__version__}"}
+    try:
+        async with streamablehttp_client(url, headers=headers, timeout=CONNECT_TIMEOUT_S) as (read, write, _):
+            async with ClientSession(read, write,
+                                     read_timeout_seconds=timedelta(seconds=CALL_TIMEOUT_S)) as session:
+                await session.initialize()
+                result = await session.call_tool(name, arguments)
+    except ToolError:
+        raise
+    except BaseException as e:  # noqa: BLE001 - ExceptionGroup from the transport's task group
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+        status = _http_status(e)
+        if status in (401, 403):
+            raise ToolError(
+                f"The hosted Mosaic service refused MOSAIC_API_KEY (HTTP {status}): it is "
+                "invalid or revoked. Nothing was answered.") from e
+        why = f"HTTP {status}" if status else f"{type(e).__name__}: {e}"
+        raise ToolError(
+            f"mosaic-mcp could not get an answer from the hosted Mosaic service at {url} "
+            f"({why}). This is a failed call, not a result; retry.") from e
+    text = "".join(getattr(block, "text", "") for block in result.content or ())
+    if result.isError:
+        # The hosted SDK prefixes a tool's own error; this SDK adds the same
+        # prefix again when the error is re-raised here, so it is said once.
+        text = text.removeprefix(f"Error executing tool {name}: ")
+        raise ToolError(text or f"the hosted Mosaic service refused {name}, without a reason")
+    if not text:
+        raise ToolError(f"the hosted Mosaic service answered {name} with no content; "
+                        "this is a failed call, not a result")
+    return text
 
 
-def _enforce_limit(tool_name: str, requested: int) -> int:
-    """Enforce tier-based result limits."""
-    tier = _get_session_tier()
-    limits = TIER_RESULT_LIMITS.get(tool_name)
-    if not limits:
-        return requested
-    max_allowed = limits.get(tier, limits.get(Tier.FREE, requested))
-    return min(requested, max_allowed)
+def _deprecation_message(name: str) -> str:
+    on, replacement = RETIRED[name]
+    return (f"{name} was retired from Mosaic's MCP tools on {on}. mosaic-mcp "
+            f"{__version__} serves the five that remain ({', '.join(FIVE_TOOLS)}), "
+            f"forwarded to the hosted service. {replacement}. The 2.x package that served "
+            f"it over your own database is deprecated; pin mosaic-mcp<3 to keep it.")
 
 
-def _with_coverage_statement(payload: dict, tool: str, resolution: Any,
-                             what: str) -> dict:
-    """Put the resolver's coverage statement on an EMPTY paged payload -- S15b.
+class _ThinMCP(FastMCP):
+    """FastMCP that answers a retired tool, by name, with what replaced it,
+    instead of "Unknown tool". The retired tools are not registered, so
+    tools/list shows exactly the five."""
 
-    Before this, an uncovered gene got `{"compounds": [], "total": 0}` with
-    nothing beside it: a zero that meant "never looked" in the shape of a
-    measurement. Every shape key stays; `returned` keeps counting this
-    payload, and `total` becomes null because there is no population behind
-    it to count. A dossier target is returned unchanged -- its empty result
-    is the coverage model's to explain.
-    """
-    note = uncovered_target_note(resolution, what, as_of=_provenance_as_of())
-    if not note:
-        return payload
-    return {"_meta": {"tool": tool, **note}, **payload, "total": None}
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        if name in RETIRED:
+            raise ToolError(_deprecation_message(name))
+        return await super().call_tool(name, arguments)
 
 
-def _paged(rows: list[dict], key: str, requested: int | None = None,
-           applied: int | None = None, **extra) -> dict:
-    """Build a paged payload that tells the truth about what it withheld.
-
-    Hand-ported from the hosted server (board S7b; audit 2026-10-03).
-    `sync_pip_package.py` syncs the data layer but deliberately EXCLUDES
-    server.py, and server.py is what *calls* it -- so a query-layer change
-    lands here only if a human carries it. queries.py emits `total_available`
-    (COUNT(*) OVER (), evaluated before LIMIT) and, on the papers axis,
-    `total_is_floor`; both are transport columns stripped from the rows.
-    """
-    has_total = bool(rows) and "total_available" in rows[0]
-    total = int(rows[0]["total_available"]) if has_total else len(rows)
-    total_is_floor = bool(rows) and bool(rows[0].get("total_is_floor"))
-    transport = ("total_available", "total_is_floor")
-    clean = [{k: v for k, v in r.items() if k not in transport} for r in rows]
-    payload = {**extra, key: clean, "returned": len(clean), "total": total}
-    if total_is_floor:
-        payload["total_is_floor"] = True
-    if rows and not has_total:
-        # The query layer drifted out from under this copy. Say so rather than
-        # crashing OR silently republishing the page size as the total.
-        payload["_total_is_page_size"] = True
-    if total > len(clean):
-        payload["truncated"] = True
-        of_total = f"at least {total}" if total_is_floor else str(total)
-        # Audit 2026-10-03 P1-4: name the tier cap when IT bound the page;
-        # "raise limit" cannot work when the cap, not the limit, applied.
-        if requested is not None and applied is not None and applied < requested:
-            how = (f"Capped at {applied} on the {_get_session_tier().value} tier "
-                   f"(you asked for {requested}) -- see https://getmosaic.dev/pricing")
-            payload["tier_cap_applied"] = applied
-        else:
-            how = "Raise `limit` to see more."
-        payload["_note"] = f"Showing {len(clean)} of {of_total}. {how}"
-    return payload
-
-# ---------------------------------------------------------------------------
-# Lifespan — shared DB connection
-# ---------------------------------------------------------------------------
-
-_graph_queries: GraphQueries | None = None
-
-
-def _get_graph_queries() -> GraphQueries:
-    """Lazily initialise a shared GraphQueries instance.
-
-    Uses the read pool which auto-routes to Neon pooler / read replica.
-    """
-    global _graph_queries
-    if _graph_queries is None:
-        _graph_queries = GraphQueries(get_read_pool())
-    return _graph_queries
-
-
-@asynccontextmanager
-async def _lifespan(server: Any):
-    """Initialise graph connection on startup, close on shutdown."""
-    gq = _get_graph_queries()
-    yield {"graph_queries": gq}
-    gq.db.close()
-
-
-# ---------------------------------------------------------------------------
-# Server
-# ---------------------------------------------------------------------------
-
-mcp = FastMCP(
+mcp = _ThinMCP(
     "mosaic_mcp",
-    lifespan=_lifespan,
+    instructions=(
+        "Mosaic: coverage-honest pre-clinical target intelligence. Every count carries a "
+        "state, so 'we did not look' never reads as zero. Answers come from the hosted "
+        "Mosaic service."),
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _tool(name: str):
+    spec = TOOLS[name]
+    return mcp.tool(name=name, description=spec["description"], annotations=spec["annotations"])
 
-# ---------------------------------------------------------------------------
-# Label enrichment safety-net
-# ---------------------------------------------------------------------------
-#
-# Historical bug: tools returned `compound_id: "CHEMBL25"` with no sibling
-# `compound_name`, so LLM clients surfaced raw ChEMBL IDs to users. The real
-# fix lives in the query layer (COALESCE(pref_name, name, chembl_id)), but
-# this walker catches any regression by ensuring every `*_id` field in the
-# response tree has a readable sibling label. It batches lookups and caches
-# per-process to avoid hammering Postgres on every tool call.
 
-import re as _re
+@_tool("mosaic_get_coverage_grid")
+async def mosaic_get_coverage_grid(params: CoverageGridInput) -> str:
+    return await _forward("mosaic_get_coverage_grid", params)
 
-# Where a user actually asks for coverage. This used to name
-# `mosaic_target_wishlist_add`, a tool that does not exist — C3.3 cut it and
-# the call to action survived in three messages, including the one every
-# archived gene returns. 704 genes are archived. The first replacement was
-# "getmosaic.dev/request", a 404 — the same defect in a new form. Curl it.
-REQUEST_URL = "https://getmosaic.dev"
 
+@_tool("mosaic_verify_claim")
+async def mosaic_verify_claim(params: VerifyClaimInput) -> str:
+    return await _forward("mosaic_verify_claim", params)
 
-_ID_KEYS_TO_NAME_KEY: dict[str, str] = {
-    "compound_id": "compound_name",
-    "target_id": "target_name",
-    "indication_id": "indication_name",
-    "paper_id": "paper_title",
-    "patent_id": "patent_title",
-    "nct_id": "trial_title",
-}
 
-_LABEL_CACHE: dict[tuple[str, str], str] = {}  # (kind, id) -> display label
-_LABEL_CACHE_MAX = 5000
+@_tool("mosaic_audit_claims")
+async def mosaic_audit_claims(params: AuditClaimsInput) -> str:
+    return await _forward("mosaic_audit_claims", params)
 
 
-def _lookup_labels(kind: str, ids: set[str]) -> dict[str, str]:
-    """Batch-resolve IDs to display labels; cache results per-process."""
-    if not ids:
-        return {}
-    out: dict[str, str] = {}
-    missing: list[str] = []
-    for i in ids:
-        key = (kind, i)
-        if key in _LABEL_CACHE:
-            out[i] = _LABEL_CACHE[key]
-        else:
-            missing.append(i)
-    if not missing:
-        return out
+@_tool("mosaic_request_dossier")
+async def mosaic_request_dossier(params: DossierRequestInput) -> str:
+    return await _forward("mosaic_request_dossier", params)
 
-    try:
-        gq = _gq()
-        if kind == "compound":
-            rows = gq.db.execute(
-                "SELECT id, COALESCE(pref_name, name, chembl_id, id) AS label "
-                "FROM compounds WHERE id = ANY(%s)",
-                (missing,),
-            )
-        elif kind == "target":
-            rows = gq.db.execute(
-                "SELECT id, COALESCE(symbol, name, id) AS label "
-                "FROM targets WHERE id = ANY(%s)",
-                (missing,),
-            )
-        elif kind == "indication":
-            rows = gq.db.execute(
-                "SELECT id, COALESCE(name, id) AS label "
-                "FROM indications WHERE id = ANY(%s)",
-                (missing,),
-            )
-        elif kind == "paper":
-            rows = gq.db.execute(
-                "SELECT paper_id AS id, COALESCE(title, paper_id) AS label "
-                "FROM papers WHERE paper_id = ANY(%s)",
-                (missing,),
-            )
-        elif kind == "patent":
-            rows = gq.db.execute(
-                "SELECT patent_id AS id, COALESCE(title, patent_id) AS label "
-                "FROM patents WHERE patent_id = ANY(%s)",
-                (missing,),
-            )
-        elif kind == "trial":
-            rows = gq.db.execute(
-                "SELECT nct_id AS id, COALESCE(brief_title, nct_id) AS label "
-                "FROM trials WHERE nct_id = ANY(%s)",
-                (missing,),
-            )
-        else:
-            rows = []
-    except Exception as e:
-        logger.debug("label lookup failed for %s: %s", kind, e)
-        rows = []
 
-    for r in rows or []:
-        rid = r.get("id")
-        label = r.get("label")
-        if rid and label:
-            out[rid] = label
-            if len(_LABEL_CACHE) < _LABEL_CACHE_MAX:
-                _LABEL_CACHE[(kind, rid)] = label
-    # Any still missing fall back to the raw ID string
-    for i in missing:
-        out.setdefault(i, i)
-    return out
-
-
-def _collect_ids(node: Any, buckets: dict[str, set[str]]) -> None:
-    """Walk the response tree and collect IDs needing enrichment."""
-    if isinstance(node, dict):
-        for id_key, name_key in _ID_KEYS_TO_NAME_KEY.items():
-            if id_key in node and node.get(id_key) and not node.get(name_key):
-                kind = id_key.replace("_id", "")
-                if kind == "nct":
-                    kind = "trial"
-                val = node[id_key]
-                if isinstance(val, str):
-                    buckets.setdefault(kind, set()).add(val)
-        for v in node.values():
-            _collect_ids(v, buckets)
-    elif isinstance(node, list):
-        for item in node:
-            _collect_ids(item, buckets)
-
-
-def _apply_labels(node: Any, resolved: dict[str, dict[str, str]]) -> None:
-    """Inject sibling *_name fields where missing."""
-    if isinstance(node, dict):
-        for id_key, name_key in _ID_KEYS_TO_NAME_KEY.items():
-            if id_key in node and node.get(id_key) and not node.get(name_key):
-                kind = id_key.replace("_id", "")
-                if kind == "nct":
-                    kind = "trial"
-                val = node[id_key]
-                if isinstance(val, str):
-                    label = resolved.get(kind, {}).get(val)
-                    if label:
-                        node[name_key] = label
-        for v in node.values():
-            _apply_labels(v, resolved)
-    elif isinstance(node, list):
-        for item in node:
-            _apply_labels(item, resolved)
-
-
-def _enrich_labels(data: Any) -> Any:
-    """Safety net: ensure every `*_id` in a response has a sibling name field.
-
-    Mutates the tree in place and returns it. Any lookup failures are silent —
-    this is a best-effort overlay on top of the query layer's COALESCE logic.
-    """
-    try:
-        buckets: dict[str, set[str]] = {}
-        _collect_ids(data, buckets)
-        if not buckets:
-            return data
-        resolved: dict[str, dict[str, str]] = {
-            kind: _lookup_labels(kind, ids) for kind, ids in buckets.items()
-        }
-        _apply_labels(data, resolved)
-    except Exception as e:
-        logger.debug("label enrichment skipped: %s", e)
-    return data
-
-
-# Freshness states for the _provenance stamp. Emitted on BOTH paths, so the
-# field's PRESENCE never carries meaning — only its value does.
-FRESHNESS_KG_METADATA = "kg_metadata"  # read a real last_refresh_at; as_of is set
-FRESHNESS_UNAVAILABLE = "unavailable"  # could not read it; as_of is null, NOT today
-
-# `at` = when we last ATTEMPTED, not when we last succeeded. Gating on the
-# attempt (rather than on a truthy value) is load-bearing: the old guard was
-# `if _PROV_CACHE["as_of"] and ...`, so once as_of stops being truthy every tool
-# re-queries on every call — a retry storm against a database that is, by
-# construction, already unhealthy. Unknown is cached too, briefly.
-_PROV_CACHE: dict[str, Any] = {"at": 0.0, "as_of": None, "freshness": None,
-                               "kg_version": None}
-_PROV_TTL_OK_S = 300.0
-_PROV_TTL_UNAVAILABLE_S = 45.0  # short: a recovered DB must not keep reporting unknown
-
-
-def _provenance_freshness() -> tuple[str | None, str]:
-    """KG freshness for the _provenance stamp: ``(as_of, freshness)``.
-
-    Returns ``as_of=None`` when ``kg_metadata`` cannot be read. It used to fall
-    back to ``datetime.date.today()``, which stamped EVERY tool response with
-    today's date whenever the lookup failed — rendering "we do not know how fresh
-    this is" as "this is maximally fresh". A plausible date is worse than no date
-    because nothing downstream can tell it was invented.
-    """
-    now = time.time()
-    cached_state = _PROV_CACHE["freshness"]
-    if cached_state is not None:
-        ttl = _PROV_TTL_OK_S if cached_state == FRESHNESS_KG_METADATA else _PROV_TTL_UNAVAILABLE_S
-        if now - _PROV_CACHE["at"] < ttl:
-            return _PROV_CACHE["as_of"], cached_state
-
-    as_of: str | None = None
-    kg_version = None
-    try:
-        meta = _gq().get_kg_metadata()
-        if meta and meta.get("kg_version") is not None:
-            kg_version = int(meta["kg_version"])
-        if meta and meta.get("last_refresh_at"):
-            as_of = str(meta["last_refresh_at"])[:10]
-    except Exception as e:
-        logger.warning("provenance: kg_metadata unreadable, as_of=null: %s", e)
-
-    freshness = FRESHNESS_KG_METADATA if as_of else FRESHNESS_UNAVAILABLE
-    _PROV_CACHE.update(at=now, as_of=as_of, freshness=freshness, kg_version=kg_version)
-    return as_of, freshness
-
-
-def _provenance_as_of() -> str | None:
-    """The freshness DATE alone, or None when it cannot be read.
-
-    Kept as a separate accessor because ~10 call sites interpolate this into
-    prose. They are falsy-guarded, so None correctly drops the "(as of ...)"
-    clause instead of asserting a date nobody measured.
-    """
-    return _provenance_freshness()[0]
-
-
-def _as_of_clause() -> str:
-    """", as of YYYY-MM-DD" — or nothing when freshness is unreadable.
-
-    The one site that interpolates the date BARE, so it needs its own guard or
-    it prints "as of None".
-    """
-    as_of = _provenance_as_of()
-    return f", as of {as_of}" if as_of else ""
-
-
-def _json_result(data: Any) -> str:
-    """Serialise a result dict/list to compact JSON.
-
-    Runs the label-enrichment safety net first so any `*_id` field that slipped
-    through without a sibling name gets one before the client sees it. Then
-    stamps a standard `_provenance` block (Task 1.2.3) on dict results that
-    don't already carry one — additive, never overwrites a tool-specific
-    provenance (e.g. external-source tools).
-    """
-    data = _enrich_labels(data)
-    if (
-        isinstance(data, dict)
-        and "_provenance" not in data
-        and "error" not in data
-    ):
-        _as_of, _freshness = _provenance_freshness()
-        data = {
-            **data,
-            "_provenance": {
-                "sources": ["mosaic_kg"],
-                # Always present, null when unknown — an absent key would
-                # mean "this build does not stamp freshness", a different fact.
-                "as_of": _as_of,
-                "freshness": _freshness,
-                # Audit 2026-10-03 P2: counts drift between refreshes; the
-                # version makes the drift explicable.
-                "kg_version": _PROV_CACHE.get("kg_version"),
-            },
-        }
-    # Compact, not indent=2: a quarter of every payload was indentation the
-    # model had to read (audit 2026-10-03 P2 — the profile ran 37 kB pretty,
-    # 28 kB compact).
-    return json.dumps(data, default=str, separators=(",", ":"))
-
-
-def _json_error(message: str) -> str:
-    """Return a JSON error envelope."""
-    return json.dumps({"error": message}, indent=2)
-
-
-def _gq() -> GraphQueries:
-    return _get_graph_queries()
-
-
-def _tier_allows(tool_name: str) -> bool:
-    """Same predicate as _check_tool_access, without raising."""
-    if _get_session_tier() in (Tier.PRO, Tier.ENTERPRISE, Tier.ADMIN):
-        return True
-    return tool_name in FREE_TOOLS
-
-
-class WatchlistOwnerRequired(Exception):
-    """Raised when a session supplies no usable owner key."""
-
-
-def _watchlist_owner_key(requested: str | None) -> str:
-    """Resolve the owner identity for a watchlist operation.
-
-    `owner_key` used to be free text taken straight off the request and
-    documented as "user id, email, or 'anon:<token>'", so passing a customer's
-    email address listed their watchlists. That the field was untrustworthy is
-    not hypothetical: of the 9 rows in `watchlists` at the time of the fix, six
-    had a **gene symbol** as the owner key (EGFR, PIK3CA, ABL1, KDR, MAPK1) —
-    LLM clients filling an ambiguous "owner" field with whatever was in
-    context. A field models populate by guessing cannot be an identity.
-
-    This is the stdio package, which has no request principal (`auth.py` is a
-    stub — see sync_from_monorepo/_compat notes), so unlike the hosted server
-    there is no authenticated account to derive an owner from. Every session is
-    therefore confined to the `anon:` namespace, which cannot collide with the
-    hosted `user:<uuid>` keys. The token is a bearer secret the caller chose;
-    scope it accordingly.
-    """
-    req = (requested or "").strip()
-    if req.startswith("anon:") and len(req) > len("anon:"):
-        return req
-    raise WatchlistOwnerRequired(
-        "Watchlists need an identity. Pass owner_key='anon:<a random token you "
-        "keep>'. A bare id or email is not accepted — it would let one caller "
-        "name another. (The pip package is stdio-only and has no signed-in "
-        "account; use the hosted MCP server if you want watchlists tied to "
-        "your Mosaic account.)"
-    )
-
-
-def _with_db_error_handling(fn):
-    """Catch DB connection errors and add Op-6 response caching.
-
-    Cache reads are free (no quota call here — the MCP tool path does
-    not meter). The cache key includes the session tier so a free user
-    can never receive a Pro-only or higher-limit cached result.
-    """
-    import functools
-
-    import psycopg
-
-    from mosaic_mcp import cache as _cache
-
-    tool_name = fn.__name__
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        # FastMCP invokes tools as fn(**validated_kwargs) — args is ALWAYS
-        # empty on the MCP path, so reading only args[0] left params None
-        # and silently disabled the response cache on every remote call.
-        # Every tool's sole argument is named `params`.
-        params = args[0] if args else kwargs.get("params")
-        cache_params = None
-        if (
-            params is not None
-            and hasattr(params, "model_dump")
-            and tool_name not in _cache.NON_CACHEABLE
-            and _tier_allows(tool_name)
-        ):
-            try:
-                cache_params = {
-                    **params.model_dump(),
-                    "__tier": _get_session_tier().value,
-                }
-                hit = _cache.tool_cache_get(tool_name, cache_params)
-                if hit is not None:
-                    return hit
-            except Exception as e:  # never let caching break a tool
-                logger.debug("tool cache get skipped: %s", e)
-                cache_params = None
-
-        try:
-            result = fn(*args, **kwargs)
-        except psycopg.OperationalError as e:
-            msg = str(e).split("\n")[0]
-            return _json_error(
-                f"Database connection failed: {msg}. "
-                "Is PostgreSQL running? Check DATABASE_URL environment variable."
-            )
-
-        if (
-            cache_params is not None
-            and isinstance(result, str)
-            and '"error"' not in result
-        ):
-            try:
-                _cache.tool_cache_put(tool_name, cache_params, result)
-            except Exception as e:
-                logger.debug("tool cache put skipped: %s", e)
-        return result
-
-    return wrapper
-
-
-# ---------------------------------------------------------------------------
-# Input Models
-# ---------------------------------------------------------------------------
-
-class SearchTargetsInput(BaseModel):
-    """Input for searching targets."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    query: str = Field(..., description="Gene symbol or keyword to search (e.g. 'EGFR', 'kinase')", min_length=1, max_length=200)
-    indication: str | None = Field(default=None, description="Optional indication filter (e.g. 'oncology')")
-
-
-class GeneSymbolInput(BaseModel):
-    """Input requiring a single gene symbol."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    gene_symbol: str = Field(..., description="Gene symbol of the target (e.g. 'EGFR', 'BRAF', 'TP53')", min_length=1, max_length=30)
-
-
-class GeneSymbolWithLimit(BaseModel):
-    """Input requiring a gene symbol with optional limit."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    gene_symbol: str = Field(..., description="Gene symbol of the target (e.g. 'EGFR', 'BRAF')", min_length=1, max_length=30)
-    limit: int = Field(default=20, description="Maximum number of results to return", ge=1, le=200)
-
-
-class TargetCompoundsInput(GeneSymbolWithLimit):
-    """Compounds on a target, potency-sorted or approved-first."""
-    sort: Literal["potency", "max_phase"] = Field(
-        default="potency",
-        description="'potency' (best activity first) or 'max_phase' (approved and "
-                    "clinical drugs first: phase, then ChEMBL mechanism, then earliest "
-                    "approval)",
-    )
-
-
-class CompoundIdInput(BaseModel):
-    """Input requiring a compound identifier."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    compound_id: str = Field(..., description="Compound identifier — ChEMBL ID (e.g. 'CHEMBL25') or internal ID", min_length=1, max_length=100)
-
-
-class IndicationInput(BaseModel):
-    """Input requiring an indication name."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    indication_name: str = Field(..., description="Indication/disease name (e.g. 'oncology', 'breast_cancer')", min_length=1, max_length=200)
-
-
-class ListSubindicationsInput(BaseModel):
-    """Optional parent filter for listing sub-indications."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    parent_indication: str | None = Field(default=None, description="Optional parent indication id, name, or synonym (e.g. 'lung cancer', 'NSCLC') to list only its children", max_length=200)
-
-
-class TargetWishlistInput(BaseModel):
-    """Request that an out-of-scope target be added in a future ingest."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    gene_symbol: str = Field(..., description="Gene symbol to request (e.g. 'GPR55')", min_length=1, max_length=50)
-    user_email: str = Field(default="anonymous", description="Optional requester email so they can be notified", max_length=200)
-    notes: str | None = Field(default=None, description="Optional context for why this target matters", max_length=1000)
-
-
-# `owner_key` was a free-text identity ("user id, email, or 'anon:<token>'"),
-# which meant naming someone returned their watchlists. It is now restricted to
-# the `anon:` namespace and validated by `_watchlist_owner_key`. `watchlist_id`
-# alone is no longer sufficient for read or write — see `get_watchlist` and
-# `add_watchlist_item` in db/queries.py, which scope on owner in the SQL.
-_OWNER_KEY_FIELD = Field(
-    default=None,
-    description=(
-        "'anon:<token>' you generate and keep. This is the stdio package: it "
-        "has no signed-in account, so watchlists are anonymous and the token "
-        "is what proves the list is yours."
-    ),
-    max_length=200,
-)
-
-
-class WatchlistCreateInput(BaseModel):
-    """Create a watchlist owned by the caller."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    owner_key: str | None = _OWNER_KEY_FIELD
-    name: str = Field(default="My watchlist", description="Watchlist name", max_length=120)
-
-
-class WatchlistAddItemInput(BaseModel):
-    """Add a watched entity to one of the caller's watchlists."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    watchlist_id: str = Field(..., description="Watchlist UUID", min_length=1, max_length=64)
-    item_type: str = Field(..., description="One of: target, indication, organization, compound, relation_type", min_length=1, max_length=40)
-    item_value: str = Field(..., description="The entity value, e.g. 'EGFR' or 'non_small_cell_lung_carcinoma'", min_length=1, max_length=200)
-    owner_key: str | None = _OWNER_KEY_FIELD
-
-
-class WatchlistIdInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    watchlist_id: str = Field(..., description="Watchlist UUID", min_length=1, max_length=64)
-    owner_key: str | None = _OWNER_KEY_FIELD
-
-
-class WatchlistOwnerInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-    owner_key: str | None = _OWNER_KEY_FIELD
-
-
-class CompoundIdWithLimit(BaseModel):
-    """Input requiring a compound ID with optional limit."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    compound_id: str = Field(..., description="Compound identifier (e.g. 'CHEMBL25')", min_length=1, max_length=100)
-    limit: int = Field(default=10, description="Maximum analogs to return", ge=1, le=50)
-
-
-class MultiGeneInput(BaseModel):
-    """Input for comparing multiple gene symbols."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    gene_symbols: list[str] = Field(..., description="2-5 gene symbols to compare (e.g. ['EGFR', 'BRAF', 'ALK'])", min_length=2, max_length=5)
-
-
-class OpportunityInput(BaseModel):
-    """Input for finding whitespace opportunities."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    therapy_area: str | None = Field(default=None, description="Optional therapy area filter (e.g. 'oncology', 'cardiovascular')")
-    limit: int = Field(default=20, description="Max results", ge=1, le=50)
-
-
-class SyntheticLethalInput(BaseModel):
-    """Input for synthetic-lethal whitespace discovery."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    approved_target: str | None = Field(
-        default=None,
-        description="Anchor target with chemical matter (e.g. 'KRAS'). "
-        "If omitted, the most-developed targets are used as anchors.",
-    )
-    lineage: str | None = Field(
-        default=None,
-        description="Tumor lineage filter (reserved — active once DepMap "
-        "co-essentiality is ingested; currently a no-op label).",
-    )
-    limit: int = Field(default=20, description="Max pairs", ge=1, le=50)
-
-
-class ModalityGapsInput(BaseModel):
-    """Input for modality-gap analysis."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    target_or_family: str = Field(
-        ..., min_length=1, max_length=100,
-        description="Target gene symbol (e.g. 'BRD4'). Family-level is "
-        "not available — protein_family data is unpopulated.",
-    )
-
-
-class ResistanceBypassInput(BaseModel):
-    """Input for resistance-bypass mapping."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    target: str = Field(..., description="Target whose therapies face "
-                        "resistance (e.g. 'EGFR')", min_length=1, max_length=100)
-    indication: str | None = Field(
-        default=None,
-        description="Optional indication context (reserved — paper-"
-        "indication links not modelled; currently a label only).",
-    )
-
-
-class TalentMigrationInput(BaseModel):
-    """Input for talent-migration discovery."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    target: str = Field(..., description="Target gene symbol (e.g. 'EGFR')",
-                         min_length=1, max_length=100)
-    lookback_years: int = Field(default=5, ge=1, le=20,
-                                description="Years of history to weight")
-
-
-class EmergingSignalsInput(BaseModel):
-    """Input for emerging-signal detection."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    window_months: int = Field(default=6, ge=1, le=24,
-                               description="Recent window length in months")
-    signal_type: str = Field(
-        default="paper_surge",
-        pattern=r"^(paper_surge|patent_surge)$",
-        description="paper_surge or patent_surge",
-    )
-    limit: int = Field(default=20, ge=1, le=50, description="Max signals")
-
-
-class SimilarTargetsInput(BaseModel):
-    """Input for structural-similarity search (Move 3 Task M3.1)."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    gene: str = Field(
-        ..., description="Target gene symbol or UniProt id (e.g. 'EGFR')",
-        min_length=1, max_length=100,
-    )
-    k: int = Field(
-        default=10, ge=1, le=50,
-        description="Max number of structurally similar neighbours to return",
-    )
-
-
-class UndruggableInput(BaseModel):
-    """Input for finding structurally intractable targets."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    therapy_area: str | None = Field(
-        default=None,
-        description="Optional therapy area filter (e.g. 'oncology', 'neuroscience')",
-    )
-    max_pocket_score: float = Field(
-        default=0.4,
-        description="Targets with top fpocket druggability score below this are eligible",
-        ge=0.0, le=1.0,
-    )
-    min_disorder_frac: float = Field(
-        default=0.0,
-        description=(
-            "If > 0, also include targets with this fraction of pLDDT<50 "
-            "(disordered) residues, regardless of pocket score"
-        ),
-        ge=0.0, le=1.0,
-    )
-    require_validation: bool = Field(
-        default=True,
-        description="Require validation evidence (paper_validations or scientific_validation >= 0.3)",
-    )
-    limit: int = Field(default=25, description="Max targets to return", ge=1, le=100)
-
-
-class OrgNameInput(BaseModel):
-    """Input requiring an organization name."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    org_name: str = Field(..., description="Organization name or partial name (e.g. 'Pfizer', 'Novartis', 'Roche')", min_length=2, max_length=200)
-
-
-class CompoundNameInput(BaseModel):
-    """Input requiring a compound name."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    compound_name: str = Field(..., description="Compound name (e.g. 'imatinib', 'osimertinib', 'pembrolizumab')", min_length=2, max_length=200)
-
-
-class RelationSearchInput(BaseModel):
-    """Input for searching by semantic relation type."""
-    model_config = ConfigDict(str_strip_whitespace=True)
-    relation_type: str = Field(
-        ...,
-        description=(
-            "Semantic relation type. Options: "
-            "validates_therapeutic_target, resistance_mechanism, biomarker, "
-            "safety_concern, clinical_efficacy, expression_change, "
-            "pathway_involvement, drug_target_identification, "
-            "inhibits, inhibits_covalent, inhibits_allosteric, inhibits_competitive, "
-            "agonizes, antagonizes, degrades_protac, modulates_allosteric, partial_agonist"
-        ),
-    )
-    min_confidence: float = Field(default=0.1, description="Minimum confidence threshold (0.0-1.0)", ge=0.0, le=1.0)
-    limit: int = Field(default=30, description="Maximum results to return", ge=1, le=100)
-
-
-# ---------------------------------------------------------------------------
-# Tool 0: start_here — the front door
-# ---------------------------------------------------------------------------
-#
-# Ported from the hosted server, ADAPTED — not copied. Three things are true on
-# the hosted side and false here, and each would be a confident wrong answer:
-#
-#   1. Hosted enforces a monthly query quota and a daily unique-target limit.
-#      This package enforces NEITHER — it gates tools (`_check_tool_access`) and
-#      counts nothing. Reporting "50 queries/month" here would state a limit that
-#      does not exist. Omitted rather than guessed.
-#   2. Hosted's free tier is activated by a magic link. There is no magic link in
-#      a stdio package; tier comes from MOSAIC_TIER / MOSAIC_API_KEY.
-#   3. Hosted serves Mosaic's curated KG. **This package is bring-your-own-
-#      database** — it queries whatever DATABASE_URL points at, and there is no
-#      shared Mosaic database to connect to. That is the single most important
-#      orientation fact for a pip user and the hosted text never says it, because
-#      for a hosted user it is not true.
-
-# `_CAPABILITY_GROUPS` lived here and was never read in this package. It
-# listed 33 tool names that exist only in the hosted server, so it was
-# dead code that described a different product. The hosted copy DOES
-# consume its version (src/mcp/server.py) and is correct there.
-
-
-@mcp.tool(
-    name="mosaic_get_target_profile",
-    annotations={
-        "title": "Get Target Profile",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_get_target_profile(params: GeneSymbolInput) -> str:
-    """Get a comprehensive intelligence dossier for a drug target.
-
-    Returns UniProt biology, target scores, SAR summary, disease associations,
-    validation evidence, pathways, PPIs, competitive landscape, clinical
-    pipeline, and publication momentum. This is the primary tool for any
-    target question.
-    """
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    profile = gq.get_target_deep_profile(symbol)
-
-    if profile is None:
-        # A5 — the miss is no longer one answer. Ask the resolver WHICH miss
-        # this is before writing a sentence about it. A pip install points at
-        # the user's OWN database, so `archive_checked` is usually False here
-        # and the message says so rather than implying a check that never ran.
-        res = gq.resolve_target_status(symbol)
-
-        if res.status == RESOLUTION_ARCHIVED:
-            canonical = res.symbol or symbol
-            named = (
-                f"'{symbol}' ({canonical})" if canonical != symbol else f"'{symbol}'"
-            )
-            return _json_result({
-                "error": (
-                    f"{named} is in this Mosaic KG but OUTSIDE the current "
-                    f"dossier scope{_as_of_clause()}. The data is held and "
-                    "coverage was deliberately narrowed; this is a scope "
-                    "decision, not a gap in the underlying graph and not a "
-                    "claim about the gene."
-                ),
-                "target": symbol,
-                "resolved_target": canonical,
-                "resolution_status": res.status,
-                "wishlist_cta": (
-                    f"{canonical} can be restored to the covered set — request it at "
-                    f"{REQUEST_URL} and it enters the "
-                    "demand-driven expansion queue."
-                ),
-            })
-
-        wellknown = symbol in WELL_KNOWN_TARGETS
-        coverage_sentence = (
-            "This is a coverage statement, not a claim that the gene does not "
-            "exist."
-            if res.archive_checked else
-            "This deployment cannot distinguish 'archived' from 'never "
-            "ingested' — it carries no archive schema."
-        )
-        return _json_result({
-            "error": (
-                f"'{symbol}' is not in the current Mosaic KG "
-                f"(curated oncology target set{_as_of_clause()}). "
-                f"{coverage_sentence}"
-            ),
-            "target": symbol,
-            "resolution_status": res.status,
-            "archive_checked": res.archive_checked,
-            "wishlist_cta": (
-                f"{symbol} is a well-characterised target — request coverage at "
-                f"{REQUEST_URL} to prioritise it."
-                if wellknown else
-                f"Request coverage for this target at {REQUEST_URL}."
-            ),
-        })
-
-    return _json_result({**format_target_dossier(profile),
-                         **_translational_blocks(symbol)})
-
-
-# ---------------------------------------------------------------------------
-# Tool 3: get_target_compounds
-# ---------------------------------------------------------------------------
-
-@mcp.tool(
-    name="mosaic_get_target_compounds",
-    annotations={
-        "title": "Get Target Compounds",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_get_target_compounds(params: TargetCompoundsInput) -> str:
-    """Get compounds active against a specific drug target.
-
-    Returns compounds with activity data (IC50, Ki, etc.), sorted by potency or,
-    with sort='max_phase', approved and clinical drugs first. Unnamed research
-    compounds read compound_name 'unnamed' with the ChEMBL id in chembl_id.
-    """
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    limit = _enforce_limit("mosaic_get_target_compounds", params.limit)
-    compounds = gq.get_target_compounds(symbol, limit, sort=params.sort)
-    # DATA_LICENCES 1.5 (2026-09-14): these rows are ChEMBL-derived, and ChEMBL
-    # is ShareAlike -- the notice travels with every payload that carries the
-    # rows, because a licence recorded only in a doc nobody fetches is the
-    # AlphaMissense label again.
-    payload = _paged(
-        compounds, "compounds", requested=params.limit, applied=limit,
-        target=symbol, sort=params.sort,
-        upstream_licence="ChEMBL data: CC BY-SA 3.0 -- adapted material must "
-                         "carry the same or a compatible licence",
-    )
-    if not compounds:
-        payload = _with_coverage_statement(
-            payload, "mosaic_get_target_compounds",
-            gq.resolve_target_status(symbol), "compounds")
-    return _json_result({**payload, **_translational_blocks(symbol)})
-
-
-# ---------------------------------------------------------------------------
-# Tool 4: get_target_patents
-# ---------------------------------------------------------------------------
-
-# RETIRED - mosaic_get_target_patents (decision D1, 2026-09-14): patents left
-# the public surface. The data and query layer are KEPT. Positioning, not a
-# defect. Replaced in FREE_TOOLS by mosaic_get_coverage_grid below.
-
-
-@mcp.tool(
-    name="mosaic_get_coverage_grid",
-    annotations={
-        "title": "Coverage Grid (any human target)",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-def mosaic_get_coverage_grid(params: GeneSymbolInput) -> str:
-    """Coverage-honest grid for ANY human gene symbol - the live demo of
-    the mechanism. In this self-hosted package the grid resolves identity
-    (HGNC) and structure (AlphaFold DB) live; the remaining axes are marked
-    `queued` and are computed by the hosted service's dossier pipeline
-    (getmosaic.dev). Every count carries a state; nothing unfetched is a
-    zero.
-    """
-    import requests as _rq
-
-    symbol = params.gene_symbol.strip().upper()
-    rec = None
-    for field_name in ("symbol", "alias_symbol", "prev_symbol"):
-        try:
-            r = _rq.get(f"https://rest.genenames.org/fetch/{field_name}/{symbol}",
-                        headers={"Accept": "application/json"}, timeout=30)
-            r.raise_for_status()
-            docs = r.json().get("response", {}).get("docs", [])
-        except Exception as e:  # noqa: BLE001
-            return _json_result({"symbol_submitted": symbol,
-                                 "resolution": "lookup_failed",
-                                 "error": f"{type(e).__name__}: {e}"})
-        if docs:
-            d = docs[0]
-            rec = {"canonical": d["symbol"].upper(),
-                   "uniprot_accession": (d.get("uniprot_ids") or [None])[0],
-                   "ensembl_gene_id": d.get("ensembl_gene_id")}
-            break
-    if rec is None:
-        return _json_result({
-            "symbol_submitted": symbol, "resolution": "unknown_symbol",
-            "note": f"HGNC has no record for {symbol!r} as a current symbol, "
-                    f"alias or previous symbol. Not resolvable; not guessed."})
-
-    structure = {"count": None, "state": "queued"}
-    acc = rec["uniprot_accession"]
-    if acc:
-        try:
-            r = _rq.get(f"https://alphafold.ebi.ac.uk/api/prediction/{acc}",
-                        timeout=30)
-            if r.status_code == 404:
-                structure = {"count": None, "state": "fetch_failed",
-                             "note": "AFDB 404 on a resolved accession - a "
-                                     "lookup failure, never 'no structure'"}
-            else:
-                r.raise_for_status()
-                entries = r.json()
-                e0 = entries[0] if entries else {}
-                ver = e0.get("latestVersion")
-                # The count is AlphaFold DB models held for the accession, not
-                # structures in general: say so, and say where it came from.
-                structure = {"count": len(entries), "state": "fetched_on_demand",
-                             "unit": "AlphaFold DB models for this UniProt accession",
-                             "source": " ".join(filter(None, (
-                                 "AlphaFold DB", e0.get("entryId"),
-                                 f"v{ver}" if ver else None))) + ", fetched live",
-                             "mean_plddt": e0.get("globalMetricValue")}
-        except Exception as e:  # noqa: BLE001
-            structure = {"count": None, "state": "fetch_failed",
-                         "error": f"{type(e).__name__}: {e}"[:160]}
-    else:
-        structure = {"count": None, "state": "not_applicable",
-                     "note": "no UniProt accession resolved"}
-
-    queued = {"count": None, "state": "queued",
-              "note": "computed by the hosted dossier pipeline"}
-    grid = {"papers": dict(queued), "compounds": dict(queued),
-            "trials": {**queued,
-                       "note": "PERMANENT FLOOR: never supports an absence "
-                               "claim"},
-            "ppi": dict(queued), "essentiality": dict(queued),
-            "coessentiality": dict(queued), "structure": structure,
-            "constraint_metrics": dict(queued),
-            "genetic_association": dict(queued)}
-    return _json_result({
-        "symbol_submitted": symbol,
-        "canonical": rec["canonical"],
-        "uniprot_accession": acc,
-        "ensembl_gene_id": rec["ensembl_gene_id"],
-        "grid": grid,
-        "how_to_read": "queued axes are fetched by the hosted pipeline when "
-                       "a dossier is requested; 'we have not fetched yet' "
-                       "and 'there is none' never share a value.",
-        "hosted": "https://getmosaic.dev - request a full dossier",
-        **_translational_blocks(rec["canonical"], missing="queued"),
-    })
-
-
-# ---------------------------------------------------------------------------
-# Tool 5: get_target_papers
-# ---------------------------------------------------------------------------
-
-@mcp.tool(
-    name="mosaic_get_target_papers",
-    annotations={
-        "title": "Get Target Papers",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_get_target_papers(params: GeneSymbolWithLimit) -> str:
-    """Get scientific papers about a specific drug target.
-
-    Where the database carries PubTator3 gene annotations, only papers tagged
-    with the target's NCBI Gene ID are served (`membership_basis` says which
-    test applied), dated by the earliest of e-pub / issue / PubMed entry,
-    papers naming the target in the title first.
-    """
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    limit = _enforce_limit("mosaic_get_target_papers", params.limit)
-    papers = gq.get_target_papers(symbol, limit)
-    payload = _paged(
-        papers, "papers", requested=params.limit, applied=limit, target=symbol,
-        membership_basis=gq.paper_membership_basis(),
-        kg_cutoff=gq._kg_cutoff_date().isoformat(),
-    )
-    if not papers:
-        payload = _with_coverage_statement(
-            payload, "mosaic_get_target_papers",
-            gq.resolve_target_status(symbol), "papers")
-    return _json_result(payload)
-
-
-# ---------------------------------------------------------------------------
-# Tool 5a: get_target_structure (AlphaFold)
-# ---------------------------------------------------------------------------
-
-@mcp.tool(
-    name="mosaic_get_target_structure",
-    annotations={
-        "title": "Get Target Structure (AlphaFold)",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_get_target_structure(params: GeneSymbolInput) -> str:
-    """Get the AlphaFold structural snapshot for a drug target.
-
-    Returns AlphaFold model URLs (PDB / CIF / PAE), per-residue confidence
-    summary (mean pLDDT, fractions of residues at high / confident / low
-    confidence, disordered fraction), and protein length. Useful for
-    SBDD scoping, disorder/IDR risk, and confidence-aware target triage.
-    Also returns the fpocket pockets with both rankings (fpocket score and
-    Druggability Score), which one selected the top pocket, and the pLDDT of
-    the residues lining each pocket.
-    """
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    structure = gq.get_target_structure(symbol)
-
-    if structure is None:
-        return _json_result({
-            "_meta": {
-                "tool": "mosaic_get_target_structure",
-                **empty_scope_note(
-                    symbol, "AlphaFold structure",
-                    as_of=_provenance_as_of(),
-                ),
-            },
-            "target": symbol,
-            "available": False,
-        })
-
-    summary = format_structure_summary(structure)
-    return _json_result({
-        "_meta": {
-            "tool": "mosaic_get_target_structure",
-            "description": (
-                f"AlphaFold structural snapshot for {symbol} "
-                f"(UniProt {structure.get('uniprot_id')})"
-            ),
-        },
-        "target": symbol,
-        "available": True,
-        "summary": summary,
-    })
-
-
-# ---------------------------------------------------------------------------
-# Tool 5b: assess_druggability
-# ---------------------------------------------------------------------------
-
-# RETIRED - mosaic_competitive_landscape (decision D1, 2026-09-14): built on
-# patent assignees, which left the public surface with them.
-
-
-# ---------------------------------------------------------------------------
-# Tool 7: pathway_context
-# ---------------------------------------------------------------------------
-
-@mcp.tool(
-    name="mosaic_pathway_context",
-    annotations={
-        "title": "Pathway Context",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_pathway_context(params: GeneSymbolInput) -> str:
-    """Get pathway context for a drug target.
-
-    Shows which biological pathways the target participates in, other targets
-    in the same pathways, and protein-protein interactions.
-    """
-    _check_tool_access("mosaic_pathway_context")
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    result = gq.get_pathway_context(symbol)
-    return _json_result(format_pathway_context(result))
-
-
-# ---------------------------------------------------------------------------
-# Tool 8: compound_selectivity
-# ---------------------------------------------------------------------------
-
-@mcp.tool(
-    name="mosaic_target_validation",
-    annotations={
-        "title": "Assay Precedent (Target Validation)",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_target_validation(params: GeneSymbolInput) -> str:
-    """Assay precedent for a drug target: what has been tried, in what model system.
-
-    Returns literature-derived experimental precedent — genetic (CRISPR/siRNA/KO),
-    in vivo (mouse/rat/xenograft), pharmacological (inhibitor/SAR), and clinical-
-    trial evidence — re-classified per paper at query time. A paper may carry
-    several methods; counts are lower bounds, not exhaustive. Papers that name the
-    target in their title are flagged high-confidence and lead the ranked
-    exemplars. Outcomes are NOT auto-graded: open the linked exemplar papers to
-    read what actually happened. Also returns DepMap essentiality + AlphaMissense
-    pathogenicity when available. A target with no precedent returns an explicit
-    no_precedent_in_corpus status (corpus coverage, not confirmed absence).
-    """
-    _check_tool_access("mosaic_target_validation")
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    result = gq.get_target_validation_summary(symbol)
-    return _json_result(format_validation_summary(result))
-
-
-# ---------------------------------------------------------------------------
-# Tool 13: clinical_pipeline
-# ---------------------------------------------------------------------------
-
-@mcp.tool(
-    name="mosaic_clinical_pipeline",
-    annotations={
-        "title": "Clinical Trial Pipeline",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_clinical_pipeline(params: GeneSymbolInput) -> str:
-    """Get clinical trial pipeline for compounds targeting a gene.
-
-    Returns compounds in clinical development with indications, trial
-    phases, and status from ClinicalTrials.gov data.
-    """
-    _check_tool_access("mosaic_clinical_pipeline")
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    result = gq.get_clinical_pipeline(symbol)
-    not_covered = None
-    if not result.get("pipeline"):
-        # S15b: resolve only on an empty roster; the formatter renders it.
-        not_covered = uncovered_target_note(
-            gq.resolve_target_status(symbol), "clinical-pipeline entries",
-            as_of=_provenance_as_of())
-    return _json_result(format_clinical_pipeline(result, not_covered=not_covered))
-
-
-# ---------------------------------------------------------------------------
-# Tool 14: compound_analogs
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# B4 — multi-hop tools restored (reset plan v3)
-#
-# HAND-MAINTAINED. scripts/sync_pip_package.py skips server.py, so a tool
-# added to the hosted server reaches neither pip copy on its own and the
-# FREE_TOOLS invariant is what catches the drift. Added to BOTH copies in
-# the same session as the hosted change, per CLAUDE.md 2.4.
-# ---------------------------------------------------------------------------
-
-@mcp.tool(
-    name="mosaic_synthetic_lethal_whitespace",
-    annotations={
-        "title": "Synthetic-Lethal Whitespace",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_synthetic_lethal_whitespace(params: SyntheticLethalInput) -> str:
-    """Find synthetic-lethal *whitespace*: targets functionally coupled to
-    a developed (drugged) target but themselves undeveloped.
-
-    For an anchor target with chemical matter, surfaces partners coupled to
-    it by DepMap co-essentiality, STRING protein-protein interactions and/or
-    Reactome pathways. Returns TWO lists, deliberately not merged:
-
-    - `candidates` — partners Mosaic covers, filtered to < 5 patents and no
-      compound past phase 0. Those counts are measured, so a whitespace claim
-      is supportable. Ranked by `whitespace_score`. **Read
-      `clinical_absence_caveat`**: it is set when a partner carries substantial
-      chemistry yet nothing clinical, which usually means our compound set is
-      incomplete rather than that the world has no clinical interest.
-    - `coupled_unassessed` — partners outside the curated universe. They are
-      coupled to the anchor, but their competitive status is UNKNOWN rather
-      than zero, so they carry null counts and no whitespace_score, and are
-      ranked by `coupling_strength` alone. Leads, not evidence. Do not
-      describe them as uncontested.
-
-    Scope: DepMap co-essentiality IS ingested, but most rows do not use it.
-    `co_functionality_basis` is one of `depmap_coessentiality` (measured
-    co-essentiality), `ppi_pathway_proxy` (protein interaction AND a shared
-    pathway), `ppi_only` (protein interaction alone, pathways checked and none
-    shared — the weakest, and on a KRAS anchor the most common), or
-    `ppi_pathways_unassessed` (interaction only, and pathways COULD NOT be
-    checked because the partner is outside the curated universe — those rows
-    also carry `shared_pathways: null`, not 0). `basis_note` gives the split.
-    A proxy row is a hypothesis about functional coupling, not measured
-    synthetic lethality.
-
-    `sufficient_for_absence_claim` is false unless most of the coupled set was
-    assessable; `assessed_fraction` reports how much was. `lineage` is still a
-    label only — it does not filter. Hypothesis generator.
-    """
-    _check_tool_access("mosaic_synthetic_lethal_whitespace")
-    gq = _gq()
-    result = gq.find_synthetic_lethal_whitespace(
-        approved_target=params.approved_target,
-        lineage=params.lineage,
-        limit=params.limit,
-    )
-
-    if not result.get("candidates"):
-        return _json_result({
-            "_meta": {
-                "tool": "mosaic_synthetic_lethal_whitespace",
-                **empty_scope_note(
-                    params.approved_target or "the developed-target set",
-                    "synthetic-lethal whitespace candidates",
-                    hint=(
-                        "Needs coupling to a drugged anchor via DepMap "
-                        "co-essentiality, STRING PPI or Reactome pathways. "
-                        + (
-                            f"NOTE: {result.get('coupled_unassessed_total', 0)} "
-                            "coupled partner(s) WERE found but sit outside the "
-                            "curated universe, so their competitive status "
-                            "cannot be assessed — see `coupled_unassessed`. "
-                            "An empty `candidates` here means 'not assessable', "
-                            "not 'no coupling exists'."
-                            if result.get("coupled_unassessed_total")
-                            else "No coupled partners found at all."
-                        )
-                    ),
-                    as_of=_provenance_as_of(),
-                ),
-            },
-            **result,
-        })
-
-    return _json_result({
-        "_meta": {
-            "tool": "mosaic_synthetic_lethal_whitespace",
-            "description": (
-                "Synthetic-lethal whitespace partners for "
-                + (params.approved_target or "top developed targets")
-            ),
-            "scoring": (
-                "candidates: whitespace_score = coupling x 1/(1+patents_B) "
-                "x (1 + ln(1+validation_evidence_B)), where coupling is "
-                "DepMap co-essentiality when available else the PPI/pathway "
-                "proxy. coupled_unassessed: ranked by coupling_strength only "
-                "— the competition term is undefined for a gene outside "
-                "coverage, so it is not computed rather than assumed zero."
-            ),
-            "caveat": result.get("method"),
-            "coverage": result.get("coverage_note"),
-        },
-        **result,
-    })
-
-
-# ---------------------------------------------------------------------------
-# Tool: modality_gaps (KG-native, Move 2 Task 2.4.R.3)
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool(
-    name="mosaic_resistance_bypass_map",
-    annotations={
-        "title": "Resistance Bypass Map",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_resistance_bypass_map(params: ResistanceBypassInput) -> str:
-    """Candidate resistance-bypass / escape targets for a given target.
-
-    From a deterministic keyword pass over the literature
-    (resistance_relations — GLiREL has no resistance edge type), surfaces
-    targets co-mentioned with the query target in resistance-context
-    abstracts, ranked by a drugability-gap score (strong resistance
-    evidence, low development activity). Hypothesis generator, not
-    evidence — every row carries its source snippet.
-    """
-    _check_tool_access("mosaic_resistance_bypass_map")
-    gq = _gq()
-    result = gq.find_resistance_bypass_map(
-        target=params.target, indication=params.indication
-    )
-    if not result.get("bypass_candidates"):
-        return _json_result({
-            "_meta": {
-                "tool": "mosaic_resistance_bypass_map",
-                **empty_scope_note(
-                    params.target, "resistance-bypass candidates",
-                    hint="No resistance-context co-mentions found. Run "
-                         "scripts/extract_resistance_relations.py if the "
-                         "resistance_relations layer is unpopulated.",
-                    as_of=_provenance_as_of(),
-                ),
-            },
-            **result,
-        })
-    return _json_result({
-        "_meta": {
-            "tool": "mosaic_resistance_bypass_map",
-            "description": (
-                f"Resistance-bypass candidates for {result['target']}"
-            ),
-            "scoring": (
-                "drugability_gap = evidence_papers x avg_confidence "
-                "x 1/(1+patents_bypass)"
-            ),
-            "caveat": result.get("method"),
-        },
-        **result,
-    })
-
-
-# ---------------------------------------------------------------------------
-# Tool: talent_migration (KG-native, Move 2 Task 2.4.R.4)
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool(
-    name="mosaic_target_network",
-    annotations={
-        "title": "Target Knowledge Graph Network",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-@_with_db_error_handling
-def mosaic_target_network(params: GeneSymbolInput) -> str:
-    """Get the 1-hop neighborhood around a drug target.
-
-    Returns the entities DIRECTLY connected to the target — compounds, diseases,
-    pathways, patent-holding organizations, interacting proteins — as nodes and
-    edges. This is a star centered on the target (independent 1-hop lookups), not
-    a multi-hop graph traversal: it shows the target's immediate context, not
-    paths that hop through intermediate entities.
-    """
-    _check_tool_access("mosaic_target_network")
-    gq = _gq()
-    symbol = params.gene_symbol.strip().upper()
-    result = gq.get_target_network(symbol)
-    if "error" in result:
-        # S15b: this read "Target 'TTN' not found" for a gene the KG holds
-        # (archived), and for every partner-tier gene. Say which it is.
-        note = uncovered_target_note(
-            gq.resolve_target_status(symbol), "network neighbours",
-            as_of=_provenance_as_of())
-        if note:
-            result = {
-                "_meta": {"tool": "mosaic_target_network", **note},
-                "center": symbol, "nodes": [], "edges": [],
-                "node_count": 0, "edge_count": 0, "node_types": {},
-            }
-    return _json_result(result)
+@_tool("mosaic_get_result")
+async def mosaic_get_result(params: ResultInput) -> str:
+    return await _forward("mosaic_get_result", params)
 
 
 def main() -> None:
-    """Run the server over stdio. This is the `mosaic-mcp` console script.
-
-    The package is stdio-only: remote transport is the hosted endpoint
-    (https://mcp.getmosaic.dev/sse), not this package.
-    """
-    import argparse
-
-    parser = argparse.ArgumentParser(
+    """The `mosaic-mcp` command: the thin client over stdio."""
+    ap = argparse.ArgumentParser(
         prog="mosaic-mcp",
-        description="Mosaic pre-clinical intelligence MCP server (stdio).",
-    )
-    parser.add_argument(
-        "--transport", choices=["stdio", "sse"], default="stdio",
-        help="stdio only; remote transport is the hosted endpoint",
-    )
-    args = parser.parse_args()
-    if args.transport != "stdio":
-        raise NotImplementedError(
-            "mosaic-mcp is stdio-only. Remote transport is served by the hosted "
-            "endpoint at https://mcp.getmosaic.dev/sse, not by this package."
-        )
-    mcp.run()
+        description="Mosaic's five MCP tools over stdio, forwarded to the hosted service.")
+    ap.add_argument("--transport", choices=["stdio"], default="stdio",
+                    help="stdio only; for remote access connect to the hosted endpoint")
+    ap.add_argument("--version", action="version", version=f"mosaic-mcp {__version__}")
+    ap.parse_args()
+    # stderr: stdout is the MCP stdio transport.
+    if os.environ.get("DATABASE_URL"):
+        print("mosaic-mcp: DATABASE_URL is ignored. 3.0 is a thin client to the hosted "
+              "service; the bring-your-own-database mode is deprecated (pin mosaic-mcp<3 "
+              "to keep it).", file=sys.stderr)
+    if not (os.environ.get("MOSAIC_API_KEY") or "").strip():
+        print("mosaic-mcp: MOSAIC_API_KEY is not set; every tool call will say so. "
+              "Or connect your client to https://mcp.getmosaic.dev/mcp (OAuth).",
+              file=sys.stderr)
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

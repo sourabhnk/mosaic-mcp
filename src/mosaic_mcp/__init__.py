@@ -1,17 +1,16 @@
-"""Mosaic MCP — Pre-clinical drug discovery intelligence server.
+"""Mosaic MCP: a thin client to the hosted Mosaic service.
 
-44 MCP tools for targets, compounds, patents, clinical trials,
-competitive landscapes, whitespace analysis, and more. Powered by a
-PostgreSQL knowledge graph.
+Five MCP tools over stdio (the coverage grid, verify_claim, the claims audit,
+the dossier request, get_result), each call forwarded to
+https://mcp.getmosaic.dev/mcp with your API key.
 
 Usage:
     pip install mosaic-mcp
-    export DATABASE_URL="postgresql://..."   # bring your own Postgres
-    mosaic-mcp                               # starts stdio MCP server
+    export MOSAIC_API_KEY="mk_live_..."
+    mosaic-mcp                               # stdio MCP server
 
-This package is stdio-only. `--transport sse` raises NotImplementedError —
-remote access is served by the hosted endpoint (mcp.getmosaic.dev), not by
-this package. The flag was documented here as working; it never was.
+3.0.0 is a deliberate break: the 2.x bring-your-own-database mode is
+deprecated and not in this package. Pin `mosaic-mcp<3` to keep it.
 """
 
-__version__ = "2.2.1"
+__version__ = "3.0.0"
