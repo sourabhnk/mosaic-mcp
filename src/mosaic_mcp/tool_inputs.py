@@ -2,8 +2,8 @@
 
     mosaic_get_coverage_grid   free     sync
     mosaic_verify_claim        free     sync, at most VERIFY_CLAIM_DEADLINE_S, rate-limited
-    mosaic_audit_claims        paid     async ($390 an audit)
-    mosaic_request_dossier     paid     async ($149 a dossier, or a subscription's quota)
+    mosaic_audit_claims        paid     async ($390 an audit, bought per item)
+    mosaic_request_dossier     paid     async ($149 a dossier, bought per item; plan v3 §4)
     mosaic_get_result          free     sync
 
 Each tool's name, description, annotations and input model live here and
@@ -133,8 +133,9 @@ TOOLS: dict[str, dict] = {
             "measured against Mosaic's declared query and given one of the seven "
             "verdicts, delivered as a report with an immutable record. $390 an audit. "
             "Give the text or a public https URL. Async: returns a request_id to poll "
-            "with mosaic_get_result. Without an audit purchase it answers with the price "
-            "and where to buy; nothing is queued or charged."),
+            "with mosaic_get_result. Without an audit purchase it answers with a checkout "
+            "link for this document; the audit is queued once the payment is confirmed, "
+            "and nothing is queued or charged before that."),
     },
     "mosaic_request_dossier": {
         "input": DossierRequestInput,
@@ -142,9 +143,11 @@ TOOLS: dict[str, dict] = {
                         "destructiveHint": False, "idempotentHint": False,
                         "openWorldHint": True},
         "description": (
-            "Request a coverage-honest dossier for ANY human target (paid). Async by "
-            "design: fetching, synthesis and verification take minutes to hours. Returns "
-            "a request_id; poll with mosaic_get_result."),
+            "Request a coverage-honest dossier for ANY human target ($149 a dossier). "
+            "Async by design: fetching, synthesis and verification take minutes to hours. "
+            "Returns a request_id; poll with mosaic_get_result. Without a dossier purchase "
+            "it answers with a checkout link for this target; the dossier is queued once "
+            "the payment is confirmed."),
     },
     "mosaic_get_result": {
         "input": ResultInput,
